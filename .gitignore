@@ -1,0 +1,39 @@
+# ─── Dependencies ──────────────────────────────────────────────────────────────
+node_modules/
+
+# ─── Environment & Secrets (NEVER commit these) ────────────────────────────────
+.env
+.env.local
+.env.development
+.env.staging
+.env.production
+.env.otp-additions
+.env.*.local
+
+# ─── SSL Certificates ──────────────────────────────────────────────────────────
+certs/*.pem
+certs/*.key
+certs/*.crt
+certs/*.p12
+
+# ─── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Build / Output ────────────────────────────────────────────────────────────
+dist/
+build/
+
+# ─── OS & Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ─── Uploads / Temp ────────────────────────────────────────────────────────────
+uploads/
+tmp/
+temp/
