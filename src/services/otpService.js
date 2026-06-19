@@ -111,7 +111,6 @@ class OTPService {
     // Build record — gracefully handle schema being either 006 or 007+
     const record = {
       id:         uuid(),
-      phone:      destination,   // keep for migration 006 compat
       otp_hash,
       expires_at,
       attempts:   0,
@@ -121,14 +120,29 @@ class OTPService {
     }
 
     // Add new columns if migration 007 has run
+    let hasMethod = false
     try {
-      const hasMethod = await this.db.schema.hasColumn('otp_codes', 'method')
-      if (hasMethod) {
-        record.method      = method
-        record.destination = destination
-        if (userId) record.user_id = userId
-      }
+      hasMethod = await this.db.schema.hasColumn('otp_codes', 'method')
     } catch { /* ignore — older schema */ }
+
+    if (hasMethod) {
+      record.method      = method
+      record.destination = destination
+      if (userId) record.user_id = userId
+      // `phone` is still NOT NULL on migration-006 installs that have since
+      // been upgraded to 007 without dropping the old constraint — keep it
+      // populated, but only with something that actually fits varchar(20).
+      // Email destinations (or long phone formats) must NOT go in here;
+      // the real value lives in `destination` above.
+      record.phone = method === 'sms' || method === 'whatsapp'
+        ? destination.slice(0, 20)
+        : null
+    } else {
+      // Pre-007 schema: `phone` is the only column available.
+      // Truncating is a last resort to avoid a hard DB error — this path
+      // only runs on databases that haven't been migrated past 006.
+      record.phone = destination.slice(0, 20)
+    }
 
     await this.db('otp_codes').insert(record)
     await this._incrementRateLimit(destination)

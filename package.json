@@ -4,14 +4,18 @@
   "description": "MediERP — Unified Node.js + PostgreSQL backend: Pharma ERP + Bank-Grade Accounting Engine",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
-    "start:prod": "NODE_ENV=production node src/server.js",
-    "start:staging": "NODE_ENV=staging node src/server.js",
-    "dev": "nodemon src/server.js",
+    "start": "cross-env NODE_ENV=development node src/server.js",
+    "start:prod": "cross-env NODE_ENV=production node src/server.js",
+    "start:staging": "cross-env NODE_ENV=staging node src/server.js",
+    "dev": "cross-env NODE_ENV=development nodemon src/server.js",
     "migrate": "knex migrate:latest",
-    "migrate:rollback": "knex migrate:rollback",
-    "seed": "knex seed:run",
+    "migrate:rollback": "cross-env NODE_ENV=development knex migrate:rollback",
+    "migrate:prod": "cross-env NODE_ENV=production knex migrate:latest",
+    "migrate:prod:rollback": "cross-env NODE_ENV=production knex migrate:rollback",
+    "seed": "cross-env NODE_ENV=development knex seed:run",
+    "seed:prod": "cross-env NODE_ENV=production knex seed:run",
     "setup": "npm run migrate && npm run seed",
+    "setup:prod": "npm run migrate:prod && npm run seed:prod",
     "gen-certs": "bash scripts/gen-certs.sh",
     "check-env": "node -e \"require('./src/config/index.js'); console.log('✅ Config OK')\""
   },
@@ -31,6 +35,7 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "nodemon": "^3.1.4"
   }
 }
