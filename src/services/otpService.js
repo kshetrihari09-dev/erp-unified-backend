@@ -59,15 +59,22 @@ class OTPService {
     return { allowed: true, remaining: RATE_LIMIT_MAX - 1 - row.request_count }
   }
 
-  async _incrementRateLimit(destination) {
+  async _incrementRateLimit(destination, method = 'sms') {
     const existing = await this.db('otp_rate_limits')
       .where(b => b.where({ destination }).orWhere({ phone: destination }))
       .first()
 
     if (!existing) {
+      // `phone` is a legacy varchar(20) column kept for backward compat.
+      // Only populate it when destination actually fits (sms/whatsapp
+      // phone numbers) — never with an email address. The canonical
+      // value always lives in `destination`. Mirrors the same guard in
+      // create() for otp_codes.phone (see migration 012's history note).
       await this.db('otp_rate_limits').insert({
         id:            uuid(),
-        phone:         destination,
+        phone:         method === 'sms' || method === 'whatsapp'
+          ? destination.slice(0, 20)
+          : null,
         destination,
         request_count: 1,
         window_start:  new Date(),
@@ -145,7 +152,7 @@ class OTPService {
     }
 
     await this.db('otp_codes').insert(record)
-    await this._incrementRateLimit(destination)
+    await this._incrementRateLimit(destination, method)
 
     return code
   }
