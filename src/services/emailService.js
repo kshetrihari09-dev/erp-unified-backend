@@ -224,7 +224,11 @@ class EmailService {
   }
 
   async _sendBrevo(to, subject, html, text) {
-    const apiKey = process.env.BREVO_API_KEY
+    // .trim() guards against trailing newlines/whitespace that can sneak in
+    // when copy-pasting the key into a dashboard input field — Node's http
+    // module rejects header values containing \n/\r with
+    // "Invalid character in header content".
+    const apiKey = (process.env.BREVO_API_KEY || '').trim()
     if (!apiKey) throw new Error('BREVO_API_KEY is required (Brevo dashboard: Settings > SMTP & API > API Keys tab)')
 
     const payload = JSON.stringify({
