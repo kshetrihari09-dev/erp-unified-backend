@@ -3,12 +3,15 @@
  *
  * Supports:
  *   - 'nodemailer_smtp'  any SMTP server (Gmail, Outlook, custom)
+ *   - 'brevo'            Brevo transactional email HTTPS API (recommended on
+ *                         Render free tier — SMTP ports 25/465/587 are
+ *                         blocked there, but HTTPS/443 is never blocked)
  *   - 'sendgrid'         SendGrid API
  *   - 'mailgun'          Mailgun API
  *   - 'console'          Development: print to terminal (default)
  *
  * .env keys:
- *   EMAIL_PROVIDER=smtp|sendgrid|mailgun|console
+ *   EMAIL_PROVIDER=smtp|brevo|sendgrid|mailgun|console
  *   EMAIL_FROM_NAME=MediERP
  *   EMAIL_FROM_ADDRESS=noreply@yourcompany.com
  *
@@ -18,6 +21,10 @@
  *   SMTP_SECURE=false          (true for port 465)
  *   SMTP_USER=your@gmail.com
  *   SMTP_PASS=your_app_password
+ *
+ *   # Brevo (HTTPS API — use this on Render free tier instead of smtp)
+ *   BREVO_API_KEY=xkeysib-xxxx   (from Brevo: Settings > SMTP & API > API Keys
+ *                                 tab — NOT the SMTP key from the SMTP tab)
  *
  *   # SendGrid
  *   SENDGRID_API_KEY=SG.xxxx
@@ -59,6 +66,8 @@ class EmailService {
         case 'smtp':
         case 'nodemailer_smtp':
           return await this._sendSMTP(email, subject, html, text)
+        case 'brevo':
+          return await this._sendBrevo(email, subject, html, text)
         case 'sendgrid':
           return await this._sendSendGrid(email, subject, html, text)
         case 'mailgun':
@@ -187,7 +196,7 @@ class EmailService {
     // Use nodemailer if available, otherwise fall back to raw SMTP
     try {
       const nodemailer = require('nodemailer')
-      const transporter = nodemailer.createTransporter({
+      const transporter = nodemailer.createTransport({
         host:   process.env.SMTP_HOST,
         port:   parseInt(process.env.SMTP_PORT || '587'),
         secure: process.env.SMTP_SECURE === 'true',
@@ -212,6 +221,34 @@ class EmailService {
       }
       throw err
     }
+  }
+
+  async _sendBrevo(to, subject, html, text) {
+    const apiKey = process.env.BREVO_API_KEY
+    if (!apiKey) throw new Error('BREVO_API_KEY is required (Brevo dashboard: Settings > SMTP & API > API Keys tab)')
+
+    const payload = JSON.stringify({
+      sender:      { name: FROM_NAME, email: FROM_ADDR },
+      to:          [{ email: to }],
+      subject,
+      htmlContent: html,
+      textContent: text,
+    })
+
+    const result = await this._post(
+      'https://api.brevo.com/v3/smtp/email',
+      payload,
+      {
+        'Content-Type': 'application/json',
+        'api-key':      apiKey,
+        'Accept':       'application/json',
+      }
+    )
+
+    if (result.messageId) {
+      return { success: true, messageId: result.messageId, provider: 'brevo' }
+    }
+    return { success: false, error: result.message || JSON.stringify(result), provider: 'brevo' }
   }
 
   async _sendSendGrid(to, subject, html, text) {
