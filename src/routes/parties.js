@@ -31,13 +31,21 @@ router.get('/customers', async (req, res, next) => {
   try {
     const { page, limit, offset } = parsePagination(req.query)
     const { search } = req.query
-    let q = db('parties as p')
+    // Base filter (no .select() yet) — clone THIS for the count query,
+    // so .count() never has to coexist with the p.*/a.name/a.code select list.
+    // Adding .select() before .clone() for count caused:
+    //   "column p.id must appear in the GROUP BY clause or be used in an
+    //    aggregate function" — Postgres correctly rejecting a mixed
+    //    SELECT p.*, a.name, count(p.id) with no GROUP BY.
+    let base = db('parties as p')
       .leftJoin('accounts as a', 'a.id', 'p.control_account_id')
       .where({ 'p.company_id': req.companyId, 'p.type': 'customer' })
+    if (search) base = base.where(b => b.whereILike('p.name', `%${search}%`).orWhereILike('p.phone', `%${search}%`).orWhereILike('p.code', `%${search}%`))
+
+    const [{ count }] = await base.clone().count('p.id as count')
+    const data = await base.clone()
       .select('p.*', 'a.name as control_account_name', 'a.code as control_account_code')
-    if (search) q = q.where(b => b.whereILike('p.name', `%${search}%`).orWhereILike('p.phone', `%${search}%`).orWhereILike('p.code', `%${search}%`))
-    const [{ count }] = await q.clone().count('p.id as count')
-    const data = await q.orderBy('p.name').limit(limit).offset(offset)
+      .orderBy('p.name').limit(limit).offset(offset)
     return paginatedResponse(res, { data, total: Number(count), page, limit })
   } catch (err) { next(err) }
 })
@@ -47,13 +55,16 @@ router.get('/suppliers', async (req, res, next) => {
   try {
     const { page, limit, offset } = parsePagination(req.query)
     const { search } = req.query
-    let q = db('parties as p')
+    // Same fix as /customers above — see comment there.
+    let base = db('parties as p')
       .leftJoin('accounts as a', 'a.id', 'p.control_account_id')
       .where({ 'p.company_id': req.companyId, 'p.type': 'supplier' })
+    if (search) base = base.where(b => b.whereILike('p.name', `%${search}%`).orWhereILike('p.phone', `%${search}%`).orWhereILike('p.code', `%${search}%`))
+
+    const [{ count }] = await base.clone().count('p.id as count')
+    const data = await base.clone()
       .select('p.*', 'a.name as control_account_name', 'a.code as control_account_code')
-    if (search) q = q.where(b => b.whereILike('p.name', `%${search}%`).orWhereILike('p.phone', `%${search}%`).orWhereILike('p.code', `%${search}%`))
-    const [{ count }] = await q.clone().count('p.id as count')
-    const data = await q.orderBy('p.name').limit(limit).offset(offset)
+      .orderBy('p.name').limit(limit).offset(offset)
     return paginatedResponse(res, { data, total: Number(count), page, limit })
   } catch (err) { next(err) }
 })
