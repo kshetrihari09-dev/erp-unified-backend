@@ -40,7 +40,7 @@ const http   = require('http')
 
 const APP_NAME    = (process.env.APP_NAME          || 'MediERP').trim()
 const FROM_NAME   = (process.env.EMAIL_FROM_NAME   || APP_NAME).trim()
-const FROM_ADDR   = (process.env.EMAIL_FROM_ADDRESS || `noreply@medierp.app`).trim()
+const FROM_ADDR   = (process.env.EMAIL_FROM_ADDRESS || `noreply@khatrihari09@gmail.com`).trim()
 
 class EmailService {
   constructor() {
