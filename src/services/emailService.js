@@ -48,7 +48,7 @@ const FROM_ADDR   = (process.env.EMAIL_FROM_ADDRESS || '').trim()
 
 class EmailService {
   constructor() {
-    this.provider = (process.env.EMAIL_PROVIDER || 'console').toLowerCase()
+    this.provider = (process.env.EMAIL_PROVIDER || 'brevo').toLowerCase()
   }
 
   /* ── Public API ─────────────────────────────────────────────────────────── */
