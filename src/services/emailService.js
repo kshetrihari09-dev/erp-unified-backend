@@ -40,7 +40,11 @@ const http   = require('http')
 
 const APP_NAME    = (process.env.APP_NAME          || 'MediERP').trim()
 const FROM_NAME   = (process.env.EMAIL_FROM_NAME   || APP_NAME).trim()
-const FROM_ADDR   = (process.env.EMAIL_FROM_ADDRESS || `noreply@kshetrihari09@gmail.com`).trim()
+const FROM_ADDR   = (process.env.EMAIL_FROM_ADDRESS || '').trim()
+// No default fallback for FROM_ADDR on purpose — defaulting to a domain
+// nobody owns (e.g. medierp.app) silently fails sender verification at
+// every provider instead of giving a clear error. sendOTP() checks for
+// this and throws a clear message if EMAIL_FROM_ADDRESS isn't set.
 
 class EmailService {
   constructor() {
@@ -60,6 +64,10 @@ class EmailService {
     const subject = `${otp} is your ${APP_NAME} verification code`
     const html    = this._buildEmailHTML(otp, name)
     const text    = this._buildEmailText(otp)
+
+    if (this.provider !== 'console' && !FROM_ADDR) {
+      throw new Error('EMAIL_FROM_ADDRESS is required when EMAIL_PROVIDER is not "console" — set it to a sender address verified with your email provider.')
+    }
 
     try {
       switch (this.provider) {
