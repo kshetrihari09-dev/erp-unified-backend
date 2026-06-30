@@ -45,7 +45,13 @@ router.get('/customers', async (req, res, next) => {
     const [{ count }] = await base.clone().count('p.id as count')
     const data = await base.clone()
       .select('p.*', 'a.name as control_account_name', 'a.code as control_account_code')
+<<<<<<< HEAD
       .orderBy('p.name').limit(limit).offset(offset)
+=======
+    if (search) q = q.where(b => b.whereILike('p.name', `%${search}%`).orWhereILike('p.phone', `%${search}%`).orWhereILike('p.code', `%${search}%`))
+    const [{ count }] = await q.clone().clearSelect().count('p.id as count')
+    const data = await q.orderBy('p.name').limit(limit).offset(offset)
+>>>>>>> 8de82f8 (all good fine\)
     return paginatedResponse(res, { data, total: Number(count), page, limit })
   } catch (err) { next(err) }
 })
@@ -64,7 +70,13 @@ router.get('/suppliers', async (req, res, next) => {
     const [{ count }] = await base.clone().count('p.id as count')
     const data = await base.clone()
       .select('p.*', 'a.name as control_account_name', 'a.code as control_account_code')
+<<<<<<< HEAD
       .orderBy('p.name').limit(limit).offset(offset)
+=======
+    if (search) q = q.where(b => b.whereILike('p.name', `%${search}%`).orWhereILike('p.phone', `%${search}%`).orWhereILike('p.code', `%${search}%`))
+    const [{ count }] = await q.clone().clearSelect().count('p.id as count')
+    const data = await q.orderBy('p.name').limit(limit).offset(offset)
+>>>>>>> 8de82f8 (all good fine\)
     return paginatedResponse(res, { data, total: Number(count), page, limit })
   } catch (err) { next(err) }
 })
