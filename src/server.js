@@ -58,6 +58,12 @@ const stockRouter      = require('./routes/stock')
 const returnsRouter    = require('./routes/returns')
 const scannerRouter    = require('./scanner/scannerRoutes')
 
+// New: Cloud Storage integration (additive only — does not touch any
+// existing routes, services, or business logic above).
+const cloudStorageRouter       = require('./routes/cloudStorage')
+const cloudStorageOAuthRouter  = require('./routes/cloudStorage').publicRouter
+
+
 const { errorHandler } = require('./middleware/index')
 const db = require('./db/knex')
 
@@ -206,6 +212,12 @@ app.use(`${API}/reports`,    reportsRouter)
 
 // Scanner — dedicated rate limit for polling
 app.use(`${API}/scanner`,    scannerLimiter, scannerRouter)
+
+// Cloud Storage integration — additive routes only.
+// OAuth callback is public (no Bearer token on a provider redirect);
+// everything else requires authentication like the rest of the API.
+app.use(`${API}/cloud-storage/oauth`, cloudStorageOAuthRouter)
+app.use(`${API}/cloud-storage`,       cloudStorageRouter)
 
 // Date utilities (UNCHANGED)
 app.get(`${API}/date/today`, (req, res) => {
