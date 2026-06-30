@@ -99,6 +99,7 @@ class DropboxProvider extends CloudStorageProvider {
     throw new Error(errData.error_summary || 'Failed to create Dropbox folder')
   }
 
+<<<<<<< HEAD
   async uploadFile({ folderId, accessToken, fileName, buffer }) {
     // folderId here is actually the resolved folder path (see resolveFolder).
     const path = `${folderId || ''}/${fileName}`.replace(/\/+/g, '/')
@@ -116,6 +117,8 @@ class DropboxProvider extends CloudStorageProvider {
     return { fileId: data.id, webUrl: null }
   }
 
+=======
+>>>>>>> 8de82f8d6c2378109c87e7d4561ba9192b09e763
   async revokeToken({ accessToken }) {
     await fetch(`${API_BASE}/auth/token/revoke`, { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` } })
   }

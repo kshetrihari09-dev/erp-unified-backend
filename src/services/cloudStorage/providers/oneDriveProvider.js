@@ -115,6 +115,7 @@ class OneDriveProvider extends CloudStorageProvider {
     if (!createRes.ok) throw new Error(createData.error?.message || 'Failed to create OneDrive folder')
     return { folderId: createData.id }
   }
+<<<<<<< HEAD
 
   async uploadFile({ accessToken, folderId, fileName, mimeType, buffer }) {
     // Simple upload (files up to 4MB, which covers typical invoice/receipt
@@ -131,6 +132,8 @@ class OneDriveProvider extends CloudStorageProvider {
     if (!res.ok) throw new Error(data.error?.message || 'Failed to upload file to OneDrive')
     return { fileId: data.id, webUrl: data.webUrl }
   }
+=======
+>>>>>>> 8de82f8d6c2378109c87e7d4561ba9192b09e763
 }
 
 module.exports = OneDriveProvider

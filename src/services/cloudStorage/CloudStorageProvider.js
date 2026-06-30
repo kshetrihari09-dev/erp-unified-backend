@@ -101,6 +101,7 @@ class CloudStorageProvider {
   }
 
   /**
+<<<<<<< HEAD
    * Upload a file's contents into the resolved backup folder.
    * @param {{ accessToken: string, folderId: string, fileName: string, mimeType: string, buffer: Buffer }} params
    * @returns {Promise<{ fileId: string, webUrl?: string }>}
@@ -111,6 +112,8 @@ class CloudStorageProvider {
   }
 
   /**
+=======
+>>>>>>> 8de82f8d6c2378109c87e7d4561ba9192b09e763
    * Revoke the token with the provider, if the provider's API supports
    * remote revocation. Best-effort — disconnect should succeed locally
    * even if this throws (caller catches and logs).

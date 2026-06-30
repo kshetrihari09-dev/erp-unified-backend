@@ -36,7 +36,7 @@ router.get('/customers', async (req, res, next) => {
       .where({ 'p.company_id': req.companyId, 'p.type': 'customer' })
       .select('p.*', 'a.name as control_account_name', 'a.code as control_account_code')
     if (search) q = q.where(b => b.whereILike('p.name', `%${search}%`).orWhereILike('p.phone', `%${search}%`).orWhereILike('p.code', `%${search}%`))
-    const [{ count }] = await q.clone().count('p.id as count')
+    const [{ count }] = await q.clone().clearSelect().count('p.id as count')
     const data = await q.orderBy('p.name').limit(limit).offset(offset)
     return paginatedResponse(res, { data, total: Number(count), page, limit })
   } catch (err) { next(err) }
@@ -52,7 +52,7 @@ router.get('/suppliers', async (req, res, next) => {
       .where({ 'p.company_id': req.companyId, 'p.type': 'supplier' })
       .select('p.*', 'a.name as control_account_name', 'a.code as control_account_code')
     if (search) q = q.where(b => b.whereILike('p.name', `%${search}%`).orWhereILike('p.phone', `%${search}%`).orWhereILike('p.code', `%${search}%`))
-    const [{ count }] = await q.clone().count('p.id as count')
+    const [{ count }] = await q.clone().clearSelect().count('p.id as count')
     const data = await q.orderBy('p.name').limit(limit).offset(offset)
     return paginatedResponse(res, { data, total: Number(count), page, limit })
   } catch (err) { next(err) }
