@@ -115,6 +115,22 @@ class OneDriveProvider extends CloudStorageProvider {
     if (!createRes.ok) throw new Error(createData.error?.message || 'Failed to create OneDrive folder')
     return { folderId: createData.id }
   }
+
+  async uploadFile({ accessToken, folderId, fileName, mimeType, buffer }) {
+    // Simple upload (files up to 4MB, which covers typical invoice/receipt
+    // PDFs). Larger files would need the resumable upload session API.
+    const path = folderId
+      ? `/me/drive/items/${folderId}:/${encodeURIComponent(fileName)}:/content`
+      : `/me/drive/root:/${encodeURIComponent(fileName)}:/content`
+    const res = await fetch(`${GRAPH_API}${path}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': mimeType },
+      body: buffer,
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error?.message || 'Failed to upload file to OneDrive')
+    return { fileId: data.id, webUrl: data.webUrl }
+  }
 }
 
 module.exports = OneDriveProvider

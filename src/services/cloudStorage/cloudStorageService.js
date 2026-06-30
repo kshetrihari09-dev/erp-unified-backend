@@ -361,6 +361,68 @@ async function setDefaultProvider({ companyId, providerId }) {
   return listConnections({ companyId })
 }
 
+/* ── Upload (the actual document backup action) ─────────────────────────── */
+
+/**
+ * Upload a single document (invoice/bill/receipt/journal entry PDF, etc.)
+ * to a company's connected cloud storage provider.
+ *
+ * @param {object} params
+ * @param {string} params.companyId
+ * @param {string} [params.providerId]  Defaults to the company's default provider.
+ * @param {Buffer} params.buffer        File contents.
+ * @param {string} params.fileName      e.g. 'Invoice-INV-2026-0042.pdf'
+ * @param {string} [params.mimeType]    Defaults to 'application/pdf'.
+ * @returns {Promise<{ provider: string, fileId: string, webUrl?: string }>}
+ */
+async function uploadDocument({ companyId, providerId, buffer, fileName, mimeType = 'application/pdf' }) {
+  let row
+  if (providerId) {
+    row = await db('cloud_storage_connections').where({ company_id: companyId, provider: providerId }).first()
+  } else {
+    row = await db('cloud_storage_connections').where({ company_id: companyId, is_default: true, status: 'connected' }).first()
+  }
+
+  if (!row || row.status !== 'connected') {
+    const err = new Error('No connected cloud storage provider available for upload.')
+    err.status = 400
+    err.code = 'NOT_CONNECTED'
+    throw err
+  }
+
+  const resolvedProviderId = row.provider
+  const provider = registry.getProvider(resolvedProviderId)
+
+  try {
+    const accessToken = await getValidAccessToken({ companyId, providerId: resolvedProviderId })
+
+    let folderId = row.folder_id
+    if (!folderId) {
+      const resolved = await provider.resolveFolder({ accessToken, folderName: row.folder_name || 'Accounting Documents' })
+      folderId = resolved.folderId
+      await db('cloud_storage_connections').where({ id: row.id }).update({ folder_id: folderId, updated_at: new Date() })
+    }
+
+    const result = await provider.uploadFile({ accessToken, folderId, fileName, mimeType, buffer })
+
+    await db('cloud_storage_connections').where({ id: row.id }).update({
+      last_sync_at: new Date(),
+      last_sync_status: 'success',
+      last_error_message: null,
+      updated_at: new Date(),
+    })
+
+    return { provider: resolvedProviderId, ...result }
+  } catch (err) {
+    await db('cloud_storage_connections').where({ id: row.id }).update({
+      last_sync_status: 'failed',
+      last_error_message: err.message,
+      updated_at: new Date(),
+    })
+    throw err
+  }
+}
+
 module.exports = {
   listProviderCatalog,
   beginAuthorization,
@@ -372,4 +434,5 @@ module.exports = {
   testConnection,
   updateConnectionSettings,
   setDefaultProvider,
+  uploadDocument,
 }

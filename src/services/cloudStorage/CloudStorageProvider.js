@@ -101,6 +101,16 @@ class CloudStorageProvider {
   }
 
   /**
+   * Upload a file's contents into the resolved backup folder.
+   * @param {{ accessToken: string, folderId: string, fileName: string, mimeType: string, buffer: Buffer }} params
+   * @returns {Promise<{ fileId: string, webUrl?: string }>}
+   * Must override.
+   */
+  async uploadFile(/* params */) {
+    throw new Error(`${this.id}: uploadFile() not implemented`)
+  }
+
+  /**
    * Revoke the token with the provider, if the provider's API supports
    * remote revocation. Best-effort — disconnect should succeed locally
    * even if this throws (caller catches and logs).

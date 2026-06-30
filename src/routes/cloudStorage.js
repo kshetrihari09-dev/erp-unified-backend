@@ -12,11 +12,17 @@
    cloud storage connections.
 ═══════════════════════════════════════════════════════════════════════ */
 const router = require('express').Router()
+const multer = require('multer')
 const { authenticate, requireRole } = require('../middleware/index')
 const { successResponse } = require('../middleware/helpers')
 const { auditLog } = require('../utils/helpers')
 const cloudStorageService = require('../services/cloudStorage/cloudStorageService')
 const { isValidProviderId } = require('../services/cloudStorage/CloudStorageRegistry')
+
+// Files are buffered in memory (never written to disk) and streamed
+// straight to the provider's upload API. 20MB cap comfortably covers
+// invoice/bill/receipt PDFs.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } })
 
 function validateProviderParam(req, res, next) {
   if (!isValidProviderId(req.params.provider)) {
@@ -33,19 +39,25 @@ function validateProviderParam(req, res, next) {
    row created in beginAuthorization — never trusted from the request
    itself. */
 const publicRouter = require('express').Router()
+/* Frontend lives on a different domain (e.g. Vercel) than this API
+   (e.g. Render), so redirects after OAuth must be absolute, built from
+   FRONTEND_URL — never a relative path. Falls back to '' (relative)
+   only if FRONTEND_URL isn't set, e.g. in same-domain/local setups. */
+const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '')
+
 publicRouter.get('/:provider/callback', validateProviderParam, async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query
     if (error) {
-      return res.redirect(`/settings/cloud-storage?status=error&provider=${req.params.provider}&message=${encodeURIComponent(error_description || error)}`)
+      return res.redirect(`${FRONTEND_URL}/settings/cloud-storage?status=error&provider=${req.params.provider}&message=${encodeURIComponent(error_description || error)}`)
     }
     if (!code || !state) {
       return res.status(400).json({ success: false, message: 'Missing code or state in OAuth callback' })
     }
     await cloudStorageService.completeAuthorization({ providerId: req.params.provider, code, state })
-    return res.redirect(`/settings/cloud-storage?status=connected&provider=${req.params.provider}`)
+    return res.redirect(`${FRONTEND_URL}/settings/cloud-storage?status=connected&provider=${req.params.provider}`)
   } catch (err) {
-    return res.redirect(`/settings/cloud-storage?status=error&provider=${req.params.provider}&message=${encodeURIComponent(err.message)}`)
+    return res.redirect(`${FRONTEND_URL}/settings/cloud-storage?status=error&provider=${req.params.provider}&message=${encodeURIComponent(err.message)}`)
   }
 })
 
@@ -128,6 +140,40 @@ router.put('/connections/:provider/settings', requireRole('admin', 'manager'), v
     await auditLog(req.companyId, req.user.id, 'UPDATE', 'cloud_storage_connection', req.params.provider, { folderName, autoUploadEnabled }, req.ip)
     return successResponse(res, result)
   } catch (err) { next(err) }
+})
+
+/* ── POST /cloud-storage/upload ───────────────────────────────────────────
+   Upload a single document (PDF, etc.) to the company's connected cloud
+   storage. Body: multipart/form-data, field "file". Optional field
+   "provider" to target a specific connection instead of the default.
+   This is the integration point any existing feature (invoice/bill/
+   journal-entry/receipt PDF generation) can call once it wants to back
+   a document up — nothing about this route changes how those documents
+   are generated or saved locally; it only adds an optional copy step. */
+router.post('/upload', upload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file provided. Attach it under field name "file".' })
+    }
+    const { provider } = req.body
+    if (provider && !isValidProviderId(provider)) {
+      return res.status(400).json({ success: false, message: `Unknown provider: ${provider}` })
+    }
+
+    const result = await cloudStorageService.uploadDocument({
+      companyId: req.companyId,
+      providerId: provider || undefined,
+      buffer: req.file.buffer,
+      fileName: req.file.originalname,
+      mimeType: req.file.mimetype || 'application/pdf',
+    })
+
+    await auditLog(req.companyId, req.user.id, 'UPLOAD', 'cloud_storage_document', result.fileId, { fileName: req.file.originalname, provider: result.provider }, req.ip)
+    return successResponse(res, result)
+  } catch (err) {
+    const status = err.status || 502
+    return res.status(status).json({ success: false, message: err.message, code: err.code })
+  }
 })
 
 /* ── POST /cloud-storage/default ─────────────────────────────────────────

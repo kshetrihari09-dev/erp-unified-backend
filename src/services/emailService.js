@@ -3,15 +3,12 @@
  *
  * Supports:
  *   - 'nodemailer_smtp'  any SMTP server (Gmail, Outlook, custom)
- *   - 'brevo'            Brevo transactional email HTTPS API (recommended on
- *                         Render free tier — SMTP ports 25/465/587 are
- *                         blocked there, but HTTPS/443 is never blocked)
  *   - 'sendgrid'         SendGrid API
  *   - 'mailgun'          Mailgun API
  *   - 'console'          Development: print to terminal (default)
  *
  * .env keys:
- *   EMAIL_PROVIDER=smtp|brevo|sendgrid|mailgun|console
+ *   EMAIL_PROVIDER=smtp|sendgrid|mailgun|console
  *   EMAIL_FROM_NAME=MediERP
  *   EMAIL_FROM_ADDRESS=noreply@yourcompany.com
  *
@@ -21,10 +18,6 @@
  *   SMTP_SECURE=false          (true for port 465)
  *   SMTP_USER=your@gmail.com
  *   SMTP_PASS=your_app_password
- *
- *   # Brevo (HTTPS API — use this on Render free tier instead of smtp)
- *   BREVO_API_KEY=xkeysib-xxxx   (from Brevo: Settings > SMTP & API > API Keys
- *                                 tab — NOT the SMTP key from the SMTP tab)
  *
  *   # SendGrid
  *   SENDGRID_API_KEY=SG.xxxx
@@ -38,17 +31,13 @@
 const https  = require('https')
 const http   = require('http')
 
-const APP_NAME    = (process.env.APP_NAME          || 'MediERP').trim()
-const FROM_NAME   = (process.env.EMAIL_FROM_NAME   || APP_NAME).trim()
-const FROM_ADDR   = (process.env.EMAIL_FROM_ADDRESS || '').trim()
-// No default fallback for FROM_ADDR on purpose — defaulting to a domain
-// nobody owns (e.g. medierp.app) silently fails sender verification at
-// every provider instead of giving a clear error. sendOTP() checks for
-// this and throws a clear message if EMAIL_FROM_ADDRESS isn't set.
+const APP_NAME    = process.env.APP_NAME          || 'MediERP'
+const FROM_NAME   = process.env.EMAIL_FROM_NAME   || APP_NAME
+const FROM_ADDR   = process.env.EMAIL_FROM_ADDRESS || `noreply@medierp.app`
 
 class EmailService {
   constructor() {
-    this.provider = (process.env.EMAIL_PROVIDER || 'brevo').toLowerCase()
+    this.provider = (process.env.EMAIL_PROVIDER || 'console').toLowerCase()
   }
 
   /* ── Public API ─────────────────────────────────────────────────────────── */
@@ -65,17 +54,11 @@ class EmailService {
     const html    = this._buildEmailHTML(otp, name)
     const text    = this._buildEmailText(otp)
 
-    if (this.provider !== 'console' && !FROM_ADDR) {
-      throw new Error('EMAIL_FROM_ADDRESS is required when EMAIL_PROVIDER is not "console" — set it to a sender address verified with your email provider.')
-    }
-
     try {
       switch (this.provider) {
         case 'smtp':
         case 'nodemailer_smtp':
           return await this._sendSMTP(email, subject, html, text)
-        case 'brevo':
-          return await this._sendBrevo(email, subject, html, text)
         case 'sendgrid':
           return await this._sendSendGrid(email, subject, html, text)
         case 'mailgun':
@@ -204,7 +187,7 @@ class EmailService {
     // Use nodemailer if available, otherwise fall back to raw SMTP
     try {
       const nodemailer = require('nodemailer')
-      const transporter = nodemailer.createTransport({
+      const transporter = nodemailer.createTransporter({
         host:   process.env.SMTP_HOST,
         port:   parseInt(process.env.SMTP_PORT || '587'),
         secure: process.env.SMTP_SECURE === 'true',
@@ -229,38 +212,6 @@ class EmailService {
       }
       throw err
     }
-  }
-
-  async _sendBrevo(to, subject, html, text) {
-    // .trim() guards against trailing newlines/whitespace that can sneak in
-    // when copy-pasting the key into a dashboard input field — Node's http
-    // module rejects header values containing \n/\r with
-    // "Invalid character in header content".
-    const apiKey = (process.env.BREVO_API_KEY || '').trim()
-    if (!apiKey) throw new Error('BREVO_API_KEY is required (Brevo dashboard: Settings > SMTP & API > API Keys tab)')
-
-    const payload = JSON.stringify({
-      sender:      { name: FROM_NAME, email: FROM_ADDR },
-      to:          [{ email: to }],
-      subject,
-      htmlContent: html,
-      textContent: text,
-    })
-
-    const result = await this._post(
-      'https://api.brevo.com/v3/smtp/email',
-      payload,
-      {
-        'Content-Type': 'application/json',
-        'api-key':      apiKey,
-        'Accept':       'application/json',
-      }
-    )
-
-    if (result.messageId) {
-      return { success: true, messageId: result.messageId, provider: 'brevo' }
-    }
-    return { success: false, error: result.message || JSON.stringify(result), provider: 'brevo' }
   }
 
   async _sendSendGrid(to, subject, html, text) {

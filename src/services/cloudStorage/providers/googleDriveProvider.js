@@ -102,6 +102,25 @@ class GoogleDriveProvider extends CloudStorageProvider {
     return { folderId: createData.id }
   }
 
+  async uploadFile({ accessToken, folderId, fileName, mimeType, buffer }) {
+    const metadata = { name: fileName, parents: folderId ? [folderId] : undefined }
+    const boundary = `erp_boundary_${Date.now()}`
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n`),
+      Buffer.from(`--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`),
+      buffer,
+      Buffer.from(`\r\n--${boundary}--`),
+    ])
+    const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+      body,
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error?.message || 'Failed to upload file to Google Drive')
+    return { fileId: data.id, webUrl: data.webViewLink }
+  }
+
   async revokeToken({ accessToken }) {
     await fetch(`https://oauth2.googleapis.com/revoke?token=${accessToken}`, { method: 'POST' })
   }
