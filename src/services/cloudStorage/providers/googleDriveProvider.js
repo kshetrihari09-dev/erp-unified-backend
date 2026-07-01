@@ -102,7 +102,6 @@ class GoogleDriveProvider extends CloudStorageProvider {
     return { folderId: createData.id }
   }
 
-<<<<<<< HEAD
   async uploadFile({ accessToken, folderId, fileName, mimeType, buffer }) {
     const metadata = { name: fileName, parents: folderId ? [folderId] : undefined }
     const boundary = `erp_boundary_${Date.now()}`
@@ -122,8 +121,6 @@ class GoogleDriveProvider extends CloudStorageProvider {
     return { fileId: data.id, webUrl: data.webViewLink }
   }
 
-=======
->>>>>>> 8de82f8d6c2378109c87e7d4561ba9192b09e763
   async revokeToken({ accessToken }) {
     await fetch(`https://oauth2.googleapis.com/revoke?token=${accessToken}`, { method: 'POST' })
   }

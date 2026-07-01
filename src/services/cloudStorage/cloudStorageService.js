@@ -361,7 +361,6 @@ async function setDefaultProvider({ companyId, providerId }) {
   return listConnections({ companyId })
 }
 
-<<<<<<< HEAD
 /* ── Upload (the actual document backup action) ─────────────────────────── */
 
 /**
@@ -424,8 +423,6 @@ async function uploadDocument({ companyId, providerId, buffer, fileName, mimeTyp
   }
 }
 
-=======
->>>>>>> 8de82f8d6c2378109c87e7d4561ba9192b09e763
 module.exports = {
   listProviderCatalog,
   beginAuthorization,
@@ -437,8 +434,5 @@ module.exports = {
   testConnection,
   updateConnectionSettings,
   setDefaultProvider,
-<<<<<<< HEAD
   uploadDocument,
-=======
->>>>>>> 8de82f8d6c2378109c87e7d4561ba9192b09e763
 }
