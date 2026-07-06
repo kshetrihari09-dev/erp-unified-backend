@@ -108,7 +108,7 @@ async function fetchProductWithStock(productId, companyId) {
   const p = await db('products')
     .where({ id: productId, company_id: companyId, is_active: true })
     .first(
-      'id', 'item_code', 'name', 'generic_name', 'company_name',
+      'id', 'item_code', 'barcode', 'name', 'generic_name', 'company_name',
       'unit', 'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active',
       db.raw('tax_rate   as vat_percent'),
       db.raw('cc_percent as cc_pct')
@@ -263,21 +263,29 @@ router.get('/products/barcode/:code', authenticate, async (req, res, next) => {
     const code = req.params.code?.trim()
     if (!code) return res.status(400).json({ success: false, message: 'Barcode required' })
 
-    // 1. Exact match
-    let product = await db('products')
-      .where({ company_id: req.companyId, item_code: code, is_active: true })
-      .first('id', 'item_code', 'name', 'generic_name', 'company_name', 'unit',
+    const cols = ['id', 'item_code', 'barcode', 'name', 'generic_name', 'company_name', 'unit',
              'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active',
-             db.raw('tax_rate as vat_percent'), db.raw('cc_percent as cc_pct'))
+             db.raw('tax_rate as vat_percent'), db.raw('cc_percent as cc_pct')]
 
-    // 2. Case-insensitive fallback
+    // 1. Real barcode column — exact match
+    let product = await db('products')
+      .where({ company_id: req.companyId, barcode: code, is_active: true })
+      .first(...cols)
+
+    // 2. item_code — exact match (internal SKU, also scannable)
+    if (!product) {
+      product = await db('products')
+        .where({ company_id: req.companyId, item_code: code, is_active: true })
+        .first(...cols)
+    }
+
+    // 3. Case-insensitive fallback on either column
     if (!product) {
       product = await db('products')
         .where({ company_id: req.companyId, is_active: true })
-        .whereRaw('LOWER(item_code) = LOWER(?)', [code])
-        .first('id', 'item_code', 'name', 'generic_name', 'company_name', 'unit',
-               'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active',
-               db.raw('tax_rate as vat_percent'), db.raw('cc_percent as cc_pct'))
+        .where(b => b.whereRaw('LOWER(barcode) = LOWER(?)', [code])
+                     .orWhereRaw('LOWER(item_code) = LOWER(?)', [code]))
+        .first(...cols)
     }
 
     if (!product) {
@@ -308,6 +316,7 @@ router.get('/products/fuzzy', authenticate, async (req, res, next) => {
         b.whereRaw('name         ILIKE ?', [pattern])
          .orWhereRaw('generic_name ILIKE ?', [pattern])
          .orWhereRaw('item_code    ILIKE ?', [pattern])
+         .orWhereRaw('barcode      ILIKE ?', [pattern])
       )
       .orderByRaw(`
         CASE
@@ -317,7 +326,7 @@ router.get('/products/fuzzy', authenticate, async (req, res, next) => {
         END, name ASC
       `, [`${raw}%`, `${raw}%`])
       .limit(limit)
-      .select('id', 'item_code', 'name', 'generic_name', 'company_name', 'unit',
+      .select('id', 'item_code', 'barcode', 'name', 'generic_name', 'company_name', 'unit',
               'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active',
               db.raw('tax_rate as vat_percent'), db.raw('cc_percent as cc_pct'))
 

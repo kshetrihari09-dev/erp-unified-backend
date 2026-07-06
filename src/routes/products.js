@@ -37,7 +37,7 @@ router.get('/', async (req, res, next) => {
     const { search, category, is_active } = req.query
 
     let q = db('products').where({ company_id: req.companyId })
-    if (search)               q = q.where(b => b.whereILike('name', `%${search}%`).orWhereILike('item_code', `%${search}%`).orWhereILike('generic_name', `%${search}%`).orWhereILike('company_name', `%${search}%`))
+    if (search)               q = q.where(b => b.whereILike('name', `%${search}%`).orWhereILike('item_code', `%${search}%`).orWhereILike('barcode', `%${search}%`).orWhereILike('generic_name', `%${search}%`).orWhereILike('company_name', `%${search}%`))
     if (category)             q = q.where({ category })
     if (is_active !== undefined) q = q.where({ is_active: is_active === 'true' })
 
@@ -102,7 +102,7 @@ router.get('/search', async (req, res, next) => {
       .orderBy('name', 'asc')
       .limit(limit)
       .select(
-        'id', 'item_code', 'name', 'generic_name',
+        'id', 'item_code', 'barcode', 'name', 'generic_name',
         'company_name', 'unit', 'sales_rate', 'mrp',
         'purchase_rate', 'min_stock', 'is_active',
         // alias the DB column name to the field name the frontend expects
@@ -178,7 +178,7 @@ router.get('/:id/stock', async (req, res, next) => {
 router.post('/', async (req, res, next) => {
   try {
     const {
-      name, generic_name, company_name, category, unit,
+      name, generic_name, company_name, category, unit, barcode,
       purchase_rate, sales_rate, mrp, cc_percent, min_stock,
     } = req.body
 
@@ -187,10 +187,20 @@ router.post('/', async (req, res, next) => {
     if (sales_rate == null || isNaN(Number(sales_rate)))
       return res.status(400).json({ success: false, message: 'Sales rate is required' })
 
+    const cleanBarcode = barcode?.toString().trim() || null
+    if (cleanBarcode) {
+      const dupe = await db('products')
+        .where({ company_id: req.companyId, barcode: cleanBarcode })
+        .first('id')
+      if (dupe)
+        return res.status(400).json({ success: false, message: 'This barcode is already assigned to another product' })
+    }
+
     const item_code = await nextItemCode(req.companyId)
     const [product] = await db('products').insert({
       company_id:   req.companyId,
       item_code,
+      barcode:      cleanBarcode,
       name:         name.trim(),
       generic_name: generic_name?.trim() || null,
       company_name: company_name?.trim() || null,
@@ -206,7 +216,12 @@ router.post('/', async (req, res, next) => {
 
     await auditLog(req.companyId, req.user.id, 'CREATE', 'products', product.id, { name }, req.ip)
     return successResponse(res, product, 'Product created', 201)
-  } catch (err) { next(err) }
+  } catch (err) {
+    if (err?.code === '23505') {
+      return res.status(400).json({ success: false, message: 'This barcode is already assigned to another product' })
+    }
+    next(err)
+  }
 })
 
 /* ── PUT /products/:id ────────────────────────────────────────────────────── */
@@ -218,7 +233,7 @@ router.put('/:id', async (req, res, next) => {
     if (!existing) return res.status(404).json({ success: false, message: 'Product not found' })
 
     const allowed = [
-      'name', 'generic_name', 'company_name', 'category', 'unit',
+      'name', 'generic_name', 'company_name', 'category', 'unit', 'barcode',
       'purchase_rate', 'sales_rate', 'mrp', 'cc_percent', 'min_stock', 'is_active',
     ]
     const updates = {}
@@ -228,9 +243,20 @@ router.put('/:id', async (req, res, next) => {
           updates[k] = Number(req.body[k])
         else if (k === 'cc_percent')
           updates[k] = Math.min(100, Math.max(0, Number(req.body[k]) || 0))
+        else if (k === 'barcode')
+          updates[k] = req.body[k]?.toString().trim() || null
         else
           updates[k] = req.body[k]
       }
+    }
+
+    if (updates.barcode) {
+      const dupe = await db('products')
+        .where({ company_id: req.companyId, barcode: updates.barcode })
+        .whereNot({ id: req.params.id })
+        .first('id')
+      if (dupe)
+        return res.status(400).json({ success: false, message: 'This barcode is already assigned to another product' })
     }
 
     const [updated] = await db('products')
@@ -240,7 +266,12 @@ router.put('/:id', async (req, res, next) => {
 
     await auditLog(req.companyId, req.user.id, 'UPDATE', 'products', req.params.id, updates, req.ip)
     return successResponse(res, updated)
-  } catch (err) { next(err) }
+  } catch (err) {
+    if (err?.code === '23505') {
+      return res.status(400).json({ success: false, message: 'This barcode is already assigned to another product' })
+    }
+    next(err)
+  }
 })
 
 /* ── DELETE /products/:id ─────────────────────────────────────────────────── */
