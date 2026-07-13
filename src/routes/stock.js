@@ -91,7 +91,7 @@ router.get('/', async (req, res, next) => {
 /* ── GET /stock/batches ────────────────────────────────────────────────────── */
 router.get('/batches', async (req, res, next) => {
   try {
-    const { expiring_in_days } = req.query
+    const { expiring_in_days, product_id } = req.query
 
     // L50 FIX:
     //   db('stock_batches as sb')          → db('inventory_batches as sb')
@@ -103,6 +103,7 @@ router.get('/batches', async (req, res, next) => {
       .where('sb.company_id', req.companyId)
       .andWhere(`sb.${QTY}`, '>', 0)                    // L50 FIX: was 'sb.qty_available'
       .select(
+        'sb.product_id',                                // additive: needed by the frontend batch selector to filter per-product
         'p.name as product_name',
         'p.item_code',
         'sb.batch_no',
@@ -114,6 +115,12 @@ router.get('/batches', async (req, res, next) => {
         'p.sales_rate',
       )
       .orderBy('sb.expiry_date', 'asc')
+
+    // Additive, optional filter — existing callers that omit product_id see
+    // no change in behavior (still all batches company-wide).
+    if (product_id) {
+      q = q.where('sb.product_id', product_id)
+    }
 
     if (expiring_in_days) {
       const cutoff = new Date(Date.now() + Number(expiring_in_days) * 86400000)
