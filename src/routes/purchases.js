@@ -20,7 +20,7 @@ const router = require('express').Router()
 const db     = require('../db/knex')
 const { authenticate }  = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
-const { nextBillNo, adToBS, todayBS, auditLog } = require('../utils/helpers')
+const { nextBillNo, adToBS, todayBS, auditLog, clampExpiry } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
 
 router.use(authenticate)
@@ -93,7 +93,7 @@ router.post('/', async (req, res, next) => {
         product_id:   item.product_id   || null,
         product_name: item.product_name || '',
         batch_no:     item.batch_no     || null,
-        expiry:       item.expiry       || null,
+        expiry:       clampExpiry(item.expiry),
         qty,
         bonus,
         rate,
@@ -129,7 +129,7 @@ router.post('/', async (req, res, next) => {
           company_id:    req.companyId,
           product_id:    item.product_id,
           batch_no:      item.batch_no || null,
-          expiry:        item.expiry   || null,
+          expiry:        clampExpiry(item.expiry),
           expiry_date:   parseExpiryToDate(item.expiry),
           receipt_date:  date,          // FIX L73: was date_ad (as a column key, not value)
           qty_received:  totalQty,      // FIX L72: was qty_in

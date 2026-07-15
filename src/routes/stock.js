@@ -111,7 +111,13 @@ router.get('/batches', async (req, res, next) => {
         'p.item_code',
         'sb.batch_no',
         'sb.expiry',
-        'sb.expiry_date',
+        // Cast to plain YYYY-MM-DD text — the pg driver otherwise returns
+        // DATE columns as JS Date objects, which JSON-serialize as full
+        // ISO timestamps (e.g. "2027-12-15T00:00:00.000Z", 24 chars). That
+        // was overflowing sale_items.expiry (varchar(20)) once a batch's
+        // expiry_date got round-tripped from this endpoint back into a
+        // sale payload.
+        db.raw(`to_char(sb.expiry_date, 'YYYY-MM-DD') as expiry_date`),
         `sb.${QTY} as qty_available`,                   // L50 FIX: alias for frontend compat
         `sb.${QTY} as qty_remaining`,
         'sb.unit_cost as purchase_rate',                 // L50 FIX: alias for frontend compat

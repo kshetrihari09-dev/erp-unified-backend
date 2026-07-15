@@ -32,7 +32,7 @@ const router = require('express').Router()
 const db     = require('../db/knex')
 const { authenticate } = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
-const { nextInvoiceNo, adToBS, todayBS, auditLog } = require('../utils/helpers')
+const { nextInvoiceNo, adToBS, todayBS, auditLog, clampExpiry } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
 
 router.use(authenticate)
@@ -167,7 +167,7 @@ router.post('/', async (req, res, next) => {
         : 0
       const amount  = Math.round((qty * rate + cc_amount) * 100) / 100
       subtotal += amount; cc_total += cc_amount
-      return { product_id: item.product_id || null, product_name: item.product_name || '', batch_no: item.batch_no || null, batch_id: item.batch_id || null, expiry: item.expiry || null, qty, bonus, rate, discount_pct: Number(item.discount_pct) || 0, cc_pct, cc_amount, amount }
+      return { product_id: item.product_id || null, product_name: item.product_name || '', batch_no: item.batch_no || null, batch_id: item.batch_id || null, expiry: clampExpiry(item.expiry), qty, bonus, rate, discount_pct: Number(item.discount_pct) || 0, cc_pct, cc_amount, amount }
     })
 
     const net_total   = Math.round((subtotal) * 100) / 100

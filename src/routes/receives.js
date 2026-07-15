@@ -8,7 +8,7 @@ const router = require('express').Router()
 const db     = require('../db/knex')
 const { authenticate }  = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
-const { auditLog, adToBS, todayBS } = require('../utils/helpers')
+const { auditLog, adToBS, todayBS, clampExpiry } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
 
 router.use(authenticate)
@@ -62,7 +62,7 @@ router.post('/', async (req, res, next) => {
         receive_id:  receive.id,
         product_id:  item.product_id,
         batch_no:    item.batch_no || null,
-        expiry:      item.expiry   || null,
+        expiry:      clampExpiry(item.expiry),
         qty,
         bonus,
         rate,
@@ -73,7 +73,7 @@ router.post('/', async (req, res, next) => {
         company_id:    req.companyId,
         product_id:    item.product_id,
         batch_no:      item.batch_no || 'RCV',
-        expiry:        item.expiry   || null,
+        expiry:        clampExpiry(item.expiry),
         expiry_date:   parseExpiryToDate(item.expiry),
         receipt_date:  receiveDate,
         qty_received:  totalQty,

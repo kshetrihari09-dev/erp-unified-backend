@@ -10,6 +10,20 @@
  */
 const db = require('../db/knex')
 
+/* ── Safe expiry text for varchar(20) columns ─────────────────────────────
+ * inventory_batches.expiry / purchase_items.expiry / receive_items.expiry /
+ * sale_items.expiry are all varchar(20), meant to hold a short display
+ * value like "12/2027". If a Date object (or an ISO timestamp string like
+ * "2027-12-15T00:00:00.000Z") ever ends up here — e.g. round-tripped from
+ * a batch's expiry_date — inserting it raw overflows the column. This
+ * takes just the date portion and hard-caps the length as a last resort. */
+function clampExpiry(raw) {
+  if (raw === null || raw === undefined || raw === '') return null
+  const str = raw instanceof Date ? raw.toISOString() : String(raw)
+  const dateOnly = str.split('T')[0]
+  return dateOnly.slice(0, 20)
+}
+
 /* ── Nepali BS date conversion ──────────────────────────────────────────── */
 const BS_YEAR_START_AD = {
   2078: '2021-04-14', 2079: '2022-04-14', 2080: '2023-04-14',
@@ -131,4 +145,4 @@ function isValidUUID(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str)
 }
 
-module.exports = { adToBS, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, auditLog }
+module.exports = { adToBS, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, auditLog, clampExpiry }
