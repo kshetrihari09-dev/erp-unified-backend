@@ -18,6 +18,15 @@
  * L181: trx('stock_batches').where()                     → trx('inventory_batches').where()
  * L182: qty_out: Math.max(0, Number(batch.qty_out)-item.qty) → removed
  * L183: qty_available: Number(batch.qty_available)+item.qty  → qty_remaining: Number(batch.qty_remaining)+item.qty
+ *
+ * Batch-selection fix (see migration 016):
+ * POST /sales previously deducted stock via a FIFO sweep across every
+ * batch of a product, ignoring which batch the Sale page's Batch
+ * Selection popup told the user they were selling from — so a sale could
+ * silently pull from a batch other than the one shown/selected. It now
+ * deducts only from the exact batch (item.batch_id, falling back to a
+ * batch_no match for older clients) and records that batch_id on the
+ * sale_items row so cancellation restores stock to that same lot.
  */
 const router = require('express').Router()
 const db     = require('../db/knex')
@@ -158,7 +167,7 @@ router.post('/', async (req, res, next) => {
         : 0
       const amount  = Math.round((qty * rate + cc_amount) * 100) / 100
       subtotal += amount; cc_total += cc_amount
-      return { product_id: item.product_id || null, product_name: item.product_name || '', batch_no: item.batch_no || null, expiry: item.expiry || null, qty, bonus, rate, discount_pct: Number(item.discount_pct) || 0, cc_pct, cc_amount, amount }
+      return { product_id: item.product_id || null, product_name: item.product_name || '', batch_no: item.batch_no || null, batch_id: item.batch_id || null, expiry: item.expiry || null, qty, bonus, rate, discount_pct: Number(item.discount_pct) || 0, cc_pct, cc_amount, amount }
     })
 
     const net_total   = Math.round((subtotal) * 100) / 100
@@ -173,27 +182,69 @@ router.post('/', async (req, res, next) => {
     }).returning('*')
 
     for (const item of saleItems) {
-      await trx('sale_items').insert({ sale_id: sale.id, ...item })
-
-      // L123-134 FIX: FIFO deduction
-      // stock_batches → inventory_batches, qty_available → qty_remaining, qty_out → removed
+      // ── Batch-specific deduction ──────────────────────────────────────────
+      // The Sale page's Batch Selection popup only ever offers batches that
+      // belong to this exact product, so an item posted from Sale always
+      // carries the id of the one lot the user picked. Stock must come out
+      // of that exact inventory_batches row and nothing else — never a FIFO
+      // sweep across every batch of the product, which could silently pull
+      // from a different lot (including one the user never saw/selected).
+      let resolvedBatchId = null
       if (item.product_id && item.qty > 0) {
-        const batches = await trx(T)                           // L123 FIX
-          .where({ product_id: item.product_id, company_id: req.companyId })
-          .where(QTY, '>', 0)                                  // L125 FIX
-          .orderBy('expiry_date', 'asc')
+        let batch = null
 
-        let remaining = item.qty
-        for (const batch of batches) {
-          if (remaining <= 0) break
-          const deduct = Math.min(remaining, Number(batch[QTY]))  // L131 FIX
-          await trx(T).where({ id: batch.id }).update({            // L132 FIX
-            // L133 FIX: qty_out removed — column does not exist
-            [QTY]: Number(batch[QTY]) - deduct,                   // L134 FIX
-          })
-          remaining -= deduct
+        if (item.batch_id) {
+          batch = await trx(T)
+            .where({ id: item.batch_id, product_id: item.product_id, company_id: req.companyId })
+            .first()
+          if (!batch) {
+            await trx.rollback()
+            return res.status(400).json({ success: false, message: `Selected batch for "${item.product_name}" no longer exists — please re-select a batch.` })
+          }
+        } else if (item.batch_no) {
+          // Back-compat for older clients that only send batch_no: match the
+          // exact lot by product + batch number rather than sweeping FIFO.
+          batch = await trx(T)
+            .where({ product_id: item.product_id, company_id: req.companyId, batch_no: item.batch_no })
+            .where(QTY, '>', 0)
+            .orderBy('created_at', 'asc')
+            .first()
+          if (!batch) {
+            await trx.rollback()
+            return res.status(400).json({ success: false, message: `Batch "${item.batch_no}" has no available stock for "${item.product_name}".` })
+          }
+        }
+
+        if (batch) {
+          if (Number(batch[QTY]) < item.qty) {
+            await trx.rollback()
+            return res.status(400).json({
+              success: false,
+              message: `Insufficient stock in batch "${batch.batch_no || '—'}" for "${item.product_name}" (available ${batch[QTY]}, requested ${item.qty}).`,
+            })
+          }
+          await trx(T).where({ id: batch.id }).update({ [QTY]: Number(batch[QTY]) - item.qty })
+          resolvedBatchId = batch.id
+        } else {
+          // No batch selected at all — legacy fallback for non-batch-tracked
+          // callers/products only. The Sale page itself always resolves a
+          // batch before a row can be posted (see BatchSelect.tsx/QtyGate.tsx).
+          const batches = await trx(T)
+            .where({ product_id: item.product_id, company_id: req.companyId })
+            .where(QTY, '>', 0)
+            .orderBy('expiry_date', 'asc')
+
+          let remaining = item.qty
+          for (const b of batches) {
+            if (remaining <= 0) break
+            const deduct = Math.min(remaining, Number(b[QTY]))
+            await trx(T).where({ id: b.id }).update({ [QTY]: Number(b[QTY]) - deduct })
+            remaining -= deduct
+          }
         }
       }
+
+      await trx('sale_items').insert({ sale_id: sale.id, ...item, batch_id: resolvedBatchId })
     }
 
     // ── Accounting Integration ─────────────────────────────────────────────────
@@ -241,18 +292,31 @@ router.put('/:id/cancel', async (req, res, next) => {
     if (!sale)                       { await trx.rollback(); return res.status(404).json({ success: false, message: 'Sale not found' }) }
     if (sale.status === 'cancelled') { await trx.rollback(); return res.status(400).json({ success: false, message: 'Already cancelled' }) }
 
-    // L177-183 FIX: reverse FIFO — stock_batches → inventory_batches,
-    //                qty_out → removed, qty_available → qty_remaining
+    // Reverse stock into the exact batch each item was deducted from —
+    // never a different lot of the same product. Items posted after
+    // migration 016 carry batch_id (the precise lot); older rows fall back
+    // to matching by batch_no, and only as a last resort to "most recent
+    // batch for this product" for legacy rows with no batch info at all.
     const items = await trx('sale_items').where({ sale_id: sale.id })
     for (const item of items) {
       if (item.product_id && item.qty > 0) {
-        const batch = await trx(T)                               // L177 FIX
-          .where({ product_id: item.product_id, company_id: req.companyId })
-          .orderBy('created_at', 'desc').first()
+        let batch = null
+        if (item.batch_id) {
+          batch = await trx(T).where({ id: item.batch_id, company_id: req.companyId }).first()
+        }
+        if (!batch && item.batch_no) {
+          batch = await trx(T)
+            .where({ product_id: item.product_id, company_id: req.companyId, batch_no: item.batch_no })
+            .orderBy('created_at', 'asc').first()
+        }
+        if (!batch) {
+          batch = await trx(T)
+            .where({ product_id: item.product_id, company_id: req.companyId })
+            .orderBy('created_at', 'desc').first()
+        }
         if (batch) {
-          await trx(T).where({ id: batch.id }).update({          // L181 FIX
-            // L182 FIX: qty_out removed
-            [QTY]: Number(batch[QTY]) + Number(item.qty),        // L183 FIX
+          await trx(T).where({ id: batch.id }).update({
+            [QTY]: Number(batch[QTY]) + Number(item.qty),
           })
         }
       }

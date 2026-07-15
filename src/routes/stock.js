@@ -103,6 +103,9 @@ router.get('/batches', async (req, res, next) => {
       .where('sb.company_id', req.companyId)
       .andWhere(`sb.${QTY}`, '>', 0)                    // L50 FIX: was 'sb.qty_available'
       .select(
+        'sb.id',                                         // additive: unique per-lot id — required so the Sale batch picker can
+                                                           // target this exact lot for deduction (batch_no alone can repeat
+                                                           // across lots of the same product)
         'sb.product_id',                                // additive: needed by the frontend batch selector to filter per-product
         'p.name as product_name',
         'p.item_code',
