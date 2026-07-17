@@ -368,6 +368,26 @@ async function dashboardHandler(req, res, next) {
       .whereNotNull('expiry_date')
       .count({ count: 'id' })
 
+    // Payment-mode breakdown for today's sales (drives the dashboard donut chart)
+    const paymentModeRows = await db('sales')
+      .where({ company_id: req.companyId, status: 'active' })
+      .where('date_ad', today)
+      .groupBy('payment_mode')
+      .select('payment_mode')
+      .sum({ total: 'net_total' })
+      .count({ count: 'id' })
+
+    const pmTotalSum = paymentModeRows.reduce((s, r) => s + (Number(r.total) || 0), 0)
+    const payment_modes = paymentModeRows
+      .filter(r => Number(r.total) > 0)
+      .map(r => ({
+        name:    r.payment_mode || 'cash',
+        total:   Number(r.total) || 0,
+        count:   Number(r.count) || 0,
+        percent: pmTotalSum > 0 ? Math.round((Number(r.total) / pmTotalSum) * 100) : 0,
+      }))
+      .sort((a, b) => b.total - a.total)
+
     return successResponse(res, {
       today:           { sales_total: Number(todayStats?.total) || 0, sales_count: Number(todayStats?.count) || 0 },
       this_month:      { revenue: Number(monthStats?.revenue) || 0 },
@@ -375,6 +395,7 @@ async function dashboardHandler(req, res, next) {
       stock_value:     Number(rawRow(stockValResult).val)  || 0,
       low_stock_items: Number(rawRow(lowStockResult).cnt)  || 0,
       expiry_alerts:   Number(expiryAlerts?.count)         || 0,
+      payment_modes,
     })
   } catch (err) { next(err) }
 }
