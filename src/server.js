@@ -231,6 +231,14 @@ app.get(`${API}/date/ad-to-bs`, (req, res) => {
   if (!date) return res.status(400).json({ success: false, message: 'date query param required' })
   res.json({ success: true, data: { ad: date, bs: adToBS(date) } })
 })
+app.get(`${API}/date/bs-to-ad`, (req, res) => {
+  const { bsToAD } = require('./utils/helpers')
+  const { year, month, day } = req.query
+  if (!year || !month || !day) return res.status(400).json({ success: false, message: 'year, month, day query params required' })
+  const ad = bsToAD(Number(year), Number(month), Number(day))
+  if (!ad) return res.status(400).json({ success: false, message: 'Invalid BS date' })
+  res.json({ success: true, data: { bs: `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`, ad } })
+})
 
 // ── 11. 404 handler ───────────────────────────────────────────────────────────
 app.use((req, res) => {

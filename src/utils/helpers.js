@@ -24,37 +24,50 @@ function clampExpiry(raw) {
   return dateOnly.slice(0, 20)
 }
 
-/* ── Nepali BS date conversion ──────────────────────────────────────────── */
-const BS_YEAR_START_AD = {
-  2078: '2021-04-14', 2079: '2022-04-14', 2080: '2023-04-14',
-  2081: '2024-07-16', 2082: '2025-04-14', 2083: '2026-04-14',
-  2084: '2027-04-14', 2085: '2028-04-13',
-}
-const BS_DAYS = {
-  2078: [31,31,32,32,31,30,30,29,30,30,29,31],
-  2079: [31,31,32,31,31,30,30,30,30,29,30,31],
-  2080: [31,32,31,32,31,30,30,30,29,30,29,31],
-  2081: [31,31,32,32,31,30,30,30,29,29,30,31],
-  2082: [31,31,32,31,31,30,30,30,29,30,29,31],
-  2083: [31,32,31,31,32,30,30,30,29,29,30,31],
+/* ── Nepali BS date conversion ──────────────────────────────────────────
+ * Previously a hand-rolled lookup table (BS_YEAR_START_AD / BS_DAYS) that
+ * only covered BS years 2078–2085 and had at least one bad entry (2081's
+ * year-start was recorded as "2024-07-16" instead of the correct mid-April
+ * date, which would silently produce wrong BS dates for that whole year).
+ * Replaced with the `nepali-date-converter` library, which also adds a
+ * working bsToAD (BS → AD) — the frontend already called
+ * GET /date/bs-to-ad expecting this, but no such route existed here.
+ *
+ * IMPORTANT — off-by-one guard: the library computes the BS/AD boundary
+ * from a Date object's exact instant, not just its calendar day. Passing
+ * it something with a live time-of-day (e.g. `new Date()`, whose hours/
+ * minutes are whatever moment the request came in) can land it on the
+ * wrong side of a day boundary. Every AD date is normalized to UTC
+ * midnight, built from its Y/M/D components, before it reaches the
+ * library — never passed through as-is.
+ */
+const { default: NepaliDate } = require('nepali-date-converter')
+
+function normalizedUTCDate(dateStr) {
+  const [y, m, d] = String(dateStr).split('T')[0].split('-').map(Number)
+  return new Date(Date.UTC(y, m - 1, d))
 }
 
 function adToBS(dateStr) {
   try {
-    const ad = new Date(dateStr)
-    let bsYear = 2081
-    for (const [y, startStr] of Object.entries(BS_YEAR_START_AD).sort((a, b) => Number(b[0]) - Number(a[0]))) {
-      if (ad >= new Date(startStr)) { bsYear = Number(y); break }
+    return new NepaliDate(normalizedUTCDate(dateStr)).format('YYYY-MM-DD')
+  } catch {
+    return null
+  }
+}
+
+/** BS → AD. Accepts either (year, month, day) or a single 'YYYY-MM-DD' BS
+ *  string. `month` is 1-indexed on this public function (matching the
+ *  'YYYY-MM-DD' string form and adToBS's output) even though the library's
+ *  own constructor takes a 0-indexed month internally. */
+function bsToAD(year, month, day) {
+  try {
+    if (typeof year === 'string') {
+      const [y, m, d] = year.split('-').map(Number)
+      ;[year, month, day] = [y, m, d]
     }
-    const yearStart = new Date(BS_YEAR_START_AD[bsYear] || '2024-07-16')
-    let daysDiff = Math.floor((ad - yearStart) / 86400000)
-    const days = BS_DAYS[bsYear] || [31,31,32,32,31,30,30,30,29,29,30,31]
-    let bsMonth = 1
-    for (const d of days) {
-      if (daysDiff < d) break
-      daysDiff -= d; bsMonth++
-    }
-    return `${bsYear}-${String(bsMonth).padStart(2,'0')}-${String(daysDiff + 1).padStart(2,'0')}`
+    const jsDate = new NepaliDate(Number(year), Number(month) - 1, Number(day)).toJsDate()
+    return jsDate.toISOString().split('T')[0]
   } catch {
     return null
   }
@@ -145,4 +158,4 @@ function isValidUUID(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str)
 }
 
-module.exports = { adToBS, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, auditLog, clampExpiry }
+module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, auditLog, clampExpiry }
