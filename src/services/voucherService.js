@@ -64,7 +64,7 @@ class VoucherService {
     }
 
     return db.transaction(async trx => {
-      await trx.raw(`SET LOCAL app.current_company_id = '${companyId}'`)
+      await db.setRLSContext(trx, companyId)
 
       // Generate atomic voucher number
       const fiscalYear = new Date(voucherDate).getFullYear().toString()
@@ -273,7 +273,7 @@ class VoucherService {
       resolvedPeriodId = period?.id || null
     }
 
-    await trx.raw(`SET LOCAL app.current_company_id = '${companyId}'`)
+    await db.setRLSContext(trx, companyId)
 
     const fiscalYear = new Date(voucherDate).getFullYear().toString()
     const prefixMap  = {

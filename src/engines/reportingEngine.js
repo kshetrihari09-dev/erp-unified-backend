@@ -10,6 +10,7 @@
  */
 
 const db = require('../db/knex')
+const config = require('../config')
 
 class ReportingEngine {
 
@@ -247,22 +248,27 @@ class ReportingEngine {
 
     const rows = result.rows
 
-    // ── Diagnostic log (remove or gate behind DEBUG env in production) ─────
-    const arRows      = rows.filter(r => /receivable|debtor/i.test(r.name + r.sub_type))
-    const apRows      = rows.filter(r => /payable|creditor/i.test(r.name + r.sub_type))
-    const nonZero     = rows.filter(r => Number(r.closing_debit) + Number(r.closing_credit) > 0)
-    const grandTotalDr = nonZero.reduce((s, r) => s + Number(r.closing_debit),  0)
-    const grandTotalCr = nonZero.reduce((s, r) => s + Number(r.closing_credit), 0)
+    // ── Diagnostic log — dev/staging only. Skipped entirely in production so
+    // every Trial Balance request doesn't pay for extra regex filtering,
+    // array reduces, and console output it never uses. Purely diagnostic;
+    // does not affect the returned report data below.
+    if (!config.isProd) {
+      const arRows      = rows.filter(r => /receivable|debtor/i.test(r.name + r.sub_type))
+      const apRows      = rows.filter(r => /payable|creditor/i.test(r.name + r.sub_type))
+      const nonZero     = rows.filter(r => Number(r.closing_debit) + Number(r.closing_credit) > 0)
+      const grandTotalDr = nonZero.reduce((s, r) => s + Number(r.closing_debit),  0)
+      const grandTotalCr = nonZero.reduce((s, r) => s + Number(r.closing_credit), 0)
 
-    console.log('[TrialBalance] ── Diagnostic ──────────────────────────────')
-    console.log(`  Total accounts loaded   : ${rows.length}`)
-    console.log(`  Non-zero balance accts  : ${nonZero.length}`)
-    console.log(`  Accounts Receivable (${arRows.length}): ${arRows.map(r => `${r.name} Dr=${r.closing_debit} Cr=${r.closing_credit}`).join(', ') || 'none found'}`)
-    console.log(`  Accounts Payable    (${apRows.length}): ${apRows.map(r => `${r.name} Dr=${r.closing_debit} Cr=${r.closing_credit}`).join(', ') || 'none found'}`)
-    console.log(`  Grand Total Debit   : ${grandTotalDr.toFixed(2)}`)
-    console.log(`  Grand Total Credit  : ${grandTotalCr.toFixed(2)}`)
-    console.log(`  Variance            : ${Math.abs(grandTotalDr - grandTotalCr).toFixed(2)}`)
-    console.log('[TrialBalance] ──────────────────────────────────────────────')
+      console.log('[TrialBalance] ── Diagnostic ──────────────────────────────')
+      console.log(`  Total accounts loaded   : ${rows.length}`)
+      console.log(`  Non-zero balance accts  : ${nonZero.length}`)
+      console.log(`  Accounts Receivable (${arRows.length}): ${arRows.map(r => `${r.name} Dr=${r.closing_debit} Cr=${r.closing_credit}`).join(', ') || 'none found'}`)
+      console.log(`  Accounts Payable    (${apRows.length}): ${apRows.map(r => `${r.name} Dr=${r.closing_debit} Cr=${r.closing_credit}`).join(', ') || 'none found'}`)
+      console.log(`  Grand Total Debit   : ${grandTotalDr.toFixed(2)}`)
+      console.log(`  Grand Total Credit  : ${grandTotalCr.toFixed(2)}`)
+      console.log(`  Variance            : ${Math.abs(grandTotalDr - grandTotalCr).toFixed(2)}`)
+      console.log('[TrialBalance] ──────────────────────────────────────────────')
+    }
 
     return {
       as_of_date:         toDate,

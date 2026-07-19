@@ -124,14 +124,17 @@ function makeTrx(state) {
 
 // Jest requires mock factories to only reference variables prefixed with 'mock'
 let mockCurrentTrx = null
-jest.mock('../src/db/knex', () => {
+jest.mock('../db/knex', () => {
   const fn = (...args) => mockCurrentTrx(...args)
   fn.transaction = async (fn2) => fn2(mockCurrentTrx)
+  // Mirrors the real src/db/knex.js helper (used by postingEngine.js /
+  // voucherService.js instead of each duplicating the raw SQL inline).
+  fn.setRLSContext = async (trx, companyId) => trx.raw(`SET LOCAL app.current_company_id = '${companyId}'`)
   return fn
 })
 
-jest.mock('../src/utils/auditLogger', () => ({ log: jest.fn().mockResolvedValue(undefined) }))
-jest.mock('../src/utils/hashing', () => ({
+jest.mock('../utils/auditLogger', () => ({ log: jest.fn().mockResolvedValue(undefined) }))
+jest.mock('../utils/hashing', () => ({
   hashJournalEntry:   jest.fn(() => 'mock-hash'),
   getLastJournalHash: jest.fn().mockResolvedValue('prev-hash'),
   hashAuditEntry:     jest.fn(() => 'mock-audit-hash'),
@@ -183,9 +186,9 @@ function addLines(state, voucherId, lines) {
 
 // ─── Load modules ─────────────────────────────────────────────────────────────
 
-const PostingEngine  = require('../src/engines/postingEngine')
+const PostingEngine  = require('./postingEngine')
 const { AppError }   = PostingEngine
-const VoucherBuilder = require('../src/services/voucherBuilder')
+const VoucherBuilder = require('../services/voucherBuilder')
 
 // ─── PostingEngine Tests ───────────────────────────────────────────────────────
 
@@ -288,7 +291,7 @@ describe('PostingEngine.postInTransaction()', () => {
   })
 
   test('writes audit log on successful post', async () => {
-    const AuditLogger = require('../src/utils/auditLogger')
+    const AuditLogger = require('../utils/auditLogger')
     AuditLogger.log.mockClear()
     setup({}, balanced)
     await PostingEngine.postInTransaction({ trx: mockCurrentTrx, voucherId: 'v-1', userId: UID, companyId: CID })
@@ -412,7 +415,7 @@ describe('VoucherBuilder', () => {
 
 describe('AccountingIntegration', () => {
 
-  const AI = require('../src/services/accountingIntegration')
+  const AI = require('../services/accountingIntegration')
 
   function setup() {
     const s = baseState()

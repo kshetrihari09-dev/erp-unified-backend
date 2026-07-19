@@ -51,7 +51,7 @@ class PostingEngine {
 
     return db.transaction(async trx => {
       // ── Step 2: Set RLS context ──────────────────────────────────────
-      await trx.raw(`SET LOCAL app.current_company_id = '${companyId}'`)
+      await db.setRLSContext(trx, companyId)
 
       // ── Step 3: Idempotency check ────────────────────────────────────
       const existing = await trx('processing_log')
@@ -229,7 +229,7 @@ class PostingEngine {
     const idempotencyKey = `reverse:${voucherId}`
 
     return db.transaction(async trx => {
-      await trx.raw(`SET LOCAL app.current_company_id = '${companyId}'`)
+      await db.setRLSContext(trx, companyId)
 
       // Idempotency check for reversal
       const existing = await trx('processing_log')
@@ -398,7 +398,7 @@ class PostingEngine {
     if (voucher.status === 'REVERSED')  throw new AppError('Cannot post a reversed voucher', 400)
 
     const resolvedCompanyId = companyId || voucher.company_id
-    await trx.raw(`SET LOCAL app.current_company_id = '${resolvedCompanyId}'`)
+    await db.setRLSContext(trx, resolvedCompanyId)
 
     // Period lock check
     const periodLocked = await trx.raw(

@@ -170,7 +170,17 @@ router.post('/', async (req, res, next) => {
       return { product_id: item.product_id || null, product_name: item.product_name || '', batch_no: item.batch_no || null, batch_id: item.batch_id || null, expiry: clampExpiry(item.expiry), qty, bonus, rate, discount_pct: Number(item.discount_pct) || 0, cc_pct, cc_amount, amount }
     })
 
-    const net_total   = Math.round((subtotal) * 100) / 100
+    const unrounded_total = Math.round((subtotal) * 100) / 100
+
+    // ── Round Off ─────────────────────────────────────────────────────────────
+    // Applied last, after subtotal/discount/tax are all final. Rounds the
+    // grand total to the nearest whole number and records the delta so it
+    // can be displayed/printed and reproduced exactly on lookup. When the
+    // total is already a whole number, round_off is 0 and net_total is
+    // unchanged — Grand Total only moves when a round off is actually applied.
+    const net_total = Math.round(unrounded_total)
+    const round_off = Math.round((net_total - unrounded_total) * 100) / 100
+
     const paid_amount = payment_mode === 'credit' ? 0 : net_total
     const due_amount  = net_total - paid_amount
 
@@ -178,7 +188,7 @@ router.post('/', async (req, res, next) => {
       company_id: req.companyId, party_id: party_id || null, created_by: req.user.id,
       invoice_no, date_ad: date, date_bs, payment_mode: payment_mode || 'cash',
       reference_no: reference_no || null, subtotal, cc_amount: cc_total,
-      net_total, paid_amount, due_amount, status: 'active', notes: notes || null,
+      net_total, round_off, paid_amount, due_amount, status: 'active', notes: notes || null,
     }).returning('*')
 
     for (const item of saleItems) {
