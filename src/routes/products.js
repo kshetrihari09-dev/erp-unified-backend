@@ -180,12 +180,19 @@ router.post('/', async (req, res, next) => {
     const {
       name, generic_name, company_name, category, unit, barcode,
       purchase_rate, sales_rate, mrp, cc_percent, min_stock,
+      tax_rate, vat_percent,
     } = req.body
 
     if (!name?.trim())
       return res.status(400).json({ success: false, message: 'Product name is required' })
     if (sales_rate == null || isNaN(Number(sales_rate)))
       return res.status(400).json({ success: false, message: 'Sales rate is required' })
+
+    // `tax_rate` is the real DB column (VAT %). The Quick Add / Product Add
+    // forms both send it as `vat_percent` — accept either name so a value
+    // typed into either form actually gets saved instead of silently
+    // falling back to the column's 0 default.
+    const taxRateValue = tax_rate ?? vat_percent
 
     const cleanBarcode = barcode?.toString().trim() || null
     if (cleanBarcode) {
@@ -210,6 +217,7 @@ router.post('/', async (req, res, next) => {
       sales_rate:   Number(sales_rate),
       mrp:          Number(mrp) || 0,
       cc_percent:   Math.min(100, Math.max(0, Number(cc_percent) || 0)),
+      tax_rate:     Math.min(100, Math.max(0, Number(taxRateValue) || 0)),
       min_stock:    Number(min_stock) || 50,
       is_active:    true,
     }).returning('*')
@@ -234,19 +242,25 @@ router.put('/:id', async (req, res, next) => {
 
     const allowed = [
       'name', 'generic_name', 'company_name', 'category', 'unit', 'barcode',
-      'purchase_rate', 'sales_rate', 'mrp', 'cc_percent', 'min_stock', 'is_active',
+      'purchase_rate', 'sales_rate', 'mrp', 'cc_percent', 'tax_rate', 'min_stock', 'is_active',
     ]
+    // `vat_percent` is the field name both the Quick Add and Product Add
+    // forms send — alias it onto the real `tax_rate` column before the
+    // allowed-fields pass below, same as on create.
+    const body = { ...req.body }
+    if (body.tax_rate === undefined && body.vat_percent !== undefined) body.tax_rate = body.vat_percent
+
     const updates = {}
     for (const k of allowed) {
-      if (req.body[k] !== undefined) {
+      if (body[k] !== undefined) {
         if (['purchase_rate', 'sales_rate', 'mrp', 'min_stock'].includes(k))
-          updates[k] = Number(req.body[k])
-        else if (k === 'cc_percent')
-          updates[k] = Math.min(100, Math.max(0, Number(req.body[k]) || 0))
+          updates[k] = Number(body[k])
+        else if (k === 'cc_percent' || k === 'tax_rate')
+          updates[k] = Math.min(100, Math.max(0, Number(body[k]) || 0))
         else if (k === 'barcode')
-          updates[k] = req.body[k]?.toString().trim() || null
+          updates[k] = body[k]?.toString().trim() || null
         else
-          updates[k] = req.body[k]
+          updates[k] = body[k]
       }
     }
 

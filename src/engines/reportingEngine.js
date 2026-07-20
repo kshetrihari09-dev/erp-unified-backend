@@ -94,6 +94,81 @@ class ReportingEngine {
   }
 
   /**
+   * Party Balance — outstanding balance per customer/supplier, derived the
+   * same way every other report here is: from journal_lines, never a
+   * stored counter.
+   *
+   *   customer (AR control account): balance = opening + invoiced(debit) − collected(credit)
+   *   supplier (AP control account): balance = opening + invoiced(credit) − paid(debit)
+   *
+   * @param {string} companyId
+   * @param {object} [opts]
+   * @param {'customer'|'supplier'} [opts.partyType] - omit for both types
+   * @param {string} [opts.dateFrom] - inclusive, filters on journal_entries.entry_date
+   * @param {string} [opts.dateTo]   - inclusive
+   * @param {import('knex').Knex}  [opts.db] - injectable for tests; defaults to the real connection
+   */
+  static async partyBalance(companyId, { partyType, dateFrom, dateTo, db: dbOverride } = {}) {
+    const conn = dbOverride || db
+
+    let partyQuery = conn('parties').where({ company_id: companyId, is_active: true })
+    if (partyType) partyQuery = partyQuery.where({ type: partyType })
+    const parties = await partyQuery
+    if (!parties.length) return []
+
+    // Resolve this company's AR / AP control accounts (same sub_type
+    // convention voucherBuilder.js uses to post sales/purchases/receipts/payments).
+    const controlAccounts = await conn('accounts')
+      .where({ company_id: companyId, is_active: true })
+      .whereIn('sub_type', ['accounts_receivable', 'accounts_payable'])
+    const arAccountIds = controlAccounts.filter(a => a.sub_type === 'accounts_receivable').map(a => a.id)
+    const apAccountIds = controlAccounts.filter(a => a.sub_type === 'accounts_payable').map(a => a.id)
+
+    const partyIds = parties.map(p => p.id)
+    const controlAccountIds = [...arAccountIds, ...apAccountIds]
+
+    let linesQuery = conn('journal_lines as jl')
+      .join('journal_entries as je', 'jl.journal_entry_id', 'je.id')
+      .where('je.company_id', companyId)
+      .whereIn('jl.account_id', controlAccountIds)
+      .whereIn('jl.party_id', partyIds)
+
+    if (dateFrom) linesQuery = linesQuery.where('je.entry_date', '>=', dateFrom)
+    if (dateTo)   linesQuery = linesQuery.where('je.entry_date', '<=', dateTo)
+
+    const lines = await linesQuery.select('jl.party_id', 'jl.account_id', 'jl.debit', 'jl.credit')
+
+    return parties.map(party => {
+      const isCustomer = party.type === 'customer'
+      const relevantAccountIds = isCustomer ? arAccountIds : apAccountIds
+      const partyLines = lines.filter(l => l.party_id === party.id && relevantAccountIds.includes(l.account_id))
+
+      const sumDebit  = partyLines.reduce((s, l) => s + (Number(l.debit)  || 0), 0)
+      const sumCredit = partyLines.reduce((s, l) => s + (Number(l.credit) || 0), 0)
+      const opening   = Number(party.opening_balance) || 0
+
+      const total_invoiced  = isCustomer ? sumDebit  : sumCredit
+      const total_collected = isCustomer ? sumCredit : 0
+      const total_paid      = isCustomer ? 0         : sumDebit
+      const balance = isCustomer
+        ? opening + total_invoiced - total_collected
+        : opening + total_invoiced - total_paid
+
+      return {
+        id: party.id,
+        code: party.code,
+        name: party.name,
+        type: party.type,
+        opening_balance: opening,
+        total_invoiced,
+        total_paid,
+        total_collected,
+        balance,
+      }
+    })
+  }
+
+  /**
    * Trial Balance — all accounts with opening / period / closing debit-credit split.
    *
    * Column contract (matches frontend TrialBalanceRow interface exactly):
