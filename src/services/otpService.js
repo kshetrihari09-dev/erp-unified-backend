@@ -59,15 +59,23 @@ class OTPService {
     return { allowed: true, remaining: RATE_LIMIT_MAX - 1 - row.request_count }
   }
 
-  async _incrementRateLimit(destination) {
+  async _incrementRateLimit(destination, method = 'sms') {
     const existing = await this.db('otp_rate_limits')
       .where(b => b.where({ destination }).orWhere({ phone: destination }))
       .first()
 
+    // `phone` is varchar(20) and only meaningful for sms/whatsapp — email
+    // destinations (or any value over 20 chars) must go in `destination`
+    // only, never truncated/forced into `phone`. Mirrors the same guard
+    // in create() for otp_codes; see migration 013 for the bug history.
+    const phoneValue = (method === 'sms' || method === 'whatsapp') && destination.length <= 20
+      ? destination
+      : null
+
     if (!existing) {
       await this.db('otp_rate_limits').insert({
         id:            uuid(),
-        phone:         destination,
+        phone:         phoneValue,
         destination,
         request_count: 1,
         window_start:  new Date(),
@@ -145,7 +153,7 @@ class OTPService {
     }
 
     await this.db('otp_codes').insert(record)
-    await this._incrementRateLimit(destination)
+    await this._incrementRateLimit(destination, method)
 
     return code
   }
