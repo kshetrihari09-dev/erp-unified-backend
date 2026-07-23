@@ -589,6 +589,36 @@ router.get('/me', authenticate, async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+/* ── POST /auth/verify-password ─────────────────────────────────────────────
+ * Step-up re-authentication for sensitive in-place edits (e.g. changing
+ * Payment Mode from the Sales List). Confirms the CURRENT session's user
+ * knows their account password. Does not log the user in, issue new
+ * tokens, or touch last_login_at — it's a yes/no check, nothing else. */
+router.post('/verify-password', authenticate, async (req, res, next) => {
+  try {
+    const { password } = req.body
+    if (!password) throw new AppError('Password is required', 400)
+
+    const user = await db('users').where({ id: req.user.id }).first()
+    if (!user) throw new AppError('User not found', 404)
+
+    if (!user.password_hash) {
+      return res.status(400).json({
+        success: false,
+        message: 'No password is set on this account, so this action cannot be confirmed. Ask an admin to set one via Settings.',
+      })
+    }
+
+    const valid = await bcrypt.compare(password, user.password_hash)
+    if (!valid) {
+      return res.status(401).json({ success: false, message: 'Incorrect password' })
+    }
+
+    await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: 'VERIFY_PASSWORD', entityType: 'auth', entityId: req.user.id, ipAddress: req.ip })
+    return res.json({ success: true, message: 'Password verified' })
+  } catch (err) { next(err) }
+})
+
 router.post('/refresh', async (req, res, next) => {
   try {
     const { refresh_token } = req.body

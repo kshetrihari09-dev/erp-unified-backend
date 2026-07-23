@@ -181,12 +181,13 @@ router.post('/', async (req, res, next) => {
     const net_total = Math.round(unrounded_total)
     const round_off = Math.round((net_total - unrounded_total) * 100) / 100
 
-    const paid_amount = payment_mode === 'credit' ? 0 : net_total
+    const effectivePaymentMode = payment_mode || 'credit'
+    const paid_amount = effectivePaymentMode === 'credit' ? 0 : net_total
     const due_amount  = net_total - paid_amount
 
     const [sale] = await trx('sales').insert({
       company_id: req.companyId, party_id: party_id || null, created_by: req.user.id,
-      invoice_no, date_ad: date, date_bs, payment_mode: payment_mode || 'cash',
+      invoice_no, date_ad: date, date_bs, payment_mode: effectivePaymentMode,
       reference_no: reference_no || null, subtotal, cc_amount: cc_total,
       net_total, round_off, paid_amount, due_amount, status: 'active', notes: notes || null,
     }).returning('*')
