@@ -339,4 +339,49 @@ router.put('/:id/cancel', async (req, res, next) => {
   } catch (err) { await trx.rollback(); next(err) }
 })
 
+/* ── PUT /sales/:id/payment-mode ───────────────────────────────────────────
+ * UI-only addition to support editing Payment Mode from the Sales List
+ * after a sale has been saved. Deliberately minimal and isolated:
+ *   - Updates ONLY the `payment_mode` column (+ updated_at).
+ *   - No transaction needed — nothing else is touched.
+ *   - Does NOT recompute totals/round-off, touch inventory_batches,
+ *     re-run AccountingIntegration/PostingEngine, or rebuild vouchers.
+ *   - Same `authenticate` + company scoping as every other route on this
+ *     router — no new permission model introduced.
+ *   - Restricted to 'active' sales, matching the existing rule that only
+ *     active invoices can be modified (see /:id/cancel above).
+ */
+const VALID_PAYMENT_MODES = ['cash', 'credit', 'bank', 'cheque', 'upi', 'card', 'online']
+
+router.put('/:id/payment-mode', async (req, res, next) => {
+  try {
+    const { payment_mode } = req.body
+    if (!VALID_PAYMENT_MODES.includes(payment_mode)) {
+      return res.status(400).json({ success: false, message: `Invalid payment mode: ${payment_mode}` })
+    }
+
+    const sale = await db('sales').where({ id: req.params.id, company_id: req.companyId }).first()
+    if (!sale) return res.status(404).json({ success: false, message: 'Sale not found' })
+    if (sale.status !== 'active') {
+      return res.status(400).json({ success: false, message: `Cannot change payment mode on a ${sale.status} invoice.` })
+    }
+
+    // No-op guard — nothing to update or audit if the value is unchanged.
+    if (sale.payment_mode === payment_mode) {
+      return successResponse(res, sale, 'Payment mode unchanged')
+    }
+
+    const [updated] = await db('sales')
+      .where({ id: req.params.id, company_id: req.companyId })
+      .update({ payment_mode, updated_at: new Date() })
+      .returning('*')
+
+    auditLog(
+      req.companyId, req.user.id, 'UPDATE', 'sales', req.params.id,
+      { field: 'payment_mode', from: sale.payment_mode, to: payment_mode }, req.ip,
+    )
+    return successResponse(res, updated, 'Payment mode updated')
+  } catch (err) { next(err) }
+})
+
 module.exports = router
