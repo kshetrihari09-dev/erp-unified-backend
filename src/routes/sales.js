@@ -165,9 +165,17 @@ router.post('/', async (req, res, next) => {
       const cc_amount = (bonus > 0 && cc_pct > 0)
         ? Math.round(bonus * rate * (cc_pct / 100) * 10000) / 10000
         : 0
-      const amount  = Math.round((qty * rate + cc_amount) * 100) / 100
+      // discount_pct was previously accepted/stored per item but never
+      // actually applied here — `amount` was computed straight from
+      // qty*rate, silently ignoring any discount entered on the Sale
+      // page. This now applies it using the same formula the frontend
+      // already uses for its own live preview (see utils/calcRowAmount):
+      // base = qty*rate*(1-discount_pct/100), amount = base+cc_amount.
+      const discount_pct = Number(item.discount_pct) || 0
+      const base    = qty * rate * (1 - discount_pct / 100)
+      const amount  = Math.round((base + cc_amount) * 100) / 100
       subtotal += amount; cc_total += cc_amount
-      return { product_id: item.product_id || null, product_name: item.product_name || '', batch_no: item.batch_no || null, batch_id: item.batch_id || null, expiry: clampExpiry(item.expiry), qty, bonus, rate, discount_pct: Number(item.discount_pct) || 0, cc_pct, cc_amount, amount }
+      return { product_id: item.product_id || null, product_name: item.product_name || '', batch_no: item.batch_no || null, batch_id: item.batch_id || null, expiry: clampExpiry(item.expiry), qty, bonus, rate, discount_pct, cc_pct, cc_amount, amount }
     })
 
     const unrounded_total = Math.round((subtotal) * 100) / 100
@@ -181,13 +189,12 @@ router.post('/', async (req, res, next) => {
     const net_total = Math.round(unrounded_total)
     const round_off = Math.round((net_total - unrounded_total) * 100) / 100
 
-    const effectivePaymentMode = payment_mode || 'credit'
-    const paid_amount = effectivePaymentMode === 'credit' ? 0 : net_total
+    const paid_amount = payment_mode === 'credit' ? 0 : net_total
     const due_amount  = net_total - paid_amount
 
     const [sale] = await trx('sales').insert({
       company_id: req.companyId, party_id: party_id || null, created_by: req.user.id,
-      invoice_no, date_ad: date, date_bs, payment_mode: effectivePaymentMode,
+      invoice_no, date_ad: date, date_bs, payment_mode: payment_mode || 'cash',
       reference_no: reference_no || null, subtotal, cc_amount: cc_total,
       net_total, round_off, paid_amount, due_amount, status: 'active', notes: notes || null,
     }).returning('*')
