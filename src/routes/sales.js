@@ -350,10 +350,16 @@ router.put('/:id/cancel', async (req, res, next) => {
 /* ── PUT /sales/:id/payment-mode ───────────────────────────────────────────
  * UI-only addition to support editing Payment Mode from the Sales List
  * after a sale has been saved. Deliberately minimal and isolated:
- *   - Updates ONLY the `payment_mode` column (+ updated_at).
- *   - No transaction needed — nothing else is touched.
- *   - Does NOT recompute totals/round-off, touch inventory_batches,
- *     re-run AccountingIntegration/PostingEngine, or rebuild vouchers.
+ *   - Updates the `payment_mode` column and recomputes `paid_amount` /
+ *     `due_amount` using the SAME cash-vs-credit rule applied at sale
+ *     creation (see POST / above: `credit` → paid 0, due = net_total;
+ *     anything else → paid = net_total, due 0). This only reclassifies
+ *     how much of the sale is "paid" vs "due" on the sale record itself.
+ *   - No transaction needed — nothing else on this table is touched, and
+ *     round_off/subtotal/net_total are left exactly as they were.
+ *   - Deliberately does NOT touch inventory_batches, re-run
+ *     AccountingIntegration/PostingEngine, or rebuild/reverse vouchers —
+ *     cash/receivable ledger entries are intentionally left as-is for now.
  *   - Same `authenticate` + company scoping as every other route on this
  *     router — no new permission model introduced.
  *   - Restricted to 'active' sales, matching the existing rule that only
@@ -379,14 +385,26 @@ router.put('/:id/payment-mode', async (req, res, next) => {
       return successResponse(res, sale, 'Payment mode unchanged')
     }
 
+    // Same rule as sale creation: `credit` means nothing has been collected
+    // yet, anything else means the full net_total was collected. Recomputed
+    // from net_total (not paid_amount) so this stays correct no matter which
+    // mode the sale is moving from or to.
+    const net_total   = Number(sale.net_total)
+    const paid_amount = payment_mode === 'credit' ? 0 : net_total
+    const due_amount  = net_total - paid_amount
+
     const [updated] = await db('sales')
       .where({ id: req.params.id, company_id: req.companyId })
-      .update({ payment_mode, updated_at: new Date() })
+      .update({ payment_mode, paid_amount, due_amount, updated_at: new Date() })
       .returning('*')
 
     auditLog(
       req.companyId, req.user.id, 'UPDATE', 'sales', req.params.id,
-      { field: 'payment_mode', from: sale.payment_mode, to: payment_mode }, req.ip,
+      {
+        field: 'payment_mode', from: sale.payment_mode, to: payment_mode,
+        paid_amount: { from: sale.paid_amount, to: paid_amount },
+        due_amount:  { from: sale.due_amount,  to: due_amount },
+      }, req.ip,
     )
     return successResponse(res, updated, 'Payment mode updated')
   } catch (err) { next(err) }
