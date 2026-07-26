@@ -5,6 +5,7 @@
 const db = require('../db/knex')
 const AuditLogger = require('../utils/auditLogger')
 const { AppError } = require('../engines/postingEngine')
+const { isValidDateOnly, yearOf } = require('../utils/dateOnly')
 
 class VoucherService {
 
@@ -38,9 +39,11 @@ class VoucherService {
       if (dr < 0 || cr < 0)  throw new AppError(`Line ${i+1}: negative amounts not allowed`, 400)
     }
 
-    // Validate date
-    const dateObj = new Date(voucherDate)
-    if (isNaN(dateObj.getTime())) throw new AppError('Invalid voucher date', 400)
+    // Validate date — kept as the exact 'YYYY-MM-DD' string the user
+    // selected; never parsed into a JS Date object (that would make the
+    // validation, and the fiscal year below, sensitive to the server's
+    // local timezone).
+    if (!isValidDateOnly(voucherDate)) throw new AppError('Invalid voucher date', 400)
 
     // Validate period lock before even creating the draft
     const periodLocked = await db.raw(
@@ -67,7 +70,7 @@ class VoucherService {
       await db.setRLSContext(trx, companyId)
 
       // Generate atomic voucher number
-      const fiscalYear = new Date(voucherDate).getFullYear().toString()
+      const fiscalYear = yearOf(voucherDate)
       const prefixMap  = {
         SALES: 'SI', PURCHASE: 'PI', PAYMENT: 'PV', RECEIPT: 'RV',
         JOURNAL: 'JV', CONTRA: 'CO', DEBIT_NOTE: 'DN', CREDIT_NOTE: 'CN',
@@ -262,8 +265,7 @@ class VoucherService {
       if (dr < 0 || cr < 0)  throw new AppError(`Line ${i+1}: negative amounts not allowed`, 400)
     }
 
-    const dateObj = new Date(voucherDate)
-    if (isNaN(dateObj.getTime())) throw new AppError('Invalid voucher date', 400)
+    if (!isValidDateOnly(voucherDate)) throw new AppError('Invalid voucher date', 400)
 
     // Period lock check
     const periodLocked = await trx.raw(
@@ -288,7 +290,7 @@ class VoucherService {
 
     await db.setRLSContext(trx, companyId)
 
-    const fiscalYear = new Date(voucherDate).getFullYear().toString()
+    const fiscalYear = yearOf(voucherDate)
     const prefixMap  = {
       SALES: 'SI', PURCHASE: 'PI', PAYMENT: 'PV', RECEIPT: 'RV',
       JOURNAL: 'JV', CONTRA: 'CO', DEBIT_NOTE: 'DN', CREDIT_NOTE: 'CN',

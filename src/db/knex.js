@@ -1,4 +1,24 @@
 require('dotenv').config()
+
+// node-postgres, by default, parses PostgreSQL DATE columns (OID 1082) into
+// JavaScript Date objects. A Date object always carries an implicit
+// timezone: it gets constructed from the row's Y/M/D using the server
+// process's local time, but anything that later serializes it back out
+// (e.g. Express's res.json(), which calls .toISOString()) reads it back in
+// UTC. Whenever the server's local timezone is ahead of UTC, that round
+// trip silently rolls the calendar day back by one — which is exactly what
+// was making voucher_date / entry_date appear one day earlier than the
+// date the user selected, everywhere the value was returned by the API
+// (voucher list, voucher detail, ledger, reports, posting history).
+//
+// DATE columns represent a calendar date, not an instant, so they should
+// never be converted through a timezone-aware Date object at all. Telling
+// pg to hand back the raw 'YYYY-MM-DD' string it already parsed from
+// Postgres (instead of building a Date from it) removes that conversion
+// entirely — the value that goes in is the exact value that comes out.
+const { types: pgTypes } = require('pg')
+pgTypes.setTypeParser(1082, val => val) // 1082 = PostgreSQL's DATE type OID
+
 const knex = require('knex')
 const config = require('../../knexfile')
 

@@ -222,7 +222,8 @@ app.use(`${API}/cloud-storage`,       cloudStorageRouter)
 // Date utilities (UNCHANGED)
 app.get(`${API}/date/today`, (req, res) => {
   const { todayBS } = require('./utils/helpers')
-  const today = new Date().toISOString().split('T')[0]
+  const { todayDateOnly } = require('./utils/dateOnly')
+  const today = todayDateOnly()
   res.json({ success: true, data: { ad: today, bs: todayBS() } })
 })
 app.get(`${API}/date/ad-to-bs`, (req, res) => {

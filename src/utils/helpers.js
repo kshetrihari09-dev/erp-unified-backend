@@ -59,7 +59,14 @@ function adToBS(dateStr) {
 /** BS → AD. Accepts either (year, month, day) or a single 'YYYY-MM-DD' BS
  *  string. `month` is 1-indexed on this public function (matching the
  *  'YYYY-MM-DD' string form and adToBS's output) even though the library's
- *  own constructor takes a 0-indexed month internally. */
+ *  own constructor takes a 0-indexed month internally.
+ *
+ *  Reads the converted date's local Y/M/D (getFullYear() / getMonth() /
+ *  getDate()) rather than toJsDate().toISOString(): the library's
+ *  toJsDate() returns a Date built from local midnight, and toISOString()
+ *  reports that same instant in UTC — for any timezone ahead of UTC (e.g.
+ *  Nepal Time, where this server typically runs), that rolls the date back
+ *  by one day. */
 function bsToAD(year, month, day) {
   try {
     if (typeof year === 'string') {
@@ -67,13 +74,23 @@ function bsToAD(year, month, day) {
       ;[year, month, day] = [y, m, d]
     }
     const jsDate = new NepaliDate(Number(year), Number(month) - 1, Number(day)).toJsDate()
-    return jsDate.toISOString().split('T')[0]
+    const adYear  = jsDate.getFullYear()
+    const adMonth = String(jsDate.getMonth() + 1).padStart(2, '0')
+    const adDay   = String(jsDate.getDate()).padStart(2, '0')
+    return `${adYear}-${adMonth}-${adDay}`
   } catch {
     return null
   }
 }
 
-function todayBS() { return adToBS(new Date().toISOString().split('T')[0]) }
+// Deliberately not new Date().toISOString().split('T')[0], which reports
+// UTC's calendar day — for a server running ahead of UTC, that can read as
+// "yesterday" for the first few hours of each local day.
+function todayBS() {
+  const now = new Date()
+  const todayAD = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  return adToBS(todayAD)
+}
 
 /* ── Invoice / voucher number generators ───────────────────────────────── */
 async function nextInvoiceNo(companyId, prefix = 'INV') {

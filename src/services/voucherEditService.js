@@ -102,8 +102,8 @@ class VoucherEditService {
     // Respect existing period locks — same DB function the rest of the
     // engine already uses, checked for both the original and new date.
     const datesToCheck = new Set([
-      new Date(voucher.voucher_date).toISOString().slice(0, 10),
-      new Date(newDate).toISOString().slice(0, 10),
+      String(voucher.voucher_date).slice(0, 10),
+      String(newDate).slice(0, 10),
     ])
     for (const d of datesToCheck) {
       const { rows } = await db.raw(`SELECT is_period_locked(?, ?::date) AS locked`, [companyId, d])

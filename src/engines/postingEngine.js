@@ -23,6 +23,7 @@ const db = require('../db/knex')
 const { hashJournalEntry, getLastJournalHash } = require('../utils/hashing')
 const AuditLogger = require('../utils/auditLogger')
 const PostingStrategies = require('./postingStrategies')
+const { todayDateOnly, yearOf } = require('../utils/dateOnly')
 
 class PostingEngine {
 
@@ -243,7 +244,7 @@ class PostingEngine {
       await trx.raw(`SELECT pg_advisory_xact_lock(?)`, [lockId.rows[0].lock_id])
 
       // Period lock check for reversal date (today)
-      const reversalDate = new Date().toISOString().split('T')[0]
+      const reversalDate = todayDateOnly()
       const periodLocked = await trx.raw(`SELECT is_period_locked(?, ?::date) AS locked`, [companyId, reversalDate])
       if (periodLocked.rows[0].locked) {
         throw new AppError('Cannot reverse — current period is locked. Contact your accountant.', 400)
@@ -264,7 +265,7 @@ class PostingEngine {
         // Create a reversal voucher
         const reversalVoucherNo = await trx.raw(
           `SELECT next_voucher_number(?, ?, ?, ?) AS voucher_no`,
-          [companyId, 'REVERSAL', new Date().getFullYear().toString(), 'REV']
+          [companyId, 'REVERSAL', yearOf(reversalDate), 'REV']
         )
         const [reversalVoucher] = await trx('vouchers').insert({
           company_id:   companyId,

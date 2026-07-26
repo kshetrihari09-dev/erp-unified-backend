@@ -22,6 +22,7 @@
  */
 
 const { AppError } = require('../engines/postingEngine')
+const { todayDateOnly } = require('../utils/dateOnly')
 
 // ─── Account Resolver ─────────────────────────────────────────────────────────
 
@@ -313,7 +314,7 @@ async function buildReceiveVoucher({ receive, items, trx, companyId, userId }) {
     companyId,
     userId,
     voucherType:  'PURCHASE',
-    voucherDate:  receive.date || new Date().toISOString().split('T')[0],
+    voucherDate:  receive.date || todayDateOnly(),
     partyId:      receive.party_id || null,
     narration:    `Stock Receive — ${receive.id}`,
     referenceNo:  null,
@@ -372,7 +373,7 @@ async function buildSaleReturnVoucher({ originalSale, returnItems, returnDate, t
     companyId,
     userId,
     voucherType:  'CREDIT_NOTE',
-    voucherDate:  returnDate || new Date().toISOString().split('T')[0],
+    voucherDate:  returnDate || todayDateOnly(),
     partyId:      originalSale.party_id || null,
     narration:    `Sales Return — Original Invoice: ${originalSale.invoice_no}`,
     referenceNo:  originalSale.invoice_no,
@@ -428,7 +429,7 @@ async function buildPurchaseReturnVoucher({ originalPurchase, returnItems, retur
     companyId,
     userId,
     voucherType:  'DEBIT_NOTE',
-    voucherDate:  returnDate || new Date().toISOString().split('T')[0],
+    voucherDate:  returnDate || todayDateOnly(),
     partyId:      originalPurchase.party_id || null,
     narration:    `Purchase Return — Original Bill: ${originalPurchase.bill_no}`,
     referenceNo:  originalPurchase.bill_no,
@@ -465,7 +466,7 @@ async function buildPaymentVoucher({ partyId, amount, paymentMode, paymentDate, 
     companyId,
     userId,
     voucherType:  'PAYMENT',
-    voucherDate:  paymentDate || new Date().toISOString().split('T')[0],
+    voucherDate:  paymentDate || todayDateOnly(),
     partyId:      partyId || null,
     narration:    narration || `Payment to Supplier`,
     referenceNo:  referenceNo || null,
@@ -506,7 +507,7 @@ async function buildReceiptVoucher({ partyId, amount, paymentMode, receiptDate, 
     companyId,
     userId,
     voucherType:  'RECEIPT',
-    voucherDate:  receiptDate || new Date().toISOString().split('T')[0],
+    voucherDate:  receiptDate || todayDateOnly(),
     partyId:      partyId || null,
     narration:    narration || `Receipt from Customer`,
     referenceNo:  referenceNo || null,
