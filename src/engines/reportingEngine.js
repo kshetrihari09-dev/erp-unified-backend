@@ -61,18 +61,47 @@ class ReportingEngine {
       .leftJoin('parties as p', 'jl.party_id', 'p.id')
       .where('je.company_id', companyId)
       .where('jl.account_id', accountId)
+      // A voucher edit is a correction, not a new transaction: hide the
+      // internal system-generated reversal/correction entries it writes
+      // (see VoucherEditService) so the ledger shows one line per voucher,
+      // same as the voucher lists — not the raw reverse-then-repost pair.
+      .andWhere(b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`))
+      .andWhere(b => b.whereNull('v.reversal_of').orWhereNotExists(
+        db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
+      ))
       .select(
         'je.entry_date', 'je.event_type', 'je.period_ref',
-        'v.voucher_no', 'v.voucher_type', 'v.reference_no',
-        'jl.debit', 'jl.credit', 'jl.description',
+        'v.id as voucher_id', 'v.voucher_no', 'v.voucher_type', 'v.reference_no',
+        'jl.account_id', 'jl.debit', 'jl.credit', 'jl.description',
         'p.name as party_name',
       )
+      .select(db.raw(`EXISTS (SELECT 1 FROM audit_log al WHERE al.entity_id = v.id AND al.action = 'EDIT_VOUCHER') AS is_edited`))
 
     if (dateFrom) q = q.where('je.entry_date', '>=', dateFrom)
     if (dateTo)   q = q.where('je.entry_date', '<=', dateTo)
 
     const [{ count }] = await q.clone().clearSelect().count('jl.id as count')
-    const rows = await q.orderBy('je.entry_date').orderBy('je.created_at').limit(limit).offset((page-1)*limit)
+    let rows = await q.orderBy('je.entry_date').orderBy('je.created_at').limit(limit).offset((page-1)*limit)
+
+    // For a voucher that's been edited, the entry still on this row is the
+    // *original* immutable journal line (append-only ledger — it can never
+    // be rewritten), which no longer matches what the voucher shows today.
+    // Swap in the voucher's current line for this account so the ledger
+    // reads the same as the voucher itself: same voucher_no, current value.
+    const editedVoucherIds = [...new Set(rows.filter(r => r.is_edited && r.voucher_id).map(r => r.voucher_id))]
+    if (editedVoucherIds.length) {
+      const currentLines = await db('voucher_lines')
+        .whereIn('voucher_id', editedVoucherIds)
+        .andWhere('account_id', accountId)
+        .select('voucher_id', 'debit', 'credit', 'description')
+      const currentByVoucher = new Map(currentLines.map(l => [l.voucher_id, l]))
+      rows = rows.map(r => {
+        const current = r.is_edited ? currentByVoucher.get(r.voucher_id) : null
+        return current
+          ? { ...r, debit: current.debit, credit: current.credit, description: current.description ?? r.description }
+          : r
+      })
+    }
 
     // Compute running balance
     let runningBalance = openingBalance
