@@ -1,34 +1,61 @@
 /**
  * voucherEditService.js — Password-protected editing of POSTED vouchers.
  *
- * Design note — why this doesn't touch postingEngine.js:
+ * Design note — why this doesn't touch postingEngine.js's core mechanics:
  * `journal_entries` is append-only (trigger-enforced: no UPDATE/DELETE) and has
  * a UNIQUE constraint on `voucher_id` (one ledger entry per voucher, forever).
  * That means the one and only accounting-correct way to change a POSTED
  * voucher's *financial* impact — without touching the schema or the posting
  * engine — is the standard immutable-ledger pattern: reverse the old entry,
- * then post a corrected one. This service does exactly that by calling the
- * EXISTING, unmodified `PostingEngine.reverse()` and `VoucherService.create()`
- * + `PostingEngine.post()` — nothing about how journal entries are built,
- * balanced, hashed or chained is changed here.
+ * then post a corrected one. This service does exactly that using the
+ * EXISTING, unmodified `PostingEngine.reverse()` and `PostingEngine.postInTransaction()`
+ * — nothing about how journal entries are built, balanced, hashed or chained
+ * is changed here.
+ *
+ * IMPORTANT — this does NOT call `VoucherService.create()`:
+ * That path is the normal user-facing "create a new voucher" flow — it pulls
+ * a real, user-visible voucher number from `next_voucher_number()` under the
+ * voucher type's real sequence (the same counter real JV/SI/PI/... vouchers
+ * use). Calling it from an edit is what made an edit look like "Reverse →
+ * Create JV-0002": a second real voucher silently entered the numbering
+ * sequence and had to be filtered back out of every list.
+ *
+ * Instead, the corrected journal effect is posted against a bare internal
+ * "ledger anchor" row that this service inserts directly:
+ *   - its `voucher_no` is never drawn from `next_voucher_number()` — it's a
+ *     `SYS-CORR-…` label that never touches the real sequence, so no
+ *     user-facing voucher number is ever generated or burned by an edit,
+ *   - `metadata.system_correction = true` marks it as internal ledger
+ *     plumbing (not a voucher), and every list/report query that shows
+ *     vouchers to the user already filters this flag out,
+ *   - the actual journal entry for it is still written by the existing,
+ *     unmodified `PostingEngine.postInTransaction()`, so balance validation,
+ *     period-lock validation, account validation, and hash chaining are all
+ *     exactly the same as for any other post.
  *
  * From the user's point of view the voucher they opened is the one that gets
  * updated: same `id`, same `voucher_no`, same row — its date/party/narration/
- * lines are updated in place and it stays `POSTED`. The reversal + correction
- * entries this generates internally are tagged `metadata.system_correction`
- * so voucher lists (VoucherService.list / receipts / payments) filter them
- * out — they're bookkeeping plumbing, not new user-facing vouchers.
+ * lines are updated in place and it stays `POSTED`. Nothing new ever appears
+ * in the voucher list.
+ *
+ * Repeated edits: the voucher's own `metadata.ledger_correction.active_entry_voucher_id`
+ * tracks which internal anchor currently holds the *live* journal entry, so a
+ * second (or third, ...) edit reverses the most recent corrected entry rather
+ * than re-reversing the original, stale, already-superseded one. Without this,
+ * editing the same voucher twice would silently corrupt the ledger even though
+ * the voucher itself kept displaying correctly — exactly the failure mode this
+ * service exists to avoid.
  *
  * Audit trail uses the existing append-only `audit_log` table (via
  * AuditLogger — untouched), so no new tables/columns are needed. The
  * "Edited" badge is a computed `is_edited` flag (EXISTS against audit_log),
- * added as an additive column in VoucherService.list()/get().
+ * unchanged from before.
  */
+const crypto         = require('crypto')
 const db             = require('../db/knex')
 const AuditLogger    = require('../utils/auditLogger')
 const PostingEngine  = require('../engines/postingEngine')
 const { AppError }   = require('../engines/postingEngine')
-const VoucherService = require('./voucherService')
 
 class VoucherEditService {
   /**
@@ -46,6 +73,23 @@ class VoucherEditService {
   static async edit({ voucherId, companyId, userId, reason, voucherDate, partyId, narration, lines }, ipAddress = null) {
     if (!reason?.trim()) throw new AppError('An edit reason is required', 400)
     if (!Array.isArray(lines) || lines.length < 2) throw new AppError('A voucher requires at least 2 lines', 400)
+
+    // ── Double-entry validation on the corrected lines ──────────────────────
+    // Previously delegated to VoucherService.create(); now enforced directly
+    // here since the correction no longer goes through that path.
+    const totalDebit  = lines.reduce((s, l) => s + Number(l.debit  || 0), 0)
+    const totalCredit = lines.reduce((s, l) => s + Number(l.credit || 0), 0)
+    if (Math.abs(totalDebit - totalCredit) > 0.005) {
+      throw new AppError(`Voucher does not balance: Dr ${totalDebit.toFixed(2)} ≠ Cr ${totalCredit.toFixed(2)}`, 400)
+    }
+    if (totalDebit <= 0) throw new AppError('Voucher total must be greater than zero', 400)
+    for (const [i, line] of lines.entries()) {
+      const dr = Number(line.debit  || 0)
+      const cr = Number(line.credit || 0)
+      if (dr > 0 && cr > 0) throw new AppError(`Line ${i + 1}: cannot have both debit and credit`, 400)
+      if (dr === 0 && cr === 0) throw new AppError(`Line ${i + 1}: debit or credit must be non-zero`, 400)
+      if (dr < 0 || cr < 0)  throw new AppError(`Line ${i + 1}: negative amounts not allowed`, 400)
+    }
 
     const voucher = await db('vouchers').where({ id: voucherId, company_id: companyId }).first()
     if (!voucher) throw new AppError('Voucher not found', 404)
@@ -78,29 +122,94 @@ class VoucherEditService {
       })),
     }
 
-    const totalDebit = lines.reduce((s, l) => s + Number(l.debit || 0), 0)
+    // The voucher's own metadata (jsonb, parsed to an object by pg) may
+    // already carry unrelated business data (e.g. SALES/PURCHASE `items`) —
+    // preserve it, only reading/writing the `ledger_correction` sub-key.
+    const existingMeta = voucher.metadata || {}
 
-    // ── Step 1 — reverse the old ledger impact (existing, unmodified engine) ──
-    await PostingEngine.reverse(voucherId, userId, `Correction (edit): ${reason}`, ipAddress)
+    // Which internal ledger anchor currently holds the *live* journal entry
+    // for this voucher? First-ever edit: the voucher's own original entry.
+    // Subsequent edits: the anchor created by the previous edit.
+    const activeEntryVoucherId = existingMeta.ledger_correction?.active_entry_voucher_id || voucherId
 
-    // ── Step 2 — post the corrected figures as a system-linked correction
-    //    voucher, using the existing, unmodified create + post pipeline. ──
-    let correctionVoucher
+    // ── Step 1 — reverse the currently-live ledger impact (existing,
+    //    unmodified engine method). ──────────────────────────────────────────
+    const reversal = await PostingEngine.reverse(activeEntryVoucherId, userId, `Correction (edit): ${reason}`, ipAddress)
+
+    // Tag the reversal artifact as internal ledger plumbing so it can never
+    // surface as a user-facing voucher — independent of the reversal_of/status
+    // heuristic the voucher list also happens to use, so this stays hidden
+    // even across several chained edits.
+    await db('vouchers').where({ id: reversal.reversal_voucher.id }).update({
+      metadata: JSON.stringify({ system_correction: true, corrects_voucher_id: voucherId, internal_only: true, kind: 'edit_reversal' }),
+    })
+
+    // ── Step 2 — post the corrected figures to a NEW internal ledger anchor.
+    //    This is deliberately NOT VoucherService.create(): no call to
+    //    next_voucher_number(), no real user-facing voucher number, and the
+    //    row is tagged system_correction so it's excluded from every voucher
+    //    list/report query up front. The actual posting — balance check,
+    //    period-lock check, account validation, hash chaining — still goes
+    //    through the existing, unmodified PostingEngine.postInTransaction(). ──
+    let correctionAnchorId
     try {
-      const created = await VoucherService.create({
-        companyId, userId,
-        voucherType: voucher.voucher_type,
-        voucherDate: newDate,
-        partyId:     partyId !== undefined ? partyId : voucher.party_id,
-        lines,
-        narration:   narration !== undefined ? narration : voucher.narration,
-        referenceNo: voucher.reference_no,
-        notes:       voucher.notes,
-        metadata:    { system_correction: true, corrects_voucher_id: voucherId },
-        currency:    voucher.currency,
-      }, ipAddress)
-      correctionVoucher = created.voucher
-      await PostingEngine.post(correctionVoucher.id, userId, ipAddress)
+      correctionAnchorId = await db.transaction(async trx => {
+        await db.setRLSContext(trx, companyId)
+
+        const period = await trx('accounting_periods')
+          .where({ company_id: companyId })
+          .where('start_date', '<=', newDate)
+          .where('end_date', '>=', newDate)
+          .andWhere('is_locked', false)
+          .first()
+
+        const [anchor] = await trx('vouchers').insert({
+          company_id:    companyId,
+          period_id:     period?.id || null,
+          party_id:      partyId !== undefined ? (partyId || null) : voucher.party_id,
+          created_by:    userId,
+          // Short, internal-only label — never drawn from next_voucher_number(),
+          // so it never collides with or consumes a real user-facing sequence
+          // number. Traceability back to the edited voucher is via
+          // metadata.corrects_voucher_id, not this string, so it only needs
+          // to fit the column (`voucher_no` varchar(50)) and stay unique.
+          voucher_no:    `SYS-CORR-${crypto.randomUUID()}`,
+          voucher_type:  voucher.voucher_type,
+          status:        'DRAFT',
+          voucher_date:  newDate,
+          currency:      voucher.currency || 'NPR',
+          exchange_rate: voucher.exchange_rate || 1,
+          total_amount:  totalDebit,
+          reference_no:  voucher.reference_no,
+          narration:     narration !== undefined ? narration : voucher.narration,
+          notes:         voucher.notes,
+          // Deliberately no `items` carried over here — SALES/PURCHASE
+          // strategies only run FIFO/inventory-batch side effects when
+          // metadata.items is present, and those already ran once when the
+          // voucher was first posted. An edit corrects the accounting entry,
+          // it does not re-run inventory movements.
+          metadata: JSON.stringify({ system_correction: true, corrects_voucher_id: voucherId, internal_only: true, kind: 'edit_correction' }),
+        }).returning('*')
+
+        for (const [i, line] of lines.entries()) {
+          const account = await trx('accounts').where({ id: line.account_id, company_id: companyId }).first()
+          if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
+          await trx('voucher_lines').insert({
+            voucher_id:  anchor.id,
+            account_id:  line.account_id,
+            party_id:    line.party_id    || null,
+            line_no:     i + 1,
+            description: line.description || null,
+            debit:       Number(line.debit  || 0),
+            credit:      Number(line.credit || 0),
+            tax_rate:    Number(line.tax_rate   || 0),
+            tax_amount:  Number(line.tax_amount || 0),
+          })
+        }
+
+        await PostingEngine.postInTransaction({ trx, voucherId: anchor.id, userId, ipAddress, companyId })
+        return anchor.id
+      })
     } catch (err) {
       // The old entry has already been reversed but the corrected one failed
       // to post — flag this loudly in the audit trail for manual follow-up
@@ -140,6 +249,14 @@ class VoucherEditService {
         narration:    narration !== undefined ? narration : voucher.narration,
         total_amount: totalDebit,
         status:       'POSTED',
+        metadata: JSON.stringify({
+          ...existingMeta,
+          ledger_correction: {
+            active_entry_voucher_id: correctionAnchorId,
+            correction_count: (existingMeta.ledger_correction?.correction_count || 0) + 1,
+            last_edited_at: new Date().toISOString(),
+          },
+        }),
         updated_at:   new Date(),
       }).returning('*')
       return row
@@ -159,7 +276,7 @@ class VoucherEditService {
       ipAddress,
     })
 
-    return { voucher: updated, correction_voucher_id: correctionVoucher.id }
+    return { voucher: updated, correction_voucher_id: correctionAnchorId }
   }
 
   /** Full edit history for one voucher, read from the append-only audit log. */
