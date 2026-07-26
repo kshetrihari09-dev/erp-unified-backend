@@ -225,7 +225,7 @@ class VoucherService {
     if (search)      q = q.where(b => b.whereILike('v.voucher_no', `%${search}%`).orWhereILike('v.narration', `%${search}%`))
 
     const [{ count }] = await q.clone().clearSelect().count('v.id as count')
-    const data = await q.orderBy('v.voucher_date', 'desc').orderBy('v.created_at', 'desc').limit(limit).offset(offset)
+    const data = await q.orderBy('v.voucher_date', 'asc').orderBy('v.created_at', 'asc').limit(limit).offset(offset)
 
     return { data, total: Number(count), page, limit, totalPages: Math.ceil(Number(count) / limit) }
   }

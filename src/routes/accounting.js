@@ -362,7 +362,7 @@ function voucherTypeRouter(voucherType) {
           .andWhere(b => b.whereNull('metadata').orWhereRaw(`metadata->>'system_correction' IS DISTINCT FROM 'true'`))
           .count('id as count')
 
-        const data = await q.orderBy('v.voucher_date', 'desc').limit(limit).offset(offset)
+        const data = await q.orderBy('v.voucher_date', 'asc').limit(limit).offset(offset)
         return paginatedResponse(res, { data, total: Number(count), page, limit })
       } catch (err) { next(err) }
     },
