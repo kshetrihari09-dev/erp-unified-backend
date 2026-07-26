@@ -305,6 +305,15 @@ router.get('/:id/ledger', async (req, res, next) => {
           .where('v.company_id', req.companyId)
           .where('v.party_id', req.params.id)
           .where('v.status', 'POSTED')
+          // Exclude internal system-generated correction/reversal vouchers
+          // (see VoucherEditService) — same filter already used by
+          // ReportingEngine.ledger(), VoucherService.list(), and the
+          // receipts/payments list in accounting.js. Without this, editing a
+          // posted voucher shows up here as an extra, duplicate-looking row.
+          .andWhere(b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`))
+          .andWhere(b => b.whereNull('v.reversal_of').orWhereNotExists(
+            db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
+          ))
           .select(
             'je.entry_date                                   as date',
             db.raw('NULL::text                              as date_bs'),
