@@ -178,7 +178,11 @@ class VoucherService {
         'p.name as party_name', 'p.code as party_code',
         'uc.name as created_by_name',
         'up.name as posted_by_name',
-      ).first()
+      )
+      // "Edited" indicator — computed from the append-only audit log rather
+      // than a new column, so no schema change is needed.
+      .select(db.raw(`EXISTS (SELECT 1 FROM audit_log al WHERE al.entity_id = v.id AND al.action = 'EDIT_VOUCHER') AS is_edited`))
+      .first()
     if (!voucher) throw new AppError('Voucher not found', 404)
 
     const lines = await db('voucher_lines as vl')
@@ -202,7 +206,16 @@ class VoucherService {
     let q = db('vouchers as v')
       .leftJoin('parties as p', 'v.party_id', 'p.id')
       .where('v.company_id', companyId)
+      // System-generated correction/reversal vouchers (written internally by
+      // VoucherEditService when a posted voucher is edited) are ledger
+      // plumbing, not user-facing records — exclude them so an edited
+      // voucher still reads as one row, updated in place.
+      .andWhere(b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`))
+      .andWhere(b => b.whereNull('v.reversal_of').orWhereNotExists(
+        db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
+      ))
       .select('v.*', 'p.name as party_name')
+      .select(db.raw(`EXISTS (SELECT 1 FROM audit_log al WHERE al.entity_id = v.id AND al.action = 'EDIT_VOUCHER') AS is_edited`))
 
     if (voucherType) q = q.where('v.voucher_type', voucherType)
     if (status)      q = q.where('v.status', status)

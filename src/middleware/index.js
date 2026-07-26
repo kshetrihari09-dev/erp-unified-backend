@@ -43,6 +43,10 @@ function requirePermission(permission) {
     approve_vouchers: u => u.can_approve_vouchers,
     lock_periods:     u => u.can_lock_periods,
     reverse_entries:  u => u.can_reverse_entries,
+    // Editing a POSTED voucher requires reversing + recalculating its journal
+    // entry under the hood, so it demands the same trust level as reversing
+    // one outright — reuse the existing can_reverse_entries flag.
+    edit_posted_vouchers: u => u.can_reverse_entries,
   }
   return async (req, res, next) => {
     try {

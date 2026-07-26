@@ -6,6 +6,7 @@ const router = require('express').Router()
 const db     = require('../db/knex')
 const PostingEngine   = require('../engines/postingEngine')
 const VoucherService  = require('../services/voucherService')
+const VoucherEditService = require('../services/voucherEditService')
 const ReportingEngine = require('../engines/reportingEngine')
 const { verifyJournalChain } = require('../utils/hashing')
 const AuditLogger     = require('../utils/auditLogger')
@@ -76,6 +77,29 @@ router.post('/vouchers/:id/cancel', async (req, res, next) => {
     if (!reason?.trim()) throw new AppError('Cancellation reason is required', 400)
     const result = await VoucherService.cancel(req.params.id, req.user.id, reason, req.ip)
     return ok(res, result, 'Voucher cancelled')
+  } catch (err) { next(err) }
+})
+
+// Edit a POSTED voucher — password confirmation is enforced client-side via
+// POST /auth/verify-password immediately before this call; this route also
+// requires edit_posted_vouchers server-side so the check can never be
+// skipped by calling the API directly. Keeps the same voucher id/no,
+// recalculates the journal via the existing (unmodified) posting engine.
+router.put('/vouchers/:id/edit', requirePermission('edit_posted_vouchers'), async (req, res, next) => {
+  try {
+    const { reason, voucher_date, party_id, narration, lines } = req.body
+    const result = await VoucherEditService.edit({
+      voucherId: req.params.id, companyId: req.companyId, userId: req.user.id,
+      reason, voucherDate: voucher_date, partyId: party_id, narration, lines,
+    }, req.ip)
+    return ok(res, result, 'Voucher updated — journal entries recalculated')
+  } catch (err) { next(err) }
+})
+
+router.get('/vouchers/:id/edit-history', async (req, res, next) => {
+  try {
+    const data = await VoucherEditService.history(req.params.id, req.companyId)
+    return ok(res, data)
   } catch (err) { next(err) }
 })
 
@@ -315,12 +339,18 @@ function voucherTypeRouter(voucherType) {
           .leftJoin('parties as p', 'v.party_id', 'p.id')
           .where('v.company_id', req.companyId)
           .where('v.voucher_type', voucherType)
+          // Exclude system-generated correction/reversal vouchers (see VoucherEditService)
+          .andWhere(b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`))
+          .andWhere(b => b.whereNull('v.reversal_of').orWhereNotExists(
+            db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
+          ))
           .select(
             'v.id', 'v.voucher_no', 'v.voucher_type', 'v.voucher_date',
             'v.narration', 'v.total_amount',
             'v.status', 'v.created_at',
             'p.name as party_name',
           )
+          .select(db.raw(`EXISTS (SELECT 1 FROM audit_log al WHERE al.entity_id = v.id AND al.action = 'EDIT_VOUCHER') AS is_edited`))
 
         if (party_id)  q = q.where('v.party_id', party_id)
         if (status)    q = q.where('v.status', status.toUpperCase())
@@ -329,6 +359,7 @@ function voucherTypeRouter(voucherType) {
 
         const [{ count }] = await db('vouchers')
           .where({ company_id: req.companyId, voucher_type: voucherType })
+          .andWhere(b => b.whereNull('metadata').orWhereRaw(`metadata->>'system_correction' IS DISTINCT FROM 'true'`))
           .count('id as count')
 
         const data = await q.orderBy('v.voucher_date', 'desc').limit(limit).offset(offset)
@@ -408,6 +439,42 @@ function voucherTypeRouter(voucherType) {
           `${voucherType === 'RECEIPT' ? 'Receipt' : 'Payment'} recorded`, 201)
       } catch (err) { next(err) }
     },
+
+    // Edit a POSTED receipt/payment — rebuilds the same two-line double
+    // entry .create() uses (Dr/Cr cash-or-bank vs. the party's control
+    // account), then hands off to VoucherEditService for the actual
+    // reverse + recalculate + in-place update.
+    edit: async (req, res, next) => {
+      try {
+        const { reason, party_id, date, amount, account_id, narration } = req.body
+        if (!amount || Number(amount) <= 0) throw new AppError('Valid amount required', 400)
+        if (!account_id)                    throw new AppError('account_id is required', 400)
+
+        const subType  = voucherType === 'RECEIPT' ? 'receivable' : 'payable'
+        const ctrlAcct = party_id
+          ? (await db('parties').where({ id: party_id, company_id: req.companyId }).first())?.control_account_id
+          : null
+        const contraAcct = ctrlAcct ||
+          (await db('accounts').where({ company_id: req.companyId, sub_type: subType }).first())?.id
+        if (!contraAcct) throw new AppError(`No ${subType} account configured`, 400)
+
+        const lines = voucherType === 'RECEIPT'
+          ? [
+              { account_id,    debit: Number(amount), credit: 0,             description: narration },
+              { account_id: contraAcct, debit: 0, credit: Number(amount),    description: narration, party_id },
+            ]
+          : [
+              { account_id: contraAcct, debit: Number(amount), credit: 0,    description: narration, party_id },
+              { account_id,    debit: 0,             credit: Number(amount), description: narration },
+            ]
+
+        const result = await VoucherEditService.edit({
+          voucherId: req.params.id, companyId: req.companyId, userId: req.user.id,
+          reason, voucherDate: date, partyId: party_id || null, narration, lines,
+        }, req.ip)
+        return ok(res, result, `${voucherType === 'RECEIPT' ? 'Receipt' : 'Payment'} updated — journal entries recalculated`)
+      } catch (err) { next(err) }
+    },
   }
 }
 
@@ -416,9 +483,11 @@ const paymentHandler = voucherTypeRouter('PAYMENT')
 
 router.get('/receipts',  receiptHandler.list)
 router.post('/receipts', requirePermission('post_vouchers'), receiptHandler.create)
+router.put('/receipts/:id/edit', requirePermission('edit_posted_vouchers'), receiptHandler.edit)
 
 router.get('/payments',  paymentHandler.list)
 router.post('/payments', requirePermission('post_vouchers'), paymentHandler.create)
+router.put('/payments/:id/edit', requirePermission('edit_posted_vouchers'), paymentHandler.edit)
 
 
 // ═══════════════════════════════════════════════════════════════════════════
