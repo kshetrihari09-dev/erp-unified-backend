@@ -18,7 +18,7 @@
  */
 const router = require('express').Router()
 const db     = require('../db/knex')
-const { authenticate }  = require('../middleware/index')
+const { authenticate, requireSensitiveConfirm }  = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { nextBillNo, adToBS, todayBS, auditLog, clampExpiry } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
@@ -189,7 +189,7 @@ router.post('/', async (req, res, next) => {
 })
 
 /* ── PUT /purchases/:id/cancel ─────────────────────────────────────────────── */
-router.put('/:id/cancel', async (req, res, next) => {
+router.put('/:id/cancel', requireSensitiveConfirm('invoiceCancel'), async (req, res, next) => {
   const trx = await db.transaction()
   try {
     const purchase = await trx('purchases').where({ id: req.params.id, company_id: req.companyId }).first()

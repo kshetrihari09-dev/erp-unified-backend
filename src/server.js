@@ -295,6 +295,22 @@ async function start() {
       console.log(`   Env:    ${config.env}\n`)
     })
 
+    // ── Automatic backups (Settings → Backup & Cloud) ───────────────────────
+    // Lightweight in-process scheduler: every 15 min, check each company's
+    // companies.settings.backup.{autoEnabled,frequency} and run a backup if
+    // one is due. A single failed company backup is logged and skipped —
+    // never throws, never blocks the server or other companies.
+    try {
+      const { checkAndRunDueBackups } = require('./services/backupService')
+      const CHECK_INTERVAL_MS = 15 * 60 * 1000
+      setInterval(() => { checkAndRunDueBackups().catch(err => console.error('[backup-scheduler]', err.message)) }, CHECK_INTERVAL_MS)
+      // Also run once shortly after boot so an overdue backup doesn't wait
+      // a full interval before the first check.
+      setTimeout(() => { checkAndRunDueBackups().catch(err => console.error('[backup-scheduler]', err.message)) }, 30 * 1000)
+    } catch (err) {
+      console.error('[backup-scheduler] failed to start:', err.message)
+    }
+
     // ── Graceful shutdown ──────────────────────────────────────────────────
     async function shutdown(signal) {
       console.log(`\n[Shutdown] ${signal} received. Closing gracefully…`)

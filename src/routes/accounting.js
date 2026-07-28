@@ -10,7 +10,7 @@ const VoucherEditService = require('../services/voucherEditService')
 const ReportingEngine = require('../engines/reportingEngine')
 const { verifyJournalChain } = require('../utils/hashing')
 const AuditLogger     = require('../utils/auditLogger')
-const { authenticate, requireRole, requirePermission, ok, paginated } = require('../middleware/index')
+const { authenticate, requireRole, requirePermission, requireSensitiveConfirm, ok, paginated } = require('../middleware/index')
 const { AppError } = require('../engines/postingEngine')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 
@@ -279,7 +279,7 @@ router.post('/periods', requirePermission('lock_periods'), async (req, res, next
   } catch (err) { next(err) }
 })
 
-router.post('/periods/:id/lock', requirePermission('lock_periods'), async (req, res, next) => {
+router.post('/periods/:id/lock', requirePermission('lock_periods'), requireSensitiveConfirm('fiscalYearChange'), async (req, res, next) => {
   try {
     const period = await db('accounting_periods').where({ id: req.params.id, company_id: req.companyId }).first()
     if (!period)         throw new AppError('Period not found', 404)
@@ -290,7 +290,7 @@ router.post('/periods/:id/lock', requirePermission('lock_periods'), async (req, 
   } catch (err) { next(err) }
 })
 
-router.post('/periods/:id/unlock', requireRole('owner'), async (req, res, next) => {
+router.post('/periods/:id/unlock', requireRole('owner'), requireSensitiveConfirm('fiscalYearChange'), async (req, res, next) => {
   try {
     const [updated] = await db('accounting_periods').where({ id: req.params.id, company_id: req.companyId }).update({ is_locked: false, locked_by: null, locked_at: null }).returning('*')
     await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: 'UNLOCK_PERIOD', entityType: 'period', entityId: req.params.id, ipAddress: req.ip })

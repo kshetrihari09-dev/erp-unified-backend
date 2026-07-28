@@ -30,7 +30,7 @@
  */
 const router = require('express').Router()
 const db     = require('../db/knex')
-const { authenticate } = require('../middleware/index')
+const { authenticate, requireSensitiveConfirm } = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { nextInvoiceNo, adToBS, todayBS, auditLog, clampExpiry } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
@@ -303,7 +303,7 @@ router.post('/', async (req, res, next) => {
 })
 
 /* ── PUT /sales/:id/cancel ─────────────────────────────────────────────────── */
-router.put('/:id/cancel', async (req, res, next) => {
+router.put('/:id/cancel', requireSensitiveConfirm('invoiceCancel'), async (req, res, next) => {
   const trx = await db.transaction()
   try {
     const sale = await trx('sales').where({ id: req.params.id, company_id: req.companyId }).first()
@@ -367,7 +367,7 @@ router.put('/:id/cancel', async (req, res, next) => {
  */
 const VALID_PAYMENT_MODES = ['cash', 'credit', 'bank', 'cheque', 'upi', 'card', 'online']
 
-router.put('/:id/payment-mode', async (req, res, next) => {
+router.put('/:id/payment-mode', requireSensitiveConfirm('paymentModeEdit'), async (req, res, next) => {
   try {
     const { payment_mode } = req.body
     if (!VALID_PAYMENT_MODES.includes(payment_mode)) {

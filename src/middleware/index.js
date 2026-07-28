@@ -1,8 +1,10 @@
 /**
  * Unified middleware — combines pharma ERP auth + accounting engine auth
  */
-const jwt = require('jsonwebtoken')
-const db  = require('../db/knex')
+const jwt    = require('jsonwebtoken')
+const bcrypt = require('bcryptjs')
+const db     = require('../db/knex')
+const { withDefaults } = require('../utils/settingsDefaults')
 
 /* ── JWT Authentication ─────────────────────────────────────────────────── */
 async function authenticate(req, res, next) {
@@ -60,6 +62,44 @@ function requirePermission(permission) {
   }
 }
 
+/* ── Sensitive-action password re-confirmation ──────────────────────────────
+ * Generalizes the existing "voucher edit" password re-check (see
+ * POST /auth/verify-password + VoucherEditPasswordDialog.tsx) to any action
+ * an admin has opted into requiring it for, via Settings → Users &
+ * Permissions → "sensitive actions". Configured per-company in
+ * companies.settings.sensitiveActions[actionKey].
+ *
+ *  - If the toggle is OFF (default), this is a no-op — existing callers of
+ *    the route are completely unaffected.
+ *  - If ON, the request must include `confirmPassword`, verified against
+ *    the ACTING user's own password_hash. Nothing about the route's other
+ *    behavior, response shape, or existing required fields changes.
+ */
+function requireSensitiveConfirm(actionKey) {
+  return async (req, res, next) => {
+    try {
+      const company = await db('companies').where({ id: req.companyId }).first('settings')
+      const settings = withDefaults(company?.settings || {})
+      const required = !!settings.sensitiveActions?.[actionKey]
+      if (!required) return next()
+
+      const { confirmPassword } = req.body || {}
+      if (!confirmPassword) {
+        return res.status(400).json({ success: false, message: 'Password confirmation is required for this action', requiresPasswordConfirm: true })
+      }
+      const user = await db('users').where({ id: req.user.id }).first()
+      if (!user?.password_hash) {
+        return res.status(400).json({ success: false, message: 'No password is set on this account, so this action cannot be confirmed.' })
+      }
+      const valid = await bcrypt.compare(confirmPassword, user.password_hash)
+      if (!valid) {
+        return res.status(401).json({ success: false, message: 'Incorrect password', requiresPasswordConfirm: true })
+      }
+      next()
+    } catch (err) { next(err) }
+  }
+}
+
 /* ── Standard response helpers ──────────────────────────────────────────── */
 function ok(res, data, message = 'Success', status = 200) {
   return res.status(status).json({ success: true, message, data })
@@ -81,4 +121,4 @@ function errorHandler(err, req, res, next) {
   res.status(status).json({ success: false, message })
 }
 
-module.exports = { authenticate, requireRole, requirePermission, errorHandler, ok, paginated }
+module.exports = { authenticate, requireRole, requirePermission, requireSensitiveConfirm, errorHandler, ok, paginated }
