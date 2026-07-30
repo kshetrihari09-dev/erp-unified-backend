@@ -93,12 +93,27 @@ class ReportingEngine {
       const currentLines = await db('voucher_lines')
         .whereIn('voucher_id', editedVoucherIds)
         .andWhere('account_id', accountId)
-        .select('voucher_id', 'debit', 'credit', 'description')
+        .select('voucher_id', 'debit', 'credit', 'description', 'party_id')
       const currentByVoucher = new Map(currentLines.map(l => [l.voucher_id, l]))
+
+      // The party may also have changed on edit (e.g. re-billed to a
+      // different customer/supplier) — re-resolve names for any current
+      // party_id not already covered by the original join above.
+      const currentPartyIds = [...new Set(currentLines.map(l => l.party_id).filter(Boolean))]
+      const partyNameById = currentPartyIds.length
+        ? new Map((await db('parties').whereIn('id', currentPartyIds).select('id', 'name')).map(p => [p.id, p.name]))
+        : new Map()
+
       rows = rows.map(r => {
         const current = r.is_edited ? currentByVoucher.get(r.voucher_id) : null
         return current
-          ? { ...r, debit: current.debit, credit: current.credit, description: current.description ?? r.description }
+          ? {
+              ...r,
+              debit: current.debit,
+              credit: current.credit,
+              description: current.description ?? r.description,
+              party_name: current.party_id ? (partyNameById.get(current.party_id) ?? null) : null,
+            }
           : r
       })
     }
