@@ -96,25 +96,37 @@ class ReportingEngine {
         .select('voucher_id', 'debit', 'credit', 'description', 'party_id')
       const currentByVoucher = new Map(currentLines.map(l => [l.voucher_id, l]))
 
+      // For Receipt/Payment (and similar) vouchers, the cash/bank line itself
+      // never carries a party_id — the party sits on the contra (AR/AP) line.
+      // The original posting strategy handles this with `line.party_id ||
+      // voucher.party_id`; replicate that same fallback here so an edited
+      // voucher's cash/bank row still resolves to the voucher's current party
+      // instead of going blank.
+      const currentVouchers = await db('vouchers').whereIn('id', editedVoucherIds).select('id', 'party_id')
+      const voucherPartyIdById = new Map(currentVouchers.map(v => [v.id, v.party_id]))
+
       // The party may also have changed on edit (e.g. re-billed to a
       // different customer/supplier) — re-resolve names for any current
       // party_id not already covered by the original join above.
-      const currentPartyIds = [...new Set(currentLines.map(l => l.party_id).filter(Boolean))]
+      const currentPartyIds = [...new Set([
+        ...currentLines.map(l => l.party_id),
+        ...currentVouchers.map(v => v.party_id),
+      ].filter(Boolean))]
       const partyNameById = currentPartyIds.length
         ? new Map((await db('parties').whereIn('id', currentPartyIds).select('id', 'name')).map(p => [p.id, p.name]))
         : new Map()
 
       rows = rows.map(r => {
         const current = r.is_edited ? currentByVoucher.get(r.voucher_id) : null
-        return current
-          ? {
-              ...r,
-              debit: current.debit,
-              credit: current.credit,
-              description: current.description ?? r.description,
-              party_name: current.party_id ? (partyNameById.get(current.party_id) ?? null) : null,
-            }
-          : r
+        if (!current) return r
+        const effectivePartyId = current.party_id || voucherPartyIdById.get(r.voucher_id) || null
+        return {
+          ...r,
+          debit: current.debit,
+          credit: current.credit,
+          description: current.description ?? r.description,
+          party_name: effectivePartyId ? (partyNameById.get(effectivePartyId) ?? null) : null,
+        }
       })
     }
 
