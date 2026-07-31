@@ -23,7 +23,7 @@ class SMSService {
   constructor() {
     this.provider   = (process.env.SMS_PROVIDER || 'console').toLowerCase()
     this.apiKey     = process.env.SMS_API_KEY
-    this.senderId   = process.env.SMS_SENDER_ID || 'MediERP'
+    this.senderId   = process.env.SMS_SENDER_ID || 'Byapar'
   }
 
   /**
@@ -33,7 +33,7 @@ class SMSService {
    * @returns {{ success: boolean, messageId?: string, error?: string }}
    */
   async sendOTP(phone, otp) {
-    const message = `Your MediERP verification code is: ${otp}. Valid for 5 minutes. Do not share this code.`
+    const message = `Your Byapar verification code is: ${otp}. Valid for 5 minutes. Do not share this code.`
 
     try {
       switch (this.provider) {

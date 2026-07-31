@@ -1,5 +1,5 @@
 /**
- * server.js — MediERP Unified Backend (Security Upgrade)
+ * server.js — Byapar Unified Backend (Security Upgrade)
  *
  * What changed from the previous version:
  *
@@ -176,7 +176,7 @@ app.get('/health', async (req, res) => {
       version:  '2.2.0',
       env:      config.env,
       time:     new Date().toISOString(),
-      name:     'MediERP Unified Backend',
+      name:     'Byapar Unified Backend',
       https:    config.server.https,
       lan:      config.server.lan,
     })
@@ -283,7 +283,7 @@ async function start() {
 
     server.listen(PORT, '0.0.0.0', () => {
       const { ip, lanDetected } = config.server.lan
-      console.log(`\n🏦 MediERP Unified Backend v2.2 [${config.env}]`)
+      console.log(`\n🏦 Byapar Unified Backend v2.2 [${config.env}]`)
       console.log(`   API:    ${proto}://localhost:${PORT}/api/v1`)
       if (lanDetected) {
         console.log(`   LAN:    ${proto}://${ip}:${PORT}/api/v1  ← mobile uses this`)

@@ -1,7 +1,7 @@
 {
   "name": "erp-unified-backend",
   "version": "2.2.0",
-  "description": "MediERP — Unified Node.js + PostgreSQL backend: Pharma ERP + Bank-Grade Accounting Engine",
+  "description": "Byapar — Unified Node.js + PostgreSQL backend: Pharma ERP + Bank-Grade Accounting Engine",
   "main": "src/server.js",
   "scripts": {
     "start": "cross-env NODE_ENV=development node src/server.js",

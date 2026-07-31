@@ -9,7 +9,7 @@
  *
  * .env keys:
  *   EMAIL_PROVIDER=smtp|sendgrid|mailgun|console
- *   EMAIL_FROM_NAME=MediERP
+ *   EMAIL_FROM_NAME=Byapar
  *   EMAIL_FROM_ADDRESS=noreply@yourcompany.com
  *
  *   # SMTP
@@ -31,7 +31,7 @@
 const https  = require('https')
 const http   = require('http')
 
-const APP_NAME    = process.env.APP_NAME          || 'MediERP'
+const APP_NAME    = process.env.APP_NAME          || 'Byapar'
 const FROM_NAME   = process.env.EMAIL_FROM_NAME   || APP_NAME
 const FROM_ADDR   = process.env.EMAIL_FROM_ADDRESS || `noreply@medierp.app`
 

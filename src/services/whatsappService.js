@@ -22,7 +22,7 @@
  *
  *   # Gupshup
  *   GUPSHUP_API_KEY=xxx
- *   GUPSHUP_APP_NAME=MediERP
+ *   GUPSHUP_APP_NAME=Byapar
  *   GUPSHUP_SRC_NAME=+9779XXXXXXXXX
  *
  * WhatsApp Business API requires approved message templates.
@@ -63,7 +63,7 @@ class WhatsAppService {
     console.log('\n' + '═'.repeat(52))
     console.log(`📲 WhatsApp OTP (console mode) → ${phone}`)
     console.log(`   OTP   : ${otp}`)
-    console.log(`   Msg   : Your MediERP code is ${otp}. Valid 5 min.`)
+    console.log(`   Msg   : Your Byapar code is ${otp}. Valid 5 min.`)
     console.log('═'.repeat(52) + '\n')
     return { success: true, messageId: `wa-console-${Date.now()}`, provider: 'console' }
   }
@@ -78,7 +78,7 @@ class WhatsAppService {
       throw new Error('TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are required')
     }
 
-    const body    = `Your MediERP verification code is: *${otp}*\n\nThis code expires in 5 minutes.\nDo not share this code with anyone.`
+    const body    = `Your Byapar verification code is: *${otp}*\n\nThis code expires in 5 minutes.\nDo not share this code with anyone.`
     const payload = new URLSearchParams({
       To:   `whatsapp:${phone}`,
       From: from,
@@ -150,12 +150,12 @@ class WhatsAppService {
   /* ── Gupshup ────────────────────────────────────────────────────────────── */
   async _sendGupshup(phone, otp) {
     const apiKey   = process.env.GUPSHUP_API_KEY
-    const appName  = process.env.GUPSHUP_APP_NAME  || 'MediERP'
+    const appName  = process.env.GUPSHUP_APP_NAME  || 'Byapar'
     const srcName  = process.env.GUPSHUP_SRC_NAME  || appName
 
     if (!apiKey) throw new Error('GUPSHUP_API_KEY is required')
 
-    const message = `Your MediERP verification code is: ${otp}. Valid for 5 minutes. Do not share.`
+    const message = `Your Byapar verification code is: ${otp}. Valid for 5 minutes. Do not share.`
     const payload = new URLSearchParams({
       channel:  'whatsapp',
       source:   srcName,
