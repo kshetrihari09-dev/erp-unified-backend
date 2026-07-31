@@ -26,6 +26,7 @@ const OTPService      = require('../services/otpService')
 const smsService      = require('../services/smsService')
 const whatsappService = require('../services/whatsappService')
 const emailService    = require('../services/emailService')
+const { resolveActiveCompanyId } = require('../services/companyContext')
 
 const otpService = new OTPService(db)
 
@@ -230,14 +231,15 @@ router.post('/verify-otp', async (req, res, next) => {
 
       if (!user || !user.is_active) throw new AppError('Account not found or disabled', 401)
 
-      await db('users').where({ id: user.id }).update({ last_login_at: new Date() })
-      const company = await db('companies').where({ id: user.company_id }).first()
-      const token   = signToken({ userId: user.id, email: user.email, role: user.role, companyId: user.company_id })
+      const companyId = await resolveActiveCompanyId(user)
+      await db('users').where({ id: user.id }).update({ last_login_at: new Date(), last_active_company_id: companyId })
+      const company = await db('companies').where({ id: companyId }).first()
+      const token   = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
       const refresh_token = signRefresh(user.id)
       const { password_hash: _, ...safeUser } = user
 
       await AuditLogger.log(db, {
-        companyId: user.company_id, userId: user.id,
+        companyId, userId: user.id,
         action: `LOGIN_OTP_${method.toUpperCase()}`,
         entityType: 'auth', entityId: user.id, ipAddress: req.ip,
       })
@@ -398,6 +400,13 @@ router.post('/register', async (req, res, next) => {
 
         await trx('users').insert(userRecord)
 
+        // Multi-company membership — this is the user's first company, so
+        // it's also their default one.
+        await trx('user_companies').insert({
+          id: uuid(), user_id: userId, company_id: companyId, is_default: true,
+        })
+        await trx('users').where({ id: userId }).update({ last_active_company_id: companyId })
+
         const user    = await trx('users').where({ id: userId }).first()
         const company = await trx('companies').where({ id: companyId }).first()
         const jwtTok  = signToken({ userId, email: user.email, role: user.role, companyId })
@@ -468,6 +477,13 @@ router.post('/register', async (req, res, next) => {
       }
       if (hasEmailVerifiedB) userRecord.email_verified = false
       await trx('users').insert(userRecord)
+
+      // Multi-company membership — this is the user's first company, so
+      // it's also their default one.
+      await trx('user_companies').insert({
+        id: uuid(), user_id: userId, company_id: companyId, is_default: true,
+      })
+      await trx('users').where({ id: userId }).update({ last_active_company_id: companyId })
 
       const user    = await trx('users').where({ id: userId }).first()
       const company = await trx('companies').where({ id: companyId }).first()
@@ -564,12 +580,13 @@ router.post('/login', async (req, res, next) => {
       throw new AppError('Invalid email or password', 401)
     }
     if (!user.is_active) throw new AppError('Account is disabled', 403)
-    await db('users').where({ id: user.id }).update({ last_login_at: new Date() })
-    const company     = await db('companies').where({ id: user.company_id }).first()
-    const token       = signToken({ userId: user.id, email: user.email, role: user.role, companyId: user.company_id })
+    const companyId = await resolveActiveCompanyId(user)
+    await db('users').where({ id: user.id }).update({ last_login_at: new Date(), last_active_company_id: companyId })
+    const company     = await db('companies').where({ id: companyId }).first()
+    const token       = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
     const refresh_token = signRefresh(user.id)
     const { password_hash: _, ...safeUser } = user
-    await AuditLogger.log(db, { companyId: user.company_id, userId: user.id, action: 'LOGIN', entityType: 'auth', entityId: user.id, ipAddress: req.ip })
+    await AuditLogger.log(db, { companyId, userId: user.id, action: 'LOGIN', entityType: 'auth', entityId: user.id, ipAddress: req.ip })
     return res.json({ success: true, data: { token, refresh_token, user: safeUser, company } })
   } catch (err) { next(err) }
 })
@@ -627,7 +644,11 @@ router.post('/refresh', async (req, res, next) => {
     if (payload.type !== 'refresh') throw new AppError('Invalid refresh token', 401)
     const user = await db('users').where({ id: payload.userId }).first()
     if (!user || !user.is_active) throw new AppError('User not found or disabled', 401)
-    const token = signToken({ userId: user.id, email: user.email, role: user.role, companyId: user.company_id })
+    // Preserve whatever company the user currently has active (survives a
+    // company switch across a silent token refresh) rather than resetting
+    // back to their default company on every refresh.
+    const companyId = await resolveActiveCompanyId(user)
+    const token = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
     return res.json({ success: true, data: { token } })
   } catch (err) {
     if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
@@ -698,3 +719,5 @@ async function seedDefaultAccounts(trx, companyId) {
 
 module.exports = router
 module.exports.seedDefaultAccounts = seedDefaultAccounts
+module.exports.signToken   = signToken
+module.exports.signRefresh = signRefresh

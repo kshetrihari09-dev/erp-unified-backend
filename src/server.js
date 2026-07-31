@@ -46,6 +46,7 @@ const {
 
 // ── Route modules (UNCHANGED) ─────────────────────────────────────────────────
 const authRouter       = require('./routes/auth')
+const companiesRouter  = require('./routes/companies')
 const productsRouter   = require('./routes/products')
 const partiesRouter    = require('./routes/parties')
 const salesRouter      = require('./routes/sales')
@@ -193,6 +194,9 @@ app.use(API, generalLimiter)
 
 // Auth — tighter limit on login/register/OTP
 app.use(`${API}/auth`,       authLimiter, authRouter)
+
+// Multi-company management (create/list/edit companies, switch active one)
+app.use(`${API}/companies`, companiesRouter)
 
 // Pharma ERP (UNCHANGED)
 app.use(`${API}/products`,   productsRouter)

@@ -17,6 +17,22 @@ async function authenticate(req, res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET)
     req.user      = { id: payload.userId, email: payload.email, role: payload.role }
     req.companyId = payload.companyId
+
+    // ── Multi-company membership check ─────────────────────────────────────
+    // The JWT already carries the active companyId, but we re-verify on
+    // every request (not just at switch time) that this user still has a
+    // live membership to that company. This closes the gap where access to
+    // a company is revoked mid-session but an existing token would
+    // otherwise keep working until it expires — the exact scenario the
+    // "company switching must not allow access to another company's data"
+    // requirement guards against.
+    const membership = await db('user_companies')
+      .where({ user_id: req.user.id, company_id: req.companyId })
+      .first('id')
+    if (!membership) {
+      return res.status(403).json({ success: false, message: 'You no longer have access to this company. Please switch companies or log in again.' })
+    }
+
     next()
   } catch (err) {
     if (err.name === 'TokenExpiredError') return res.status(401).json({ success: false, message: 'Token expired' })
