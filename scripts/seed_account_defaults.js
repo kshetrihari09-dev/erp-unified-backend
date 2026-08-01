@@ -18,19 +18,21 @@ require('dotenv').config({ path: require('path').join(__dirname, '../../../.env'
 const db = require('../src/db/knex')
 
 // Mapping: role → sub_type in the accounts table
+// NOTE: these sub_type values match auth.js's seedDefaultAccounts() Chart
+// of Accounts seed exactly (e.g. 'receivable', not 'accounts_receivable').
 const ROLE_SUBTYPE_MAP = [
-  { role: 'accounts_receivable', sub_type: 'accounts_receivable' },
-  { role: 'accounts_payable',    sub_type: 'accounts_payable'    },
-  { role: 'sales_revenue',       sub_type: 'sales'               },
-  { role: 'purchase_expense',    sub_type: 'purchases'           },
-  { role: 'inventory',           sub_type: 'inventory'           },
-  { role: 'cogs',                sub_type: 'cogs'                },
-  { role: 'cash',                sub_type: 'cash'                },
-  { role: 'bank',                sub_type: 'bank'                },
-  { role: 'tax_payable',         sub_type: 'tax_payable'         },
-  { role: 'tax_input',           sub_type: 'tax_input'           },
-  { role: 'discount_given',      sub_type: 'discount_expense'    },
-  { role: 'discount_received',   sub_type: 'discount_income'     },
+  { role: 'accounts_receivable', sub_type: 'receivable'        },
+  { role: 'accounts_payable',    sub_type: 'payable'           },
+  { role: 'sales_revenue',       sub_type: 'sales'             },
+  { role: 'purchase_expense',    sub_type: 'purchase'          },
+  { role: 'inventory',           sub_type: 'inventory'         },
+  { role: 'cogs',                sub_type: 'cogs'              },
+  { role: 'cash',                sub_type: 'cash'              },
+  { role: 'bank',                sub_type: 'bank'              },
+  { role: 'tax_payable',         sub_type: 'tax_payable'       },
+  { role: 'tax_input',           sub_type: 'tax_input'         },
+  { role: 'discount_given',      sub_type: 'discount_expense'  },
+  { role: 'discount_received',   sub_type: 'discount_income'   },
 ]
 
 async function seedAccountDefaults(companyId) {
@@ -73,6 +75,8 @@ async function seedAccountDefaults(companyId) {
         role,
         description: `Auto-seeded from sub_type="${sub_type}"`,
         is_active:   true,
+        is_default:  true,
+        default_account_id: account.id,
       })
       console.log(`  ✨  ${role.padEnd(25)} → ${account.code} ${account.name} (created)`)
       seeded++

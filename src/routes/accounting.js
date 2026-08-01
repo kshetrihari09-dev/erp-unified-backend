@@ -508,14 +508,83 @@ router.get('/account-defaults', async (req, res, next) => {
   try {
     const defaults = await db('account_defaults as ad')
       .join('accounts as a', 'ad.account_id', 'a.id')
+      .leftJoin('accounts as da', 'ad.default_account_id', 'da.id')
       .where('ad.company_id', req.companyId)
       .select(
         'ad.id', 'ad.role', 'ad.description', 'ad.is_active',
+        'ad.is_default', 'ad.default_account_id',
         'a.id as account_id', 'a.code as account_code',
         'a.name as account_name', 'a.type as account_type', 'a.sub_type',
+        'da.code as default_account_code', 'da.name as default_account_name',
       )
       .orderBy('ad.role')
     return ok(res, defaults)
+  } catch (err) { next(err) }
+})
+
+/* POST /account-defaults/initialize — idempotent bulk auto-assign.
+ * For companies that don't have Engine Setup fully configured yet (e.g.
+ * companies created before this feature existed), this matches each
+ * unmapped required/optional role to a Chart-of-Accounts leaf account by
+ * sub_type and fills it in. Never touches a role that's already mapped. */
+router.post('/account-defaults/initialize', requireRole('owner', 'admin', 'accountant'), async (req, res, next) => {
+  try {
+    const ROLE_SUBTYPE_MAP = [
+      { role: 'accounts_receivable', sub_type: 'receivable' },
+      { role: 'accounts_payable',    sub_type: 'payable' },
+      { role: 'sales_revenue',       sub_type: 'sales' },
+      { role: 'purchase_expense',    sub_type: 'purchase' },
+      { role: 'inventory',           sub_type: 'inventory' },
+      { role: 'cogs',                sub_type: 'cogs' },
+      { role: 'cash',                sub_type: 'cash' },
+      { role: 'bank',                sub_type: 'bank' },
+      { role: 'tax_payable',         sub_type: 'tax_payable' },
+      { role: 'tax_input',           sub_type: 'tax_input' },
+      { role: 'discount_given',      sub_type: 'discount_expense' },
+      { role: 'discount_received',   sub_type: 'discount_income' },
+    ]
+
+    const existingRoles = new Set(
+      (await db('account_defaults').where('company_id', req.companyId).select('role')).map(r => r.role)
+    )
+
+    const created = []
+    for (const { role, sub_type } of ROLE_SUBTYPE_MAP) {
+      if (existingRoles.has(role)) continue // never overwrite an existing setting
+
+      const account = await db('accounts')
+        .where({ company_id: req.companyId, sub_type, is_active: true, is_group: false })
+        .first()
+      if (!account) continue // no matching account yet — leave unmapped, user can assign manually
+
+      const [def] = await db('account_defaults')
+        .insert({
+          company_id:  req.companyId,
+          account_id:  account.id,
+          role,
+          description: 'Auto-assigned default during setup',
+          is_active:   true,
+          is_default:  true,
+          default_account_id: account.id,
+        })
+        .onConflict(['company_id', 'role'])
+        .ignore()
+        .returning('*')
+
+      if (def) created.push({ role, account_id: account.id, account_name: account.name })
+    }
+
+    if (created.length) {
+      await AuditLogger.log(db, {
+        companyId: req.companyId, userId: req.user.id,
+        action: 'INITIALIZE_ACCOUNT_DEFAULTS',
+        entityType: 'account_defaults', entityId: req.companyId,
+        payloadAfter: { created },
+        ipAddress: req.ip,
+      })
+    }
+
+    return ok(res, { created }, created.length ? `${created.length} default(s) auto-assigned` : 'All roles already configured')
   } catch (err) { next(err) }
 })
 
@@ -535,9 +604,19 @@ router.post('/account-defaults', requireRole('owner', 'admin', 'accountant'), as
         role,
         description: description || null,
         is_active:   true,
+        is_default:  false,
       })
       .onConflict(['company_id', 'role'])
-      .merge({ account_id, description: description || null, is_active: true, updated_at: new Date() })
+      .merge({
+        account_id, description: description || null, is_active: true,
+        // A manual save always means "user-chosen", even if it happens to
+        // match the original default account — is_default only reflects
+        // "system auto-assigned and never touched since". default_account_id
+        // is intentionally left alone here (via a raw merge below) so
+        // "Reset to Default" keeps working after this edit.
+        is_default: false,
+        updated_at: new Date(),
+      })
       .returning('*')
 
     await AuditLogger.log(db, {
@@ -559,6 +638,38 @@ router.delete('/account-defaults/:role', requireRole('owner', 'admin'), async (r
       .del()
     if (!deleted) throw new AppError('Account default not found', 404)
     return ok(res, null, 'Account default removed')
+  } catch (err) { next(err) }
+})
+
+/* POST /account-defaults/:role/reset — restore the system default account
+ * for a single role. Only affects future postings/lookups through this
+ * mapping; already-posted vouchers and journal entries reference their own
+ * account_id at posting time and are unaffected. */
+router.post('/account-defaults/:role/reset', requireRole('owner', 'admin', 'accountant'), async (req, res, next) => {
+  try {
+    const existing = await db('account_defaults')
+      .where({ company_id: req.companyId, role: req.params.role })
+      .first()
+    if (!existing) throw new AppError('Account default not found', 404)
+    if (!existing.default_account_id) throw new AppError('No default is available for this role — assign one manually', 400)
+
+    const account = await db('accounts').where({ id: existing.default_account_id, is_active: true }).first()
+    if (!account) throw new AppError('The default account is no longer available (inactive or deleted)', 400)
+
+    const [def] = await db('account_defaults')
+      .where({ company_id: req.companyId, role: req.params.role })
+      .update({ account_id: existing.default_account_id, is_active: true, is_default: true, updated_at: new Date() })
+      .returning('*')
+
+    await AuditLogger.log(db, {
+      companyId: req.companyId, userId: req.user.id,
+      action: 'RESET_ACCOUNT_DEFAULT',
+      entityType: 'account_defaults', entityId: def.id,
+      payloadAfter: { role: req.params.role, account_id: existing.default_account_id },
+      ipAddress: req.ip,
+    })
+
+    return ok(res, { ...def, account_code: account.code, account_name: account.name }, 'Reset to default')
   } catch (err) { next(err) }
 })
 

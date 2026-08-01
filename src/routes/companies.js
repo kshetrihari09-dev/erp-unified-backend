@@ -21,7 +21,7 @@ const db = require('../db/knex')
 const { authenticate, requireRole } = require('../middleware/index')
 const { successResponse } = require('../middleware/helpers')
 const { auditLog } = require('../utils/helpers')
-const { seedDefaultAccounts, signToken, signRefresh } = require('./auth')
+const { seedDefaultAccounts, seedAccountDefaults, signToken, signRefresh } = require('./auth')
 
 class AppError extends Error {
   constructor(msg, status = 400) { super(msg); this.status = status }
@@ -81,7 +81,8 @@ router.post('/', requireRole('admin', 'manager'), async (req, res, next) => {
         vat_percent:     vat_percent ?? 13,
       })
 
-      await seedDefaultAccounts(trx, companyId)
+      const seededAccountIds = await seedDefaultAccounts(trx, companyId)
+      await seedAccountDefaults(trx, companyId, seededAccountIds)
 
       const year = new Date().getFullYear()
       await trx('accounting_periods').insert({

@@ -345,7 +345,8 @@ router.post('/register', async (req, res, next) => {
           vat_percent:     13,
         })
 
-        await seedDefaultAccounts(trx, companyId)
+        const seededAccountIds = await seedDefaultAccounts(trx, companyId)
+        await seedAccountDefaults(trx, companyId, seededAccountIds)
 
         const year = new Date().getFullYear()
         await trx('accounting_periods').insert({
@@ -453,7 +454,8 @@ router.post('/register', async (req, res, next) => {
         vat_percent:     13,
       })
 
-      await seedDefaultAccounts(trx, companyId)
+      const seededAccountIds = await seedDefaultAccounts(trx, companyId)
+      await seedAccountDefaults(trx, companyId, seededAccountIds)
 
       const year = new Date().getFullYear()
       await trx('accounting_periods').insert({
@@ -698,6 +700,8 @@ async function seedDefaultAccounts(trx, companyId) {
     { key:'SALARY',    code:'5101', name:'Salary Expense',        type:'expense',   sub_type:'operating',   normal_balance:'debit',  is_group:false, is_system:false },
     { key:'RENT',      code:'5102', name:'Rent Expense',          type:'expense',   sub_type:'operating',   normal_balance:'debit',  is_group:false, is_system:false },
     { key:'UTILITY',   code:'5103', name:'Utility Expense',       type:'expense',   sub_type:'operating',   normal_balance:'debit',  is_group:false, is_system:false },
+    { key:'DISC_GIVEN',code:'5104', name:'Discount Allowed',      type:'expense',   sub_type:'discount_expense', normal_balance:'debit',  is_group:false, is_system:false },
+    { key:'DISC_RECD', code:'4101', name:'Discount Received',     type:'income',    sub_type:'discount_income',  normal_balance:'credit', is_group:false, is_system:false },
   ]
   for (const { key, ...acc } of accounts) {
     const id = uuid()
@@ -708,8 +712,8 @@ async function seedDefaultAccounts(trx, companyId) {
     CASH:'G_ASSET', BANK:'G_ASSET', AR:'G_ASSET', INVENTORY:'G_ASSET', TAX_IN:'G_ASSET',
     AP:'G_LIAB', TAX_OUT:'G_LIAB',
     CAPITAL:'G_EQUITY', RETAINED:'G_EQUITY',
-    SALES:'G_INCOME', OTHER_INC:'G_INCOME',
-    COGS:'G_EXP', PURCHASE:'G_EXP', SALARY:'G_EXP', RENT:'G_EXP', UTILITY:'G_EXP',
+    SALES:'G_INCOME', OTHER_INC:'G_INCOME', DISC_RECD:'G_INCOME',
+    COGS:'G_EXP', PURCHASE:'G_EXP', SALARY:'G_EXP', RENT:'G_EXP', UTILITY:'G_EXP', DISC_GIVEN:'G_EXP',
   }
   for (const [child, parent] of Object.entries(parentMap)) {
     if (ids[child] && ids[parent]) await trx('accounts').where({ id: ids[child] }).update({ parent_id: ids[parent] })
@@ -717,7 +721,63 @@ async function seedDefaultAccounts(trx, companyId) {
   return ids
 }
 
+/* ── Engine Setup (account_defaults) seeder ────────────────────────────────
+ * Auto-populates PostingEngine's Chart-of-Accounts role mapping so a brand
+ * new company can post sales/purchase/payment vouchers immediately, with
+ * no manual "Engine Setup" step required.
+ *
+ * IDEMPOTENT: only ever INSERTs rows that don't already exist
+ * (`onConflict(['company_id','role']).ignore()`), so calling this again for
+ * a company that already has some/all roles configured never overwrites a
+ * setting the user (or a previous run) already set — matching the
+ * "if setting exists, keep it; else create the default" rule.
+ *
+ * Rows created here are flagged is_default=true and remember their
+ * originally-assigned account in default_account_id, so the Engine Setup
+ * UI can show a "Default" badge and offer "Reset to Default" even after a
+ * user changes the mapping later — without ever touching existing
+ * transactions, journal entries, or ledger mappings.
+ */
+const ENGINE_SETUP_ROLE_MAP = {
+  accounts_receivable: 'AR',
+  accounts_payable:    'AP',
+  sales_revenue:        'SALES',
+  purchase_expense:     'PURCHASE',
+  inventory:             'INVENTORY',
+  cogs:                  'COGS',
+  cash:                  'CASH',
+  bank:                  'BANK',
+  tax_payable:           'TAX_OUT',
+  tax_input:             'TAX_IN',
+  discount_given:        'DISC_GIVEN',
+  discount_received:     'DISC_RECD',
+}
+
+async function seedAccountDefaults(trx, companyId, accountIds) {
+  const rows = []
+  for (const [role, key] of Object.entries(ENGINE_SETUP_ROLE_MAP)) {
+    const accountId = accountIds[key]
+    if (!accountId) continue // account wasn't created for some reason — skip, leave role unmapped
+    rows.push({
+      id:                 uuid(),
+      company_id:         companyId,
+      account_id:         accountId,
+      role,
+      description:        'Auto-assigned default during setup',
+      is_active:           true,
+      is_default:          true,
+      default_account_id: accountId,
+    })
+  }
+  if (rows.length === 0) return
+  await trx('account_defaults')
+    .insert(rows)
+    .onConflict(['company_id', 'role'])
+    .ignore()
+}
+
 module.exports = router
-module.exports.seedDefaultAccounts = seedDefaultAccounts
+module.exports.seedDefaultAccounts  = seedDefaultAccounts
+module.exports.seedAccountDefaults  = seedAccountDefaults
 module.exports.signToken   = signToken
 module.exports.signRefresh = signRefresh
