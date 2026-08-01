@@ -314,39 +314,114 @@ router.delete('/:id', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
-/* ── POST /products/:id/adjust ────────────────────────────────────────────── */
+/* ── POST /products/:id/adjust ─────────────────────────────────────────────
+ *
+ * Creates a brand-new, independent inventory batch. This is an ADDITIVE
+ * operation only: it never updates, merges, or deletes any existing batch
+ * or movement row. Used both by product creation (opening stock) and by
+ * Edit Product's "Add Opening Inventory" action — every call, whenever it
+ * happens, produces one more standalone batch + movement, so a product can
+ * accumulate many opening-inventory lines (Batch A, Batch B, Batch C, ...)
+ * that all continue to contribute to current_stock and remain available
+ * to FIFO independently.
+ * ───────────────────────────────────────────────────────────────────────── */
 router.post('/:id/adjust', async (req, res, next) => {
+  const trx = await db.transaction()
   try {
     const { qty, batch_no, expiry, purchase_rate, reason } = req.body
-    if (!qty || isNaN(Number(qty)))
+    if (!qty || isNaN(Number(qty))) {
+      await trx.rollback()
       return res.status(400).json({ success: false, message: 'Quantity is required' })
+    }
 
-    const product = await db('products')
+    const product = await trx('products')
       .where({ id: req.params.id, company_id: req.companyId })
       .first()
-    if (!product) return res.status(404).json({ success: false, message: 'Product not found' })
+    if (!product) {
+      await trx.rollback()
+      return res.status(404).json({ success: false, message: 'Product not found' })
+    }
 
     const qtyNum  = Number(qty)
     const costNum = Number(purchase_rate) || Number(product.purchase_rate) || 0
+    const totalCost = Math.round(Math.abs(qtyNum) * costNum * 100) / 100
+    const receiptDate = new Date().toISOString().split('T')[0]
 
-    // FIX: was db('stock_batches').insert() with wrong columns
-    //   - removed: qty_in, qty_out, purchase_rate, date_ad (none exist in migration 002)
-    //   - added:   qty_received, qty_remaining, unit_cost, total_cost, receipt_date
-    await db(BATCHES_TABLE).insert({
+    // Always INSERT a new row — never .where(...).update(...) an existing
+    // batch. Each call (including repeated "Add Opening Inventory" entries
+    // for the same product from Edit Product) is its own batch with its
+    // own batch_no/expiry/unit_cost, left untouched by any later call.
+    const [batch] = await trx(BATCHES_TABLE).insert({
       company_id:   req.companyId,
       product_id:   req.params.id,
       batch_no:     batch_no || 'ADJ',
       expiry:       expiry   || null,
       expiry_date:  expiry   ? parseExpiryToDate(expiry) : null,
-      receipt_date: new Date().toISOString().split('T')[0],
+      receipt_date: receiptDate,
       qty_received: Math.abs(qtyNum),
       qty_remaining:Math.abs(qtyNum),   // real column name
       unit_cost:    costNum,
-      total_cost:   Math.round(Math.abs(qtyNum) * costNum * 100) / 100,
+      total_cost:   totalCost,
+    }).returning(['id'])
+
+    // Immutable ledger entry for this batch, so opening inventory has the
+    // same audit trail as purchase-created stock. Linked to the new batch
+    // only — existing movements for other batches are never touched.
+    await trx('inventory_movements').insert({
+      company_id:    req.companyId,
+      product_id:    req.params.id,
+      batch_id:      batch.id,
+      movement_type: 'IN',
+      qty:           Math.abs(qtyNum),
+      unit_cost:     costNum,
+      total_cost:    totalCost,
+      movement_date: receiptDate,
+      description:   reason || 'Stock adjustment',
     })
 
-    await auditLog(req.companyId, req.user.id, 'ADJUST_STOCK', 'products', req.params.id, { qty, reason }, req.ip)
+    await trx.commit()
+
+    await auditLog(req.companyId, req.user.id, 'ADJUST_STOCK', 'products', req.params.id, { qty, reason, batch_no }, req.ip)
     return successResponse(res, null, 'Stock adjusted')
+  } catch (err) {
+    await trx.rollback().catch(() => {})
+    next(err)
+  }
+})
+
+/* ── GET /products/:id/opening-batches ─────────────────────────────────────
+ *
+ * Returns every opening-inventory batch for this product, each as its own
+ * separate line — Batch A, Batch B, Batch C, etc. "Opening inventory"
+ * batches are the ones created via POST /:id/adjust above (opening stock
+ * on product creation or Edit Product's "Add Opening Inventory"), which are
+ * never tied to a purchase voucher, so they're identified by voucher_id
+ * IS NULL. Purely a read — never modifies any batch.
+ * ───────────────────────────────────────────────────────────────────────── */
+router.get('/:id/opening-batches', async (req, res, next) => {
+  try {
+    const product = await db('products')
+      .where({ id: req.params.id, company_id: req.companyId })
+      .first()
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' })
+
+    const batches = await db(BATCHES_TABLE)
+      .where({ product_id: req.params.id, company_id: req.companyId })
+      .whereNull('voucher_id')
+      .orderBy('created_at', 'asc')
+
+    return successResponse(res, batches.map(b => ({
+      id:            b.id,
+      batch_no:      b.batch_no,
+      expiry:        b.expiry,
+      expiry_date:   b.expiry_date,
+      receipt_date:  b.receipt_date,
+      qty_received:  Number(b.qty_received),
+      qty_remaining: Number(b[QTY_COL]),
+      unit_cost:     Number(b.unit_cost),
+      total_cost:    Number(b.total_cost),
+      created_at:    b.created_at,
+    })))
   } catch (err) { next(err) }
 })
 
