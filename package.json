@@ -17,6 +17,7 @@
     "setup": "npm run migrate && npm run seed",
     "setup:prod": "npm run migrate:prod && npm run seed:prod",
     "gen-certs": "bash scripts/gen-certs.sh",
+    "backfill:discount-accounts": "node scripts/backfill_discount_accounts.js --all",
     "check-env": "node -e \"require('./src/config/index.js'); console.log('✅ Config OK')\""
   },
   "dependencies": {
