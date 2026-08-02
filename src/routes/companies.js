@@ -12,11 +12,14 @@
  *   GET    /companies              list companies the current user can access
  *   POST   /companies              create a new company (adds current user as a member)
  *   PUT    /companies/:id          edit a company's own info (member-only)
+ *   DELETE /companies/:id          deactivate ("delete") a company (member-only, owner/admin, password-confirmed)
+ *   POST   /companies/:id/restore  reactivate a previously deleted company (member-only, owner/admin)
  *   POST   /companies/:id/switch   re-issue a token scoped to another company
  *   PUT    /companies/:id/default  mark a company as this user's default
  */
 const router = require('express').Router()
 const { v4: uuid } = require('uuid')
+const bcrypt = require('bcryptjs')
 const db = require('../db/knex')
 const { authenticate, requireRole } = require('../middleware/index')
 const { successResponse } = require('../middleware/helpers')
@@ -146,6 +149,134 @@ router.put('/:id', requireRole('admin', 'manager'), async (req, res, next) => {
 
     await auditLog(req.params.id, req.user.id, 'UPDATE', 'company', req.params.id, updates, req.ip)
     return successResponse(res, updated, 'Company updated')
+  } catch (err) { next(err) }
+})
+
+/* ── DELETE /companies/:id — "delete" a company ────────────────────────────
+ * Companies are never hard-deleted. Dozens of tables (vouchers, journal
+ * entries, ledger accounts, even users' own home company) reference
+ * company_id, and for an accounting system historical records must be
+ * retained regardless of whether a company is still "open" — this mirrors
+ * standard accounting-software practice (e.g. Tally/QuickBooks "delete
+ * company" is really an archive). "Delete" here means: is_active = false.
+ * The company and every record scoped to it are completely untouched —
+ * it's just hidden from active pickers and can't be switched into again
+ * until it's restored (see POST /companies/:id/restore, right below).
+ *
+ * Guards, in order:
+ *   - requester must be owner/admin (requireRole('owner') — 'owner' and
+ *     'admin' always pass that check; every other role is denied, unlike
+ *     PUT /:id above which also allows 'manager')
+ *   - requester must actually be a member of the target company
+ *   - can't delete the company that's active in THIS session's token —
+ *     switch to a different one first, so the client never ends up
+ *     holding a token for a company that just got deactivated
+ *   - always requires password confirmation, regardless of the
+ *     sensitiveActions settings toggle — deletion is destructive enough
+ *     from the user's point of view to always ask, even though it's
+ *     reversible. Uses the same `requiresPasswordConfirm` response shape
+ *     as requireSensitiveConfirm() so the existing useSensitiveConfirm()
+ *     frontend hook works here without any special-casing.
+ *   - can't delete a user's last remaining active company — they must
+ *     always have somewhere to land
+ *   - can't delete a company that has other members — a single member
+ *     deactivating it would silently lock everyone else out; remove them
+ *     first (existing member-management flow, unaffected by this change)
+ *
+ * If the deleted company was this user's default, another of their active
+ * companies is automatically promoted to default so they're never left
+ * without one. */
+router.delete('/:id', requireRole('owner'), async (req, res, next) => {
+  try {
+    const membership = await db('user_companies')
+      .where({ user_id: req.user.id, company_id: req.params.id })
+      .first()
+    if (!membership) throw new AppError('You do not have access to this company', 403)
+
+    if (req.params.id === req.companyId) {
+      throw new AppError('Switch to a different company before deleting this one', 400)
+    }
+
+    const company = await db('companies').where({ id: req.params.id }).first()
+    if (!company) throw new AppError('Company not found', 404)
+    if (company.is_active === false) throw new AppError('This company is already deleted', 400)
+
+    const { confirmPassword } = req.body || {}
+    if (!confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password confirmation is required to delete a company',
+        requiresPasswordConfirm: true,
+      })
+    }
+    const user = await db('users').where({ id: req.user.id }).first()
+    const passwordOk = user?.password_hash && await bcrypt.compare(confirmPassword, user.password_hash)
+    if (!passwordOk) {
+      return res.status(401).json({ success: false, message: 'Incorrect password', requiresPasswordConfirm: true })
+    }
+
+    const otherActiveMembership = await db('user_companies as uc')
+      .join('companies as c', 'c.id', 'uc.company_id')
+      .where('uc.user_id', req.user.id)
+      .andWhere('uc.company_id', '!=', req.params.id)
+      .andWhere('c.is_active', true)
+      .first()
+    if (!otherActiveMembership) {
+      throw new AppError('You must have at least one other active company. Create one before deleting this one.', 400)
+    }
+
+    const memberCount = await db('user_companies').where({ company_id: req.params.id }).count('id as c').first()
+    if (Number(memberCount.c) > 1) {
+      throw new AppError('This company has other members — remove them first, or contact an administrator.', 400)
+    }
+
+    await db.transaction(async (trx) => {
+      await trx('companies').where({ id: req.params.id }).update({ is_active: false, updated_at: new Date() })
+
+      if (membership.is_default) {
+        const nextDefault = await trx('user_companies as uc')
+          .join('companies as c', 'c.id', 'uc.company_id')
+          .where('uc.user_id', req.user.id)
+          .andWhere('uc.company_id', '!=', req.params.id)
+          .andWhere('c.is_active', true)
+          .select('uc.id')
+          .first()
+        if (nextDefault) {
+          await trx('user_companies').where({ id: nextDefault.id }).update({ is_default: true })
+        }
+      }
+    })
+
+    await auditLog(req.params.id, req.user.id, 'DELETE', 'company', req.params.id, { name: company.name }, req.ip)
+
+    return successResponse(res, { id: req.params.id }, 'Company deleted')
+  } catch (err) { next(err) }
+})
+
+/* ── POST /companies/:id/restore — undo a delete ───────────────────────────
+ * Reactivates a company that was previously soft-deleted above. Since
+ * nothing was ever destroyed, this simply flips is_active back on — every
+ * account, voucher, and journal entry the company had is exactly as it
+ * was. Not password-confirmed since it's non-destructive. */
+router.post('/:id/restore', requireRole('owner'), async (req, res, next) => {
+  try {
+    const membership = await db('user_companies')
+      .where({ user_id: req.user.id, company_id: req.params.id })
+      .first()
+    if (!membership) throw new AppError('You do not have access to this company', 403)
+
+    const existing = await db('companies').where({ id: req.params.id }).first()
+    if (!existing) throw new AppError('Company not found', 404)
+    if (existing.is_active !== false) throw new AppError('This company is not deleted', 400)
+
+    const [company] = await db('companies')
+      .where({ id: req.params.id })
+      .update({ is_active: true, updated_at: new Date() })
+      .returning('*')
+
+    await auditLog(req.params.id, req.user.id, 'RESTORE', 'company', req.params.id, { name: company.name }, req.ip)
+
+    return successResponse(res, company, 'Company restored')
   } catch (err) { next(err) }
 })
 
