@@ -134,6 +134,40 @@ async function nextItemCode(companyId) {
   return `MED-${String(last + 1).padStart(3, '0')}`
 }
 
+/* ── Auto-generated barcode ───────────────────────────────────────────────
+ *
+ * Used when a product is created without a manufacturer barcode typed in
+ * or scanned. Derives the code from the SAME sequence number as
+ * `item_code` (so it needs no separate counter/lookup and can never
+ * collide with another auto-generated barcode for this company), then
+ * encodes it as a full, valid EAN-13:
+ *
+ *   [ 2 0 ][ 10-digit zero-padded sequence ][ check digit ]
+ *
+ * The "20" prefix falls inside GS1's 200–299 "restricted circulation /
+ * internal use" range — numbers in that range are never issued to real
+ * products, so an auto-generated code here will never collide with a
+ * genuine manufacturer barcode scanned in later. Encoding a real EAN-13
+ * check digit (rather than a bare Code128 string) means the printed
+ * label also scans cleanly on EAN-13-only hardware, not just Code128
+ * readers — Code128 can still encode it as-is since it's plain digits.
+ */
+function ean13CheckDigit(digits12) {
+  let sum = 0
+  for (let i = 0; i < 12; i++) {
+    const d = Number(digits12[i])
+    sum += (i % 2 === 0) ? d : d * 3
+  }
+  const mod = sum % 10
+  return mod === 0 ? 0 : 10 - mod
+}
+
+function autoBarcode(itemCode) {
+  const seq  = parseInt(String(itemCode).split('-').pop(), 10) || 0
+  const body = '20' + String(seq).padStart(10, '0')
+  return body + String(ean13CheckDigit(body))
+}
+
 /* ── Audit logger — FIXED column names ──────────────────────────────────
  *
  * BEFORE (BROKEN):
@@ -175,4 +209,4 @@ function isValidUUID(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str)
 }
 
-module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, auditLog, clampExpiry }
+module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, autoBarcode, auditLog, clampExpiry }

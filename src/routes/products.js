@@ -20,7 +20,7 @@ const router = require('express').Router()
 const db     = require('../db/knex')
 const { authenticate }  = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
-const { nextItemCode, auditLog } = require('../utils/helpers')
+const { nextItemCode, autoBarcode, auditLog } = require('../utils/helpers')
 
 router.use(authenticate)
 
@@ -204,10 +204,14 @@ router.post('/', async (req, res, next) => {
     }
 
     const item_code = await nextItemCode(req.companyId)
+    // No barcode typed in or scanned? Auto-generate one from the same
+    // sequence number as item_code — see autoBarcode() for why this can
+    // never collide with a real manufacturer barcode.
+    const finalBarcode = cleanBarcode || autoBarcode(item_code)
     const [product] = await db('products').insert({
       company_id:   req.companyId,
       item_code,
-      barcode:      cleanBarcode,
+      barcode:      finalBarcode,
       name:         name.trim(),
       generic_name: generic_name?.trim() || null,
       company_name: company_name?.trim() || null,
