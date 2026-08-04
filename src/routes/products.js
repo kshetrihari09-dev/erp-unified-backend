@@ -20,7 +20,7 @@ const router = require('express').Router()
 const db     = require('../db/knex')
 const { authenticate }  = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
-const { nextItemCode, autoBarcode, auditLog } = require('../utils/helpers')
+const { nextItemCode, nextAutoBarcode, auditLog } = require('../utils/helpers')
 
 router.use(authenticate)
 
@@ -204,10 +204,14 @@ router.post('/', async (req, res, next) => {
     }
 
     const item_code = await nextItemCode(req.companyId)
-    // No barcode typed in or scanned? Auto-generate one from the same
-    // sequence number as item_code — see autoBarcode() for why this can
-    // never collide with a real manufacturer barcode.
-    const finalBarcode = cleanBarcode || autoBarcode(item_code)
+    // No barcode typed in or scanned? Auto-generate one from the global
+    // product_auto_barcode_seq (migration 021) — NOT from item_code's
+    // per-company counter. item_code repeats across companies (every
+    // company's first product is MED-001), so deriving the barcode from
+    // it let two companies generate the identical barcode. The global
+    // sequence guarantees this can never happen. See nextAutoBarcode()
+    // in utils/helpers.js.
+    const finalBarcode = cleanBarcode || await nextAutoBarcode()
     const [product] = await db('products').insert({
       company_id:   req.companyId,
       item_code,

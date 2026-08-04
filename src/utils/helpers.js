@@ -137,10 +137,7 @@ async function nextItemCode(companyId) {
 /* ── Auto-generated barcode ───────────────────────────────────────────────
  *
  * Used when a product is created without a manufacturer barcode typed in
- * or scanned. Derives the code from the SAME sequence number as
- * `item_code` (so it needs no separate counter/lookup and can never
- * collide with another auto-generated barcode for this company), then
- * encodes it as a full, valid EAN-13:
+ * or scanned. Encodes a full, valid EAN-13:
  *
  *   [ 2 0 ][ 10-digit zero-padded sequence ][ check digit ]
  *
@@ -151,6 +148,16 @@ async function nextItemCode(companyId) {
  * check digit (rather than a bare Code128 string) means the printed
  * label also scans cleanly on EAN-13-only hardware, not just Code128
  * readers — Code128 can still encode it as-is since it's plain digits.
+ *
+ * IMPORTANT — the sequence number is drawn from `product_auto_barcode_seq`,
+ * a single Postgres SEQUENCE shared by every company (migration 021), NOT
+ * from each company's own `item_code` counter. Two different companies'
+ * first products are both "MED-001" — deriving the barcode from that
+ * per-company number meant two companies could (and did) generate the
+ * exact same barcode, so scanning it anywhere without a company filter
+ * could return either company's product. A DB sequence never repeats a
+ * value, so this can no longer happen — see migration 021 for the fix and
+ * the backfill that repairs any barcodes that already collided.
  */
 function ean13CheckDigit(digits12) {
   let sum = 0
@@ -162,10 +169,22 @@ function ean13CheckDigit(digits12) {
   return mod === 0 ? 0 : 10 - mod
 }
 
-function autoBarcode(itemCode) {
-  const seq  = parseInt(String(itemCode).split('-').pop(), 10) || 0
+/** Pure encoder: sequence number → 13-digit auto-barcode string. */
+function buildAutoBarcode(seq) {
   const body = '20' + String(seq).padStart(10, '0')
   return body + String(ean13CheckDigit(body))
+}
+
+/** Pulls the next value from the global auto-barcode sequence and encodes
+ *  it. Accepts an optional transaction so callers that create the product
+ *  inside a `db.transaction()` can keep the sequence pull in the same
+ *  transaction (not required for correctness — sequence values never
+ *  repeat or roll back even if the surrounding transaction does — but
+ *  keeps things tidy under a single connection). */
+async function nextAutoBarcode(trx) {
+  const runner = trx || db
+  const { rows } = await runner.raw(`SELECT nextval('product_auto_barcode_seq') AS seq`)
+  return buildAutoBarcode(Number(rows[0].seq))
 }
 
 /* ── Audit logger — FIXED column names ──────────────────────────────────
@@ -209,4 +228,4 @@ function isValidUUID(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str)
 }
 
-module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, autoBarcode, auditLog, clampExpiry }
+module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, nextAutoBarcode, buildAutoBarcode, auditLog, clampExpiry }
