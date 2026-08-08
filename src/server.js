@@ -143,7 +143,7 @@ app.use((req, res, next) => {
     origin: true,           // reflect the matched origin back
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-Step-Up-Token'],
     exposedHeaders: ['X-Request-Id', 'RateLimit-Limit', 'RateLimit-Remaining'],
   })(req, res, next)
 })

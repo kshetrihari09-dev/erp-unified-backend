@@ -5,6 +5,7 @@ const jwt    = require('jsonwebtoken')
 const bcrypt = require('bcryptjs')
 const db     = require('../db/knex')
 const { withDefaults } = require('../utils/settingsDefaults')
+const { verifyStepUpToken } = require('../utils/stepUp')
 
 /* ── JWT Authentication ─────────────────────────────────────────────────── */
 async function authenticate(req, res, next) {
@@ -78,19 +79,52 @@ function requirePermission(permission) {
   }
 }
 
-/* ── Sensitive-action password re-confirmation ──────────────────────────────
- * Generalizes the existing "voucher edit" password re-check (see
- * POST /auth/verify-password + VoucherEditPasswordDialog.tsx) to any action
- * an admin has opted into requiring it for, via Settings → Users &
- * Permissions → "sensitive actions". Configured per-company in
- * companies.settings.sensitiveActions[actionKey].
+/* ── Sensitive-action step-up gate ──────────────────────────────────────────
+ * Generalizes the "voucher edit password re-check" pattern (see
+ * POST /auth/verify-password + VoucherEditPasswordDialog.tsx /
+ * useSensitiveConfirm.tsx) to any action.
  *
- *  - If the toggle is OFF (default), this is a no-op — existing callers of
- *    the route are completely unaffected.
- *  - If ON, the request must include `confirmPassword`, verified against
- *    the ACTING user's own password_hash. Nothing about the route's other
- *    behavior, response shape, or existing required fields changes.
+ * Two exports, sharing one internal check:
+ *
+ *  - requireSensitiveConfirm(actionKey) — OPT-IN per company via
+ *    companies.settings.sensitiveActions[actionKey] (Settings → Users &
+ *    Permissions). If the toggle is OFF (default), this is a no-op —
+ *    unchanged from before this feature existed.
+ *
+ *  - requireStepUp(actionKey) — ALWAYS enforced, no company toggle.
+ *    For actions that must never be optional (e.g. editing an already-
+ *    posted voucher) — closes the gap where a route only relied on the
+ *    FRONTEND having called /auth/verify-password first, with nothing
+ *    stopping a direct API call from skipping that step entirely.
+ *
+ * Both accept a request as verified if EITHER:
+ *   1. A valid `X-Step-Up-Token` header is present (signed by
+ *      POST /auth/verify-password or /auth/security-pin within the last
+ *      ~10 minutes, for this exact user+company) — the preferred path,
+ *      since it means the person doesn't get re-prompted for a PIN on
+ *      every single sensitive click within that window.
+ *   2. A legacy inline `confirmPassword` in the request body, checked
+ *      against the ACTING user's own password_hash — kept for backward
+ *      compatibility with any caller that hasn't adopted the step-up
+ *      token flow yet.
+ *
+ * Neither ever trusts anything else the client sends — the user/company
+ * being checked against always comes from `req.user`/`req.companyId`,
+ * which `authenticate` already derived from the verified session JWT.
  */
+async function stepUpSatisfied(req) {
+  const headerToken = req.headers['x-step-up-token']
+  if (headerToken && verifyStepUpToken(headerToken, { userId: req.user.id, companyId: req.companyId })) {
+    return 'ok'
+  }
+  const { confirmPassword } = req.body || {}
+  if (!confirmPassword) return 'no-credential'
+
+  const user = await db('users').where({ id: req.user.id }).first()
+  if (user?.password_hash && await bcrypt.compare(confirmPassword, user.password_hash)) return 'ok'
+  return 'wrong-credential'
+}
+
 function requireSensitiveConfirm(actionKey) {
   return async (req, res, next) => {
     try {
@@ -99,19 +133,25 @@ function requireSensitiveConfirm(actionKey) {
       const required = !!settings.sensitiveActions?.[actionKey]
       if (!required) return next()
 
-      const { confirmPassword } = req.body || {}
-      if (!confirmPassword) {
-        return res.status(400).json({ success: false, message: 'Password confirmation is required for this action', requiresPasswordConfirm: true })
-      }
-      const user = await db('users').where({ id: req.user.id }).first()
-      if (!user?.password_hash) {
-        return res.status(400).json({ success: false, message: 'No password is set on this account, so this action cannot be confirmed.' })
-      }
-      const valid = await bcrypt.compare(confirmPassword, user.password_hash)
-      if (!valid) {
+      const result = await stepUpSatisfied(req)
+      if (result === 'ok') return next()
+      if (result === 'wrong-credential') {
         return res.status(401).json({ success: false, message: 'Incorrect password', requiresPasswordConfirm: true })
       }
-      next()
+      return res.status(400).json({ success: false, message: 'Password confirmation is required for this action', requiresPasswordConfirm: true })
+    } catch (err) { next(err) }
+  }
+}
+
+function requireStepUp(actionKey) {
+  return async (req, res, next) => {
+    try {
+      const result = await stepUpSatisfied(req)
+      if (result === 'ok') return next()
+      if (result === 'wrong-credential') {
+        return res.status(401).json({ success: false, message: 'Incorrect password', requiresPasswordConfirm: true, action: actionKey })
+      }
+      return res.status(400).json({ success: false, message: 'Verification is required for this action', requiresPasswordConfirm: true, action: actionKey })
     } catch (err) { next(err) }
   }
 }
@@ -137,4 +177,4 @@ function errorHandler(err, req, res, next) {
   res.status(status).json({ success: false, message })
 }
 
-module.exports = { authenticate, requireRole, requirePermission, requireSensitiveConfirm, errorHandler, ok, paginated }
+module.exports = { authenticate, requireRole, requirePermission, requireSensitiveConfirm, requireStepUp, errorHandler, ok, paginated }

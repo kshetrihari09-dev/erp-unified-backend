@@ -10,7 +10,7 @@ const VoucherEditService = require('../services/voucherEditService')
 const ReportingEngine = require('../engines/reportingEngine')
 const { verifyJournalChain } = require('../utils/hashing')
 const AuditLogger     = require('../utils/auditLogger')
-const { authenticate, requireRole, requirePermission, requireSensitiveConfirm, ok, paginated } = require('../middleware/index')
+const { authenticate, requireRole, requirePermission, requireSensitiveConfirm, requireStepUp, ok, paginated } = require('../middleware/index')
 const { AppError } = require('../engines/postingEngine')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 
@@ -85,7 +85,7 @@ router.post('/vouchers/:id/cancel', async (req, res, next) => {
 // requires edit_posted_vouchers server-side so the check can never be
 // skipped by calling the API directly. Keeps the same voucher id/no,
 // recalculates the journal via the existing (unmodified) posting engine.
-router.put('/vouchers/:id/edit', requirePermission('edit_posted_vouchers'), async (req, res, next) => {
+router.put('/vouchers/:id/edit', requirePermission('edit_posted_vouchers'), requireStepUp('voucherEdit'), async (req, res, next) => {
   try {
     const { reason, voucher_date, party_id, narration, lines } = req.body
     const result = await VoucherEditService.edit({

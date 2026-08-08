@@ -27,6 +27,8 @@ const smsService      = require('../services/smsService')
 const whatsappService = require('../services/whatsappService')
 const emailService    = require('../services/emailService')
 const { resolveActiveCompanyId } = require('../services/companyContext')
+const { signStepUpToken, STEP_UP_TTL_SECONDS } = require('../utils/stepUp')
+const { verifyStepUpCredential } = require('../utils/pinAuth')
 
 const otpService = new OTPService(db)
 
@@ -603,38 +605,90 @@ router.get('/me', authenticate, async (req, res, next) => {
     const user    = await db('users').where({ id: req.user.id }).first()
     const company = await db('companies').where({ id: req.companyId }).first()
     if (!user) throw new AppError('User not found', 404)
-    const { password_hash: _, ...safeUser } = user
-    return res.json({ success: true, data: { user: safeUser, company } })
+    const { password_hash: _, pin_hash: __, pin_failed_attempts: ___, ...safeUser } = user
+    return res.json({ success: true, data: { user: { ...safeUser, hasPin: !!user.pin_hash }, company } })
   } catch (err) { next(err) }
 })
 
 /* ── POST /auth/verify-password ─────────────────────────────────────────────
- * Step-up re-authentication for sensitive in-place edits (e.g. changing
- * Payment Mode from the Sales List). Confirms the CURRENT session's user
- * knows their account password. Does not log the user in, issue new
- * tokens, or touch last_login_at — it's a yes/no check, nothing else. */
+ * Step-up re-authentication for sensitive actions (voucher edit, payment
+ * mode changes, invoice cancellation, etc — see middleware/index.js
+ * requireSensitiveConfirm / requireStepUp).
+ *
+ * Accepts EITHER `{ password }` (the existing behavior, unchanged for
+ * any caller that doesn't know about PINs yet) OR `{ pin }` (the new
+ * preferred 6-digit Security PIN). Confirms the CURRENT session's user
+ * knows one of their own credentials — does not log the user in, issue
+ * new session tokens, or touch last_login_at.
+ *
+ * On success, returns a short-lived `stepUpToken` (see utils/stepUp.js)
+ * the frontend can attach as `X-Step-Up-Token` on subsequent sensitive
+ * requests for the next ~10 minutes, instead of re-prompting for a
+ * credential on every single one — see requirement: no permanent
+ * "verified" flag, but also no re-asking every request.
+ *
+ * Per-account lockout after repeated failures is handled by
+ * verifyStepUpCredential() (utils/pinAuth.js) — shared with
+ * /auth/security-pin so there's exactly one lockout implementation.
+ */
 router.post('/verify-password', authenticate, async (req, res, next) => {
   try {
-    const { password } = req.body
-    if (!password) throw new AppError('Password is required', 400)
+    const { password, pin } = req.body || {}
+    if (!password && !pin) throw new AppError('Password or PIN is required', 400)
 
-    const user = await db('users').where({ id: req.user.id }).first()
-    if (!user) throw new AppError('User not found', 404)
-
-    if (!user.password_hash) {
-      return res.status(400).json({
-        success: false,
-        message: 'No password is set on this account, so this action cannot be confirmed. Ask an admin to set one via Settings.',
-      })
+    const result = await verifyStepUpCredential({
+      userId: req.user.id, companyId: req.companyId, pin, password, ip: req.ip,
+    })
+    if (!result.ok) {
+      return res.status(result.status).json({ success: false, message: result.message, needsPinSetup: result.needsPinSetup })
     }
 
-    const valid = await bcrypt.compare(password, user.password_hash)
-    if (!valid) {
+    const stepUpToken = signStepUpToken({ userId: req.user.id, companyId: req.companyId })
+    return res.json({
+      success: true,
+      message: 'Verified',
+      data: { stepUpToken, expiresIn: STEP_UP_TTL_SECONDS },
+    })
+  } catch (err) { next(err) }
+})
+
+/* ── POST /auth/security-pin ──────────────────────────────────────────────
+ * Sets or changes the acting user's 6-digit Security PIN, used for
+ * step-up verification instead of re-typing the full account password.
+ *
+ * Always requires the CURRENT account password first (even when setting
+ * a PIN for the very first time) — never the PIN itself, since a user
+ * setting their first PIN by definition doesn't have one yet, and a
+ * user CHANGING an existing PIN shouldn't be able to do so with only
+ * something that may have been shoulder-surfed. This mirrors how
+ * changing a password already requires the current one
+ * (PUT /auth/change-password below).
+ */
+router.post('/security-pin', authenticate, async (req, res, next) => {
+  try {
+    const { pin, current_password } = req.body || {}
+    if (!current_password) throw new AppError('Your current account password is required to set a Security PIN', 400)
+    if (!/^\d{6}$/.test(String(pin || ''))) throw new AppError('PIN must be exactly 6 digits', 400)
+
+    const user = await db('users').where({ id: req.user.id }).first()
+    if (!user?.password_hash) throw new AppError('No password is set on this account.', 400)
+    const validPassword = await bcrypt.compare(current_password, user.password_hash)
+    if (!validPassword) {
+      await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: 'PIN_SETUP_FAILED', entityType: 'auth', entityId: req.user.id, ipAddress: req.ip })
       return res.status(401).json({ success: false, message: 'Incorrect password' })
     }
 
-    await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: 'VERIFY_PASSWORD', entityType: 'auth', entityId: req.user.id, ipAddress: req.ip })
-    return res.json({ success: true, message: 'Password verified' })
+    const pin_hash = await bcrypt.hash(String(pin), 12)
+    await db('users').where({ id: req.user.id }).update({
+      pin_hash, pin_set_at: new Date(), pin_failed_attempts: 0, pin_locked_until: null,
+    })
+    await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: user.pin_hash ? 'PIN_CHANGED' : 'PIN_CREATED', entityType: 'auth', entityId: req.user.id, ipAddress: req.ip })
+
+    // Setting/changing the PIN counts as having just step-up-verified —
+    // issue a token immediately so the user isn't asked to re-verify a
+    // second time right after proving their password moments ago.
+    const stepUpToken = signStepUpToken({ userId: req.user.id, companyId: req.companyId })
+    return res.json({ success: true, message: 'Security PIN saved', data: { stepUpToken, expiresIn: STEP_UP_TTL_SECONDS } })
   } catch (err) { next(err) }
 })
 
