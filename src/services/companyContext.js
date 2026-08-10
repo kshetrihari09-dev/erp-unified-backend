@@ -39,26 +39,7 @@ async function resolveActiveCompanyId(user) {
     .first()
   if (any) return any.company_id
 
-  // No membership rows at all for this user (should only happen for an
-  // account created outside the normal signup/registration path, or one
-  // whose membership row was lost some other way). Falling back to the
-  // legacy `users.company_id` column alone is NOT enough — every route
-  // is guarded by `authenticate`, which re-checks `user_companies` on
-  // every request, so a token minted for a company with no membership
-  // row would pass login and then 403 on the very next request. Self-heal
-  // by creating the missing membership so the session that's about to be
-  // issued is actually usable.
-  if (user.company_id) {
-    const company = await db('companies').where({ id: user.company_id }).first('id')
-    if (company) {
-      await db('user_companies')
-        .insert({ user_id: user.id, company_id: user.company_id, is_default: true })
-        .onConflict(['user_id', 'company_id']).ignore()
-      return user.company_id
-    }
-  }
-
-  return null
+  return user.company_id
 }
 
 /**

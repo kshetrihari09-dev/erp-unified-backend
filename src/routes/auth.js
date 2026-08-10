@@ -234,7 +234,6 @@ router.post('/verify-otp', async (req, res, next) => {
       if (!user || !user.is_active) throw new AppError('Account not found or disabled', 401)
 
       const companyId = await resolveActiveCompanyId(user)
-      if (!companyId) throw new AppError('This account has no company associated with it. Please contact support.', 403)
       await db('users').where({ id: user.id }).update({ last_login_at: new Date(), last_active_company_id: companyId })
       const company = await db('companies').where({ id: companyId }).first()
       const token   = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
@@ -586,7 +585,6 @@ router.post('/login', async (req, res, next) => {
     }
     if (!user.is_active) throw new AppError('Account is disabled', 403)
     const companyId = await resolveActiveCompanyId(user)
-    if (!companyId) throw new AppError('This account has no company associated with it. Please contact support.', 403)
     await db('users').where({ id: user.id }).update({ last_login_at: new Date(), last_active_company_id: companyId })
     const company     = await db('companies').where({ id: companyId }).first()
     const token       = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
@@ -706,7 +704,6 @@ router.post('/refresh', async (req, res, next) => {
     // company switch across a silent token refresh) rather than resetting
     // back to their default company on every refresh.
     const companyId = await resolveActiveCompanyId(user)
-    if (!companyId) throw new AppError('This account has no company associated with it. Please contact support.', 403)
     const token = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
     return res.json({ success: true, data: { token } })
   } catch (err) {
