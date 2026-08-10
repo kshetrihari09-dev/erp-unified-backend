@@ -125,6 +125,19 @@ router.get('/categories', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+/* ── GET /products/next-barcode ───────────────────────────────────────────── *
+ * Lets the Create Product form pre-fill the barcode field as soon as it
+ * opens, instead of only finding out the generated value after submit.
+ * Just calls the existing nextAutoBarcode() helper — no separate
+ * barcode-generation logic. Registered above /:id so Express doesn't treat
+ * "next-barcode" as an :id param. */
+router.get('/next-barcode', async (req, res, next) => {
+  try {
+    const barcode = await nextAutoBarcode()
+    return successResponse(res, { barcode })
+  } catch (err) { next(err) }
+})
+
 /* ── GET /products/:id ────────────────────────────────────────────────────── */
 router.get('/:id', async (req, res, next) => {
   try {
