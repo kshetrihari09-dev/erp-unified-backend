@@ -27,7 +27,7 @@
  *   DELETE /scanner/session/:token     — desktop cancels session (auth required)
  *
  *   GET  /scanner/products/barcode/:code — barcode lookup (auth required)
- *   GET  /scanner/products/fuzzy?q=...   — contains search for OCR (auth required)
+ *   GET  /scanner/products/fuzzy?q=...   — contains search, barcode-miss fallback (auth required)
  *
  * Mount in server.js:
  *   const scannerRouter = require('./scanner/scannerRoutes')
@@ -100,7 +100,7 @@ function validateProductResult(data) {
   if (!data || typeof data !== 'object')          return 'Missing data'
   if (!data.productId || typeof data.productId !== 'string')     return 'Missing productId'
   if (!data.productName || typeof data.productName !== 'string') return 'Missing productName'
-  if (!['barcode', 'ocr', 'manual'].includes(data.scanMethod))  return 'Invalid scanMethod'
+  if (!['barcode', 'manual'].includes(data.scanMethod))  return 'Invalid scanMethod'
   return null   // null = valid
 }
 
@@ -193,7 +193,7 @@ router.post('/session/:token/result', async (req, res, next) => {
     const err = validateProductResult(req.body)
     if (err) return res.status(400).json({ success: false, message: err })
 
-    const { productId, productName, scanMethod, barcode, ocrText } = req.body
+    const { productId, productName, scanMethod, barcode } = req.body
 
     // Verify productId belongs to this company
     const product = await fetchProductWithStock(productId, session.companyId)
@@ -205,7 +205,6 @@ router.post('/session/:token/result', async (req, res, next) => {
       product,
       scanMethod: scanMethod || 'manual',
       barcode:    barcode  || null,
-      ocrText:    ocrText  || null,
       scannedAt:  Date.now(),
     }
     session.status = 'done'
@@ -380,7 +379,7 @@ router.get('/products/barcode/:code', authenticate, async (req, res, next) => {
 })
 
 /* ── GET /scanner/products/fuzzy?q=paracetamol&limit=10 ─────────────────────
- * Substring / contains search — for OCR fallback (searches name + generic_name).
+ * Substring / contains search — barcode-miss fallback (searches name + generic_name).
  * Auth required (JWT forwarded from session).
  * ─────────────────────────────────────────────────────────────────────────── */
 router.get('/products/fuzzy', authenticate, async (req, res, next) => {
