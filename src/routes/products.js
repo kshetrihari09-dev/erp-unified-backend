@@ -34,12 +34,19 @@ const QTY_COL       = 'qty_remaining'    // the real column in migration 002
 router.get('/', async (req, res, next) => {
   try {
     const { page, limit, offset } = parsePagination(req.query)
-    const { search, category, is_active } = req.query
+    const { search, category, is_active, updated_since } = req.query
 
     let q = db('products').where({ company_id: req.companyId })
     if (search)               q = q.where(b => b.whereILike('name', `%${search}%`).orWhereILike('item_code', `%${search}%`).orWhereILike('barcode', `%${search}%`).orWhereILike('generic_name', `%${search}%`).orWhereILike('company_name', `%${search}%`))
     if (category)             q = q.where({ category })
     if (is_active !== undefined) q = q.where({ is_active: is_active === 'true' })
+    // Incremental catalog sync (see erp-enterprise-full/src/offline/catalogSync.ts):
+    // after an initial full pull, the offline product cache only needs
+    // rows that changed since its last successful sync, not the whole
+    // catalog again every time. Purely additive — omitted, behaves
+    // exactly as before. `updated_at` already exists on every row via
+    // knex's `t.timestamps(true, true)` (migration 002).
+    if (updated_since)        q = q.where('updated_at', '>', updated_since)
 
     const [{ count }] = await q.clone().count('id as count')
     const data = await q.orderBy('name').limit(limit).offset(offset)

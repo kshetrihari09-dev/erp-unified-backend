@@ -124,8 +124,41 @@ router.get('/:id', async (req, res, next) => {
 router.post('/', async (req, res, next) => {
   const trx = await db.transaction()
   try {
-    const { party_id, date_ad, payment_mode, reference_no, items, notes, cc_charge_pct } = req.body
+    const { party_id, date_ad, payment_mode, reference_no, items, notes, cc_charge_pct, client_txn_id } = req.body
     if (!items?.length) { await trx.rollback(); return res.status(400).json({ success: false, message: 'At least one item is required' }) }
+
+    // ── Offline-sync idempotency replay (see migration 024) ────────────────
+    // `client_txn_id` is only ever sent by the frontend's offline sync
+    // engine (src/offline/syncEngine.ts) replaying a sale that was queued
+    // in IndexedDB while the browser had no connection — see
+    // src/offline/db.ts for where that id is generated (once, at the
+    // moment the sale was queued, before any server invoice number
+    // exists). A normal online sale from the Sale page never sends this
+    // field at all, so this block is a no-op for every non-offline sale,
+    // exactly as before this migration.
+    //
+    // The sync engine can legitimately retry the SAME queued sale more
+    // than once — e.g. the POST succeeds on the server but the response
+    // never reaches the browser (connection drops, tab closes mid-
+    // request), so the queue still shows it "pending" and retries it. If
+    // that retry reached the code below unchecked, it would deduct stock
+    // and post a voucher a second time for what is really one sale. So
+    // before doing ANY work, check whether a sale with this exact
+    // (company_id, client_txn_id) already exists — if it does, this is a
+    // replay of an already-processed transaction: return that ORIGINAL
+    // sale's data (same response shape as a fresh create, so the sync
+    // engine's success handling doesn't need to know the difference)
+    // instead of creating a second one.
+    if (client_txn_id) {
+      const existing = await trx('sales')
+        .where({ company_id: req.companyId, client_txn_id })
+        .first()
+      if (existing) {
+        const existingItems = await trx('sale_items').where({ sale_id: existing.id })
+        await trx.commit()
+        return successResponse(res, { ...existing, items: existingItems, replayed: true }, 'Invoice already synced', 200)
+      }
+    }
 
     // ── Date sequence validation ──────────────────────────────────────────────
     // New invoice date must be >= latest active sales invoice date for this company.
@@ -197,6 +230,7 @@ router.post('/', async (req, res, next) => {
       invoice_no, date_ad: date, date_bs, payment_mode: payment_mode || 'cash',
       reference_no: reference_no || null, subtotal, cc_amount: cc_total,
       net_total, round_off, paid_amount, due_amount, status: 'active', notes: notes || null,
+      client_txn_id: client_txn_id || null,
     }).returning('*')
 
     for (const item of saleItems) {
@@ -299,7 +333,31 @@ router.post('/', async (req, res, next) => {
         ? { voucher_no: accountingResult.voucher?.voucher_no, journal_entry_id: accountingResult.journal_entry?.id }
         : { status: 'pending_coa', note: accountingResult?.accountingError || 'Chart of Accounts not configured' },
     }, 'Invoice created', 201)
-  } catch (err) { await trx.rollback(); next(err) }
+  } catch (err) {
+    await trx.rollback()
+    // ── Concurrent-replay race guard (see the client_txn_id check above) ──
+    // The SELECT-then-INSERT check above has a TOCTOU gap: two nearly-
+    // simultaneous requests for the same offline-queued sale (e.g. a sync
+    // retry fired before the first attempt's response came back) can both
+    // pass the "does it exist yet?" check before either has committed its
+    // INSERT. The unique index from migration 024 is what actually
+    // prevents a duplicate sale in that case — Postgres rejects the
+    // second INSERT with a 23505 (unique_violation) on
+    // sales_company_client_txn_id_unique. Recognize that specific error
+    // and resolve it the same way the earlier check does (return the
+    // now-existing original sale) instead of surfacing it to the sync
+    // engine as a failure it would otherwise retry forever.
+    if (err?.code === '23505' && err?.constraint === 'sales_company_client_txn_id_unique' && req.body?.client_txn_id) {
+      try {
+        const existing = await db('sales').where({ company_id: req.companyId, client_txn_id: req.body.client_txn_id }).first()
+        if (existing) {
+          const existingItems = await db('sale_items').where({ sale_id: existing.id })
+          return successResponse(res, { ...existing, items: existingItems, replayed: true }, 'Invoice already synced', 200)
+        }
+      } catch (lookupErr) { return next(lookupErr) }
+    }
+    next(err)
+  }
 })
 
 /* ── PUT /sales/:id/cancel ─────────────────────────────────────────────────── */
