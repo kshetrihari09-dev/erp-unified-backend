@@ -24,9 +24,8 @@ async function fetchProductWithStock(productId, companyId) {
     .where({ id: productId, company_id: companyId, is_active: true })
     .first(
       'id', 'item_code', 'barcode', 'name', 'generic_name', 'company_name',
-      'unit', 'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active',
-      db.raw('tax_rate   as vat_percent'),
-      db.raw('cc_percent as cc_pct')
+      'unit', 'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active', 'cc_pct',
+      db.raw('tax_rate   as vat_percent')
     )
   if (!p) return null
 
@@ -81,8 +80,8 @@ router.get('/products/barcode/:code', authenticate, async (req, res, next) => {
     if (!raw) return res.status(400).json({ success: false, message: 'Barcode required' })
 
     const cols = ['id', 'item_code', 'barcode', 'name', 'generic_name', 'company_name', 'unit',
-             'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active',
-             db.raw('tax_rate as vat_percent'), db.raw('cc_percent as cc_pct')]
+             'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active', 'cc_pct',
+             db.raw('tax_rate as vat_percent')]
 
     // ── Legacy structured QR payload (labels printed before this
     //    contract) — checked first only because it's the more specific
@@ -213,8 +212,8 @@ router.get('/products/fuzzy', authenticate, async (req, res, next) => {
       `, [`${raw}%`, `${raw}%`])
       .limit(limit)
       .select('id', 'item_code', 'barcode', 'name', 'generic_name', 'company_name', 'unit',
-              'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active',
-              db.raw('tax_rate as vat_percent'), db.raw('cc_percent as cc_pct'))
+              'sales_rate', 'mrp', 'purchase_rate', 'min_stock', 'is_active', 'cc_pct',
+              db.raw('tax_rate as vat_percent'))
 
     res.json({ success: true, data: rows })
   } catch (err) { next(err) }

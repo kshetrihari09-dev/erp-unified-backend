@@ -34,19 +34,12 @@ const QTY_COL       = 'qty_remaining'    // the real column in migration 002
 router.get('/', async (req, res, next) => {
   try {
     const { page, limit, offset } = parsePagination(req.query)
-    const { search, category, is_active, updated_since } = req.query
+    const { search, category, is_active } = req.query
 
     let q = db('products').where({ company_id: req.companyId })
     if (search)               q = q.where(b => b.whereILike('name', `%${search}%`).orWhereILike('item_code', `%${search}%`).orWhereILike('barcode', `%${search}%`).orWhereILike('generic_name', `%${search}%`).orWhereILike('company_name', `%${search}%`))
     if (category)             q = q.where({ category })
     if (is_active !== undefined) q = q.where({ is_active: is_active === 'true' })
-    // Incremental catalog sync (see erp-enterprise-full/src/offline/catalogSync.ts):
-    // after an initial full pull, the offline product cache only needs
-    // rows that changed since its last successful sync, not the whole
-    // catalog again every time. Purely additive — omitted, behaves
-    // exactly as before. `updated_at` already exists on every row via
-    // knex's `t.timestamps(true, true)` (migration 002).
-    if (updated_since)        q = q.where('updated_at', '>', updated_since)
 
     const [{ count }] = await q.clone().count('id as count')
     const data = await q.orderBy('name').limit(limit).offset(offset)
@@ -111,10 +104,9 @@ router.get('/search', async (req, res, next) => {
       .select(
         'id', 'item_code', 'barcode', 'name', 'generic_name',
         'company_name', 'unit', 'sales_rate', 'mrp',
-        'purchase_rate', 'min_stock', 'is_active',
+        'purchase_rate', 'min_stock', 'is_active', 'cc_pct',
         // alias the DB column name to the field name the frontend expects
-        db.raw('tax_rate   as vat_percent'),
-        db.raw('cc_percent as cc_pct')
+        db.raw('tax_rate   as vat_percent')
       )
 
     return res.json({ success: true, data: rows })
@@ -199,7 +191,7 @@ router.post('/', async (req, res, next) => {
   try {
     const {
       name, generic_name, company_name, category, unit, barcode,
-      purchase_rate, sales_rate, mrp, cc_percent, min_stock,
+      purchase_rate, sales_rate, mrp, cc_pct, min_stock,
       tax_rate, vat_percent,
     } = req.body
 
@@ -262,7 +254,7 @@ router.post('/', async (req, res, next) => {
       purchase_rate:Number(purchase_rate) || 0,
       sales_rate:   Number(sales_rate),
       mrp:          Number(mrp) || 0,
-      cc_percent:   Math.min(100, Math.max(0, Number(cc_percent) || 0)),
+      cc_pct:       Math.min(100, Math.max(0, Number(cc_pct) || 0)),
       tax_rate:     Math.min(100, Math.max(0, Number(taxRateValue) || 0)),
       min_stock:    Number(min_stock) || 50,
       is_active:    true,
@@ -288,7 +280,7 @@ router.put('/:id', async (req, res, next) => {
 
     const allowed = [
       'name', 'generic_name', 'company_name', 'category', 'unit', 'barcode',
-      'purchase_rate', 'sales_rate', 'mrp', 'cc_percent', 'tax_rate', 'min_stock', 'is_active',
+      'purchase_rate', 'sales_rate', 'mrp', 'cc_pct', 'tax_rate', 'min_stock', 'is_active',
     ]
     // `vat_percent` is the field name both the Quick Add and Product Add
     // forms send — alias it onto the real `tax_rate` column before the
@@ -301,7 +293,7 @@ router.put('/:id', async (req, res, next) => {
       if (body[k] !== undefined) {
         if (['purchase_rate', 'sales_rate', 'mrp', 'min_stock'].includes(k))
           updates[k] = Number(body[k])
-        else if (k === 'cc_percent' || k === 'tax_rate')
+        else if (k === 'cc_pct' || k === 'tax_rate')
           updates[k] = Math.min(100, Math.max(0, Number(body[k]) || 0))
         else if (k === 'barcode')
           updates[k] = body[k]?.toString().trim() || null
