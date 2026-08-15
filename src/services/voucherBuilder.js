@@ -115,15 +115,37 @@ async function buildSaleVoucher({ sale, items, trx, companyId, userId }) {
   const netTotal  = Number(sale.net_total)  || 0
   const salesNet  = netTotal - vatAmount
 
+  // Aggregate line-level discount, same formula used everywhere else
+  // (print, sale_items.amount calc): sum(qty × rate × discount_pct / 100),
+  // rounded to 2dp. `items` here is saleItems — already carries discount_pct
+  // per line — so this is derived fresh from the transaction being posted,
+  // never from a stored/derived total.
+  const discountAmt = Math.round(
+    (items || []).reduce((sum, it) => {
+      const qty = Number(it.qty) || 0
+      const rate = Number(it.rate) || 0
+      const pct  = Number(it.discount_pct) || 0
+      return sum + (qty * rate * pct) / 100
+    }, 0) * 100
+  ) / 100
+
   // Resolve accounts
   const debitAccount  = isCredit
     ? await resolveAccount(trx, companyId, 'accounts_receivable')
     : await resolvePaymentAccount(trx, companyId, sale.payment_mode)
   const revenueAccount = await resolveAccount(trx, companyId, 'sales_revenue')
+  // Only resolved when there's actually a discount to post — a company
+  // that has removed/never configured the discount_given role shouldn't
+  // fail to post ordinary no-discount sales (mirrors the vatAccount
+  // pattern below, resolved only when vatAmount > 0).
+  const discountAccount = discountAmt > 0
+    ? await resolveAccount(trx, companyId, 'discount_given')
+    : null
 
   const lines = []
 
-  // DR line: Cash/Bank or Receivable
+  // DR line: Cash/Bank or Receivable — unchanged; this is the actual
+  // money movement and must stay exactly what net_total already is.
   lines.push({
     account_id:  debitAccount.id,
     party_id:    sale.party_id || null,
@@ -132,12 +154,29 @@ async function buildSaleVoucher({ sale, items, trx, companyId, userId }) {
     description: `${isCredit ? 'Credit Sale' : 'Cash Sale'} — ${sale.invoice_no}`,
   })
 
-  // CR line: Sales Revenue
+  // DR line: Discount Allowed (expense) — only when a discount was
+  // actually given. Grossing this up against Sales Revenue below keeps
+  // the voucher balanced without touching the Cash/AR or VAT lines.
+  if (discountAccount && discountAmt > 0) {
+    lines.push({
+      account_id:  discountAccount.id,
+      party_id:    sale.party_id || null,
+      debit:       discountAmt,
+      credit:      0,
+      description: `Discount Allowed — ${sale.invoice_no}`,
+    })
+  }
+
+  // CR line: Sales Revenue — recognized gross of discount so the entry
+  // balances once the Discount Allowed line above is added. With no
+  // discount (discountAmt === 0) this is identical to the original
+  // salesNet/netTotal figure — no behavior change for non-discounted sales.
+  const grossSalesRevenue = (salesNet > 0 ? salesNet : netTotal) + discountAmt
   lines.push({
     account_id:  revenueAccount.id,
     party_id:    null,
     debit:       0,
-    credit:      salesNet > 0 ? salesNet : netTotal,
+    credit:      grossSalesRevenue,
     description: `Sales Revenue — ${sale.invoice_no}`,
   })
 

@@ -156,6 +156,7 @@ const ACCOUNTS = [
   { id: 'acc-tin', company_id: CID, code: '1400', name: 'Input VAT',           type: 'asset',     sub_type: 'tax_input',           is_group: false, is_active: true },
   { id: 'acc-grp', company_id: CID, code: '1000G', name: 'Current Assets',    type: 'asset',     sub_type: null,                  is_group: true,  is_active: true },
   { id: 'acc-old', company_id: CID, code: '9000',  name: 'Old Account',       type: 'expense',   sub_type: null,                  is_group: false, is_active: false },
+  { id: 'acc-disc', company_id: CID, code: '5104', name: 'Discount Allowed',  type: 'expense',   sub_type: 'discount_expense',    is_group: false, is_active: true },
 ]
 
 function baseState() {
@@ -347,6 +348,31 @@ describe('VoucherBuilder', () => {
     const taxLine = p.lines.find(l => l.account_id === 'acc-tax')
     expect(taxLine).toBeDefined()
     expect(taxLine.credit).toBe(130)
+    expect(isBalanced(p.lines)).toBe(true)
+  })
+
+  test('buildSaleVoucher: discount > 0 adds DR Discount Allowed, Revenue grossed up, stays balanced', async () => {
+    setup()
+    const sale = { id: 's4', invoice_no: 'I4', payment_mode: 'cash', net_total: 950, vat_amount: 0, party_id: null }
+    const items = [{ qty: 10, rate: 100, discount_pct: 5 }]  // 10*100*5/100 = 50 discount
+    const p = await VoucherBuilder.buildSaleVoucher({ sale, items, trx: mockCurrentTrx, companyId: CID, userId: UID })
+
+    const discLine = p.lines.find(l => l.account_id === 'acc-disc')
+    expect(discLine).toBeDefined()
+    expect(discLine.debit).toBe(50)
+    const revLine = p.lines.find(l => l.account_id === 'acc-rev')
+    expect(revLine.credit).toBe(1000)  // netTotal(950) + discount(50), grossed up
+    expect(isBalanced(p.lines)).toBe(true)
+  })
+
+  test('buildSaleVoucher: no discount does NOT add a Discount Allowed line', async () => {
+    setup()
+    const sale = { id: 's5', invoice_no: 'I5', payment_mode: 'cash', net_total: 1000, vat_amount: 0, party_id: null }
+    const items = [{ qty: 10, rate: 100, discount_pct: 0 }]
+    const p = await VoucherBuilder.buildSaleVoucher({ sale, items, trx: mockCurrentTrx, companyId: CID, userId: UID })
+
+    expect(p.lines.find(l => l.account_id === 'acc-disc')).toBeUndefined()
+    expect(p.lines).toHaveLength(2)
     expect(isBalanced(p.lines)).toBe(true)
   })
 
