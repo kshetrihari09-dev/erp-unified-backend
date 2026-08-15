@@ -63,6 +63,11 @@ const scannerRouter    = require('./scanner/scannerRoutes')
 const cloudStorageRouter       = require('./routes/cloudStorage')
 const cloudStorageOAuthRouter  = require('./routes/cloudStorage').publicRouter
 
+// New: LAN/cloud device sync — device registration, QR pairing, heartbeat,
+// conflict review (additive only — does not touch any existing route).
+const devicesRouter       = require('./routes/devices')
+const devicesPairingRouter = require('./routes/devices').publicRouter
+
 
 const { errorHandler } = require('./middleware/index')
 const db = require('./db/knex')
@@ -220,6 +225,13 @@ app.use(`${API}/scanner`,    scannerLimiter, scannerRouter)
 // everything else requires authentication like the rest of the API.
 app.use(`${API}/cloud-storage/oauth`, cloudStorageOAuthRouter)
 app.use(`${API}/cloud-storage`,       cloudStorageRouter)
+
+// Device sync — pairing claim is public (a brand-new device has no JWT
+// yet, matching the cloud-storage OAuth callback pattern above);
+// everything else (register/list/heartbeat/revoke/conflicts) requires
+// authentication like the rest of the API.
+app.use(`${API}/devices/pair`, devicesPairingRouter)
+app.use(`${API}/devices`,      devicesRouter)
 
 // Date utilities (UNCHANGED)
 app.get(`${API}/date/today`, (req, res) => {

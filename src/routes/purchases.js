@@ -18,12 +18,13 @@
  */
 const router = require('express').Router()
 const db     = require('../db/knex')
-const { authenticate, requireSensitiveConfirm }  = require('../middleware/index')
+const { authenticate, identifyDevice, requireSensitiveConfirm }  = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
-const { nextBillNo, adToBS, todayBS, auditLog, clampExpiry } = require('../utils/helpers')
+const { nextBillNo, adToBS, todayBS, auditLog, clampExpiry, isValidUUID } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
 
 router.use(authenticate)
+router.use(identifyDevice)
 
 const T   = 'inventory_batches'
 const QTY = 'qty_remaining'
@@ -68,8 +69,23 @@ router.get('/:id', async (req, res, next) => {
 router.post('/', async (req, res, next) => {
   const trx = await db.transaction()
   try {
-    const { party_id, date_ad, payment_mode, supplier_bill_no, items, notes } = req.body
+    const { party_id, date_ad, payment_mode, supplier_bill_no, items, notes, client_txn_id } = req.body
     if (!items?.length) { await trx.rollback(); return res.status(400).json({ success: false, message: 'At least one item required' }) }
+
+    // ── Idempotency (offline sync retries) — see sales.js POST / for the
+    // full rationale; same pattern, same migration 025 partial unique index.
+    if (client_txn_id) {
+      if (!isValidUUID(client_txn_id)) {
+        await trx.rollback()
+        return res.status(400).json({ success: false, message: 'client_txn_id must be a UUID' })
+      }
+      const existingPurchase = await trx('purchases').where({ company_id: req.companyId, client_txn_id }).first()
+      if (existingPurchase) {
+        await trx.rollback()
+        const existingItems = await db('purchase_items').where({ purchase_id: existingPurchase.id })
+        return successResponse(res, { ...existingPurchase, items: existingItems }, 'Bill already recorded (idempotent replay)', 200)
+      }
+    }
 
     const bill_no = await nextBillNo(req.companyId)
     const date    = date_ad || new Date().toISOString().split('T')[0]
@@ -121,6 +137,7 @@ router.post('/', async (req, res, next) => {
       bill_no, supplier_bill_no: supplier_bill_no || null, date_ad: date, date_bs,
       payment_mode: payment_mode || 'credit', net_total, round_off, paid_amount, due_amount,
       notes: notes || null, status: 'active',
+      client_txn_id: client_txn_id || null, device_id: req.deviceId || null,
     }).returning('*')
 
     for (const item of purchaseItems) {
@@ -185,7 +202,17 @@ router.post('/', async (req, res, next) => {
         ? { voucher_no: accountingResult.voucher?.voucher_no, journal_entry_id: accountingResult.journal_entry?.id }
         : { status: 'pending_coa', note: accountingResult?.accountingError || 'Chart of Accounts not configured' },
     }, 'Purchase created', 201)
-  } catch (err) { await trx.rollback(); next(err) }
+  } catch (err) {
+    await trx.rollback()
+    if (err.code === '23505' && err.constraint === 'purchases_company_client_txn_id_unique' && req.body.client_txn_id) {
+      const existingPurchase = await db('purchases').where({ company_id: req.companyId, client_txn_id: req.body.client_txn_id }).first()
+      if (existingPurchase) {
+        const existingItems = await db('purchase_items').where({ purchase_id: existingPurchase.id })
+        return successResponse(res, { ...existingPurchase, items: existingItems }, 'Bill already recorded (idempotent replay)', 200)
+      }
+    }
+    next(err)
+  }
 })
 
 /* ── PUT /purchases/:id/cancel ─────────────────────────────────────────────── */

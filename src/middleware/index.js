@@ -42,6 +42,66 @@ async function authenticate(req, res, next) {
   }
 }
 
+/* ── Device identity (LAN/offline sync) ───────────────────────────────────
+ * Optional, non-blocking: reads the `X-Device-Id` header the frontend now
+ * attaches to every request (see services/http.ts) and, if it matches a
+ * still-active device registered to this company, attaches req.deviceId
+ * for routes that want to record which device created something (e.g.
+ * sales.js/purchases.js stamping the `device_id` column added in
+ * migration 025).
+ *
+ * Deliberately does NOT reject the request when the header is missing,
+ * unknown, or revoked — the browser/older-client case (no device
+ * registered at all) must keep working exactly as before. Routes that
+ * genuinely require an authorized device (the sync endpoints themselves)
+ * use requireActiveDevice below instead.
+ */
+async function identifyDevice(req, res, next) {
+  try {
+    const deviceId = req.headers['x-device-id']
+    if (deviceId && req.companyId) {
+      const device = await db('devices')
+        .where({ id: deviceId, company_id: req.companyId, status: 'active' })
+        .first('id')
+      if (device) {
+        req.deviceId = deviceId
+        // Best-effort — never blocks the request on this write. Also
+        // keeps user_id current (see migration 026 — "most recently
+        // seen with", not a fixed owner) for a device shared by staff.
+        db('devices').where({ id: deviceId }).update({ last_seen_at: new Date(), user_id: req.user?.id }).catch(() => {})
+      }
+    }
+    next()
+  } catch (err) { next() } // identity is optional — never fail the request over it
+}
+
+/* ── Device identity (required) ───────────────────────────────────────────
+ * For routes that must only accept calls from a currently-authorized,
+ * non-revoked device — used by the sync/device endpoints themselves
+ * (requirement #22: "Never trust ... another device's local database" /
+ * revoked devices must be rejected).
+ */
+async function requireActiveDevice(req, res, next) {
+  try {
+    const deviceId = req.headers['x-device-id']
+    if (!deviceId) {
+      return res.status(400).json({ success: false, message: 'X-Device-Id header is required' })
+    }
+    const device = await db('devices')
+      .where({ id: deviceId, company_id: req.companyId })
+      .first()
+    if (!device) {
+      return res.status(403).json({ success: false, message: 'Device is not registered', code: 'DEVICE_NOT_REGISTERED' })
+    }
+    if (device.status === 'revoked') {
+      return res.status(403).json({ success: false, message: 'This device has been revoked. Contact an admin to re-authorize it.', code: 'DEVICE_REVOKED' })
+    }
+    req.deviceId = deviceId
+    req.device   = device
+    next()
+  } catch (err) { next(err) }
+}
+
 /* ── Role Guard ─────────────────────────────────────────────────────────── */
 function requireRole(...roles) {
   return (req, res, next) => {
@@ -177,4 +237,4 @@ function errorHandler(err, req, res, next) {
   res.status(status).json({ success: false, message })
 }
 
-module.exports = { authenticate, requireRole, requirePermission, requireSensitiveConfirm, requireStepUp, errorHandler, ok, paginated }
+module.exports = { authenticate, identifyDevice, requireActiveDevice, requireRole, requirePermission, requireSensitiveConfirm, requireStepUp, errorHandler, ok, paginated }

@@ -253,4 +253,4 @@ function isValidUUID(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str)
 }
 
-module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, nextAutoBarcode, buildAutoBarcode, auditLog, clampExpiry }
+module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, nextAutoBarcode, buildAutoBarcode, auditLog, clampExpiry, isValidUUID }

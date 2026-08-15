@@ -66,6 +66,13 @@ const DEFAULT_SETTINGS = {
     autoEnabled: false,
     frequency:   'daily', // 'daily' | 'weekly' | 'monthly'
   },
+  devices: {
+    // Enforced in routes/devices.js POST /register — kept here (not
+    // hard-coded) so an account can be granted a higher/lower limit
+    // without a code change, same pattern as every other per-company
+    // toggle in this file.
+    maxDevices: 5,
+  },
 }
 
 /** One level deep-merge per top-level section — enough for this flat shape
