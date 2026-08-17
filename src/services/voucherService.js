@@ -141,14 +141,23 @@ class VoucherService {
   /**
    * Cancel a DRAFT voucher (not yet posted).
    * Posted vouchers must be reversed, not cancelled.
+   * @param {string} voucherId
+   * @param {string} companyId — the AUTHENTICATED caller's company (req.companyId).
+   *   Never derived from the voucher itself, and never accepted from the
+   *   frontend — see PostingEngine.post() for the same rule.
+   * @param {string} userId
+   * @param {string} reason
+   * @param {string} ipAddress
    */
-  static async cancel(voucherId, userId, reason, ipAddress = null) {
-    const voucher = await db('vouchers').where({ id: voucherId }).first()
+  static async cancel(voucherId, companyId, userId, reason, ipAddress = null) {
+    if (!companyId) throw new AppError('Voucher not found', 404)
+
+    const voucher = await db('vouchers').where({ id: voucherId, company_id: companyId }).first()
     if (!voucher)                     throw new AppError('Voucher not found', 404)
     if (voucher.status === 'POSTED')  throw new AppError('Cannot cancel a posted voucher. Use reverse instead.', 400)
     if (voucher.status === 'CANCELLED') throw new AppError('Already cancelled', 409)
 
-    await db('vouchers').where({ id: voucherId }).update({
+    await db('vouchers').where({ id: voucherId, company_id: companyId }).update({
       status:       'CANCELLED',
       cancelled_by: userId,
       cancelled_at: new Date(),

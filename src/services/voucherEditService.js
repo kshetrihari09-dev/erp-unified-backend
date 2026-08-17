@@ -134,13 +134,13 @@ class VoucherEditService {
 
     // ── Step 1 — reverse the currently-live ledger impact (existing,
     //    unmodified engine method). ──────────────────────────────────────────
-    const reversal = await PostingEngine.reverse(activeEntryVoucherId, userId, `Correction (edit): ${reason}`, ipAddress)
+    const reversal = await PostingEngine.reverse(activeEntryVoucherId, companyId, userId, `Correction (edit): ${reason}`, ipAddress)
 
     // Tag the reversal artifact as internal ledger plumbing so it can never
     // surface as a user-facing voucher — independent of the reversal_of/status
     // heuristic the voucher list also happens to use, so this stays hidden
     // even across several chained edits.
-    await db('vouchers').where({ id: reversal.reversal_voucher.id }).update({
+    await db('vouchers').where({ id: reversal.reversal_voucher.id, company_id: companyId }).update({
       metadata: JSON.stringify({ system_correction: true, corrects_voucher_id: voucherId, internal_only: true, kind: 'edit_reversal' }),
     })
 
@@ -243,7 +243,7 @@ class VoucherEditService {
         })
       }
 
-      const [row] = await trx('vouchers').where({ id: voucherId }).update({
+      const [row] = await trx('vouchers').where({ id: voucherId, company_id: companyId }).update({
         voucher_date: newDate,
         party_id:     partyId !== undefined ? (partyId || null) : voucher.party_id,
         narration:    narration !== undefined ? narration : voucher.narration,

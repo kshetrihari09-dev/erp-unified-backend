@@ -30,16 +30,23 @@ class PostingEngine {
   /**
    * Post a voucher — the main entry point.
    * @param {string} voucherId
+   * @param {string} companyId — the AUTHENTICATED caller's company (req.companyId).
+   *   Never derived from the voucher itself, and never accepted from the
+   *   frontend request body/query — this is what prevents a user in
+   *   Company A from posting a voucher belonging to Company B, even if
+   *   they know/guess the voucher's UUID.
    * @param {string} userId  — the user performing the post
    * @param {string} ipAddress
    * @returns {object} journal_entry
    */
-  static async post(voucherId, userId, ipAddress = null) {
+  static async post(voucherId, companyId, userId, ipAddress = null) {
+    if (!companyId) throw new AppError('Voucher not found', 404)
+
     // ── Step 1: Load voucher (outside transaction for quick validation) ──
-    const voucher = await db('vouchers as v')
-      .leftJoin('users as u', 'v.created_by', 'u.id')
-      .where('v.id', voucherId)
-      .select('v.*', 'u.company_id as company_id_check')
+    // Scoped by BOTH id and company_id — a voucher belonging to another
+    // company must look identical to a voucher that doesn't exist at all.
+    const voucher = await db('vouchers')
+      .where({ id: voucherId, company_id: companyId })
       .first()
 
     if (!voucher) throw new AppError('Voucher not found', 404)
@@ -47,7 +54,6 @@ class PostingEngine {
     if (voucher.status === 'CANCELLED') throw new AppError('Cannot post a cancelled voucher', 400)
     if (voucher.status === 'REVERSED')  throw new AppError('Cannot post a reversed voucher', 400)
 
-    const companyId     = voucher.company_id
     const idempotencyKey = `post:${voucherId}`
 
     return db.transaction(async trx => {
@@ -183,7 +189,7 @@ class PostingEngine {
         }
 
         // ── Step 14: Update voucher to POSTED ─────────────────────────
-        await trx('vouchers').where({ id: voucherId }).update({
+        await trx('vouchers').where({ id: voucherId, company_id: companyId }).update({
           status:    'POSTED',
           posted_by: userId,
           posted_at: new Date(),
@@ -220,13 +226,20 @@ class PostingEngine {
   /**
    * Reverse a posted journal entry.
    * Creates an equal-and-opposite journal entry. Never modifies original.
+   * @param {string} voucherId
+   * @param {string} companyId — the AUTHENTICATED caller's company (req.companyId).
+   *   Never derived from the voucher itself — see post() above for why.
+   * @param {string} userId
+   * @param {string} reason
+   * @param {string} ipAddress
    */
-  static async reverse(voucherId, userId, reason, ipAddress = null) {
-    const voucher = await db('vouchers').where({ id: voucherId }).first()
+  static async reverse(voucherId, companyId, userId, reason, ipAddress = null) {
+    if (!companyId) throw new AppError('Voucher not found', 404)
+
+    const voucher = await db('vouchers').where({ id: voucherId, company_id: companyId }).first()
     if (!voucher)                       throw new AppError('Voucher not found', 404)
     if (voucher.status !== 'POSTED')    throw new AppError('Only POSTED vouchers can be reversed', 400)
 
-    const companyId     = voucher.company_id
     const idempotencyKey = `reverse:${voucherId}`
 
     return db.transaction(async trx => {
@@ -344,7 +357,7 @@ class PostingEngine {
         }
 
         // Mark original voucher as REVERSED
-        await trx('vouchers').where({ id: voucherId }).update({
+        await trx('vouchers').where({ id: voucherId, company_id: companyId }).update({
           status: 'REVERSED', reversed_by: userId,
         })
 
@@ -389,16 +402,21 @@ class PostingEngine {
    *   - DOES write the audit log
    *
    * @param {{ trx, voucherId, userId, ipAddress, companyId }} opts
+   *   companyId is REQUIRED — the AUTHENTICATED caller's company. It is
+   *   never derived from the voucher row itself (see post() above for why),
+   *   and the voucher lookup below is scoped by it.
    */
   static async postInTransaction({ trx, voucherId, userId, ipAddress = null, companyId }) {
-    // Load voucher within the transaction
-    const voucher = await trx('vouchers').where({ id: voucherId }).first()
+    if (!companyId) throw new AppError('Voucher not found', 404)
+
+    // Load voucher within the transaction — scoped by id AND company_id
+    const voucher = await trx('vouchers').where({ id: voucherId, company_id: companyId }).first()
     if (!voucher) throw new AppError('Voucher not found', 404)
     if (voucher.status === 'POSTED')    throw new AppError('Voucher is already posted', 409)
     if (voucher.status === 'CANCELLED') throw new AppError('Cannot post a cancelled voucher', 400)
     if (voucher.status === 'REVERSED')  throw new AppError('Cannot post a reversed voucher', 400)
 
-    const resolvedCompanyId = companyId || voucher.company_id
+    const resolvedCompanyId = companyId
     await db.setRLSContext(trx, resolvedCompanyId)
 
     // Period lock check
@@ -497,7 +515,7 @@ class PostingEngine {
     }
 
     // Mark voucher POSTED
-    await trx('vouchers').where({ id: voucherId }).update({
+    await trx('vouchers').where({ id: voucherId, company_id: resolvedCompanyId }).update({
       status:     'POSTED',
       posted_by:  userId,
       posted_at:  new Date(),

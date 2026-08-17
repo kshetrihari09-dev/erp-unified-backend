@@ -56,7 +56,7 @@ router.get('/vouchers/:id', async (req, res, next) => {
 
 router.post('/vouchers/:id/post', requirePermission('post_vouchers'), async (req, res, next) => {
   try {
-    const result = await PostingEngine.post(req.params.id, req.user.id, req.ip)
+    const result = await PostingEngine.post(req.params.id, req.companyId, req.user.id, req.ip)
     if (result.alreadyPosted) return ok(res, result, 'Already posted (idempotent)')
     return ok(res, result, 'Voucher posted successfully')
   } catch (err) { next(err) }
@@ -66,7 +66,7 @@ router.post('/vouchers/:id/reverse', requirePermission('reverse_entries'), async
   try {
     const { reason } = req.body
     if (!reason?.trim()) throw new AppError('Reversal reason is required', 400)
-    const result = await PostingEngine.reverse(req.params.id, req.user.id, reason, req.ip)
+    const result = await PostingEngine.reverse(req.params.id, req.companyId, req.user.id, reason, req.ip)
     return ok(res, result, 'Voucher reversed successfully')
   } catch (err) { next(err) }
 })
@@ -75,7 +75,7 @@ router.post('/vouchers/:id/cancel', async (req, res, next) => {
   try {
     const { reason } = req.body
     if (!reason?.trim()) throw new AppError('Cancellation reason is required', 400)
-    const result = await VoucherService.cancel(req.params.id, req.user.id, reason, req.ip)
+    const result = await VoucherService.cancel(req.params.id, req.companyId, req.user.id, reason, req.ip)
     return ok(res, result, 'Voucher cancelled')
   } catch (err) { next(err) }
 })
@@ -254,7 +254,7 @@ router.post('/create-payment', requirePermission('post_vouchers'), async (req, r
       ],
     }, req.ip)
 
-    const posted = await PostingEngine.post(created.voucher.id, req.user.id, req.ip)
+    const posted = await PostingEngine.post(created.voucher.id, req.companyId, req.user.id, req.ip)
     return ok(res, { voucher: created.voucher, journal_entry: posted.journal_entry }, 'Payment recorded', 201)
   } catch (err) { next(err) }
 })
