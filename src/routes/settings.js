@@ -9,6 +9,8 @@ const { v4: uuid } = require('uuid')
 const { authenticate, requireRole, requireSensitiveConfirm } = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { auditLog } = require('../utils/helpers')
+const { validateRole, canAssignRole } = require('../utils/roles')
+const { revokeAllForUser } = require('../utils/refreshTokens')
 const { withDefaults, mergeSettings } = require('../utils/settingsDefaults')
 const backupService = require('../services/backupService')
 
@@ -79,20 +81,32 @@ router.get('/users', requireRole('admin', 'manager'), async (req, res, next) => 
 router.post('/users', requireRole('admin'), async (req, res, next) => {
   try {
     const { name, email, password, role, phone } = req.body
-    if (!name || !email || !password) return res.status(400).json({ success: false, message: 'Name, email and password required' })
-    if (password.length < 8) return res.status(400).json({ success: false, message: 'Password must be at least 8 characters' })
+    if (!name || !email || !password) return res.status(400).json({ success: false, code: 'INVALID_REQUEST', message: 'Name, email and password required' })
+    if (password.length < 8) return res.status(400).json({ success: false, code: 'INVALID_REQUEST', message: 'Password must be at least 8 characters' })
+
+    // Role validation: reject anything that isn't an exact known role
+    // string, and reject 'owner' outright — a new-user endpoint must
+    // never be able to mint a second owner. requireRole('admin') above
+    // already lets 'owner' actors through too (see requireRole), so an
+    // actual owner creating staff is unaffected; only the role VALUE is
+    // restricted here, not who may call this route.
+    const roleCheck = validateRole(role, { allowOwner: false, required: false })
+    if (!roleCheck.valid) {
+      return res.status(400).json({ success: false, code: roleCheck.code, message: roleCheck.message })
+    }
+    const finalRole = roleCheck.role || 'cashier'
 
     const exists = await db('users').where({ company_id: req.companyId, email: email.toLowerCase() }).first()
-    if (exists) return res.status(409).json({ success: false, message: 'Email already exists in this company' })
+    if (exists) return res.status(409).json({ success: false, code: 'EMAIL_ALREADY_EXISTS', message: 'Email already exists in this company' })
 
     const password_hash = await bcrypt.hash(password, 12)
     const [user] = await db('users').insert({
       id: uuid(), company_id: req.companyId,
       name, email: email.toLowerCase(), password_hash,
-      phone: phone || null, role: role || 'cashier', is_active: true,
+      phone: phone || null, role: finalRole, is_active: true,
     }).returning('id','name','email','phone','role','is_active','created_at','can_post_vouchers','can_approve_vouchers','can_lock_periods','can_reverse_entries')
 
-    await auditLog(req.companyId, req.user.id, 'CREATE_USER', 'users', user.id, { name, email, role }, req.ip)
+    await auditLog(req.companyId, req.user.id, 'CREATE_USER', 'users', user.id, { name, email, role: finalRole }, req.ip)
     return successResponse(res, user, 'User created', 201)
   } catch (err) { next(err) }
 })
@@ -101,27 +115,76 @@ router.post('/users', requireRole('admin'), async (req, res, next) => {
 router.put('/users/:id', requireRole('admin'), async (req, res, next) => {
   try {
     const user = await db('users').where({ id: req.params.id, company_id: req.companyId }).first()
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' })
+    if (!user) return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' })
 
     const updates = {}
     if (req.body.name)      updates.name      = req.body.name
     if (req.body.phone)     updates.phone     = req.body.phone
-    if (req.body.role)      updates.role      = req.body.role
-    if (req.body.is_active !== undefined) updates.is_active = req.body.is_active
+
+    if (req.body.role !== undefined) {
+      // 1. Is the role value itself valid? (never allow 'owner' through
+      //    this endpoint — only direct DB/ownership-transfer tooling, which
+      //    doesn't exist here, should ever set it.)
+      const roleCheck = validateRole(req.body.role, { allowOwner: false, required: true })
+      if (!roleCheck.valid) {
+        return res.status(400).json({ success: false, code: roleCheck.code, message: roleCheck.message })
+      }
+      // 2. Self-escalation guard: nobody may change their own role,
+      //    regardless of what role they're requesting — an admin
+      //    demoting themselves is just as much a self-authorization
+      //    change as one promoting themselves, and either should go
+      //    through another admin/owner.
+      if (req.params.id === req.user.id) {
+        return res.status(403).json({ success: false, code: 'SELF_ROLE_CHANGE_DENIED', message: 'You cannot change your own role.' })
+      }
+      // 3. Is THIS actor allowed to move THIS target to THIS role?
+      //    (blocks admin touching an owner account, and admin granting
+      //    owner — both already covered by allowOwner:false above, this
+      //    also covers "target is currently owner".)
+      const assignCheck = canAssignRole({ actorRole: req.user.role, targetCurrentRole: user.role, newRole: roleCheck.role })
+      if (!assignCheck.ok) {
+        return res.status(403).json({ success: false, code: assignCheck.code, message: assignCheck.message })
+      }
+      updates.role = roleCheck.role
+    }
+
+    if (req.body.is_active !== undefined) {
+      if (req.params.id === req.user.id) {
+        return res.status(403).json({ success: false, code: 'SELF_ROLE_CHANGE_DENIED', message: 'You cannot deactivate your own account.' })
+      }
+      if (user.role === 'owner' && req.user.role !== 'owner') {
+        return res.status(403).json({ success: false, code: 'TARGET_ROLE_PROTECTED', message: 'The owner account cannot be modified.' })
+      }
+      updates.is_active = !!req.body.is_active
+    }
     // Real, backend-enforced permission flags (see requirePermission() in
     // middleware/index.js) — surfaced in Settings → Users & Permissions.
-    // Admin-only route already (see requireRole('admin') above).
-    for (const flag of ['can_post_vouchers', 'can_approve_vouchers', 'can_lock_periods', 'can_reverse_entries']) {
-      if (req.body[flag] !== undefined) updates[flag] = !!req.body[flag]
+    // Admin-only route already (see requireRole('admin') above), but an
+    // owner-only target is still off-limits to a non-owner admin.
+    const flagFields = ['can_post_vouchers', 'can_approve_vouchers', 'can_lock_periods', 'can_reverse_entries']
+    if (flagFields.some(f => req.body[f] !== undefined)) {
+      if (user.role === 'owner' && req.user.role !== 'owner') {
+        return res.status(403).json({ success: false, code: 'TARGET_ROLE_PROTECTED', message: 'The owner account cannot be modified.' })
+      }
+      for (const flag of flagFields) {
+        if (req.body[flag] !== undefined) updates[flag] = !!req.body[flag]
+      }
     }
     if (req.body.password) {
-      if (req.body.password.length < 8) return res.status(400).json({ success: false, message: 'Password must be at least 8 characters' })
+      if (req.body.password.length < 8) return res.status(400).json({ success: false, code: 'INVALID_REQUEST', message: 'Password must be at least 8 characters' })
       updates.password_hash = await bcrypt.hash(req.body.password, 12)
     }
     const [updated] = await db('users').where({ id: req.params.id }).update({ ...updates, updated_at: new Date() }).returning(
       'id','name','email','phone','role','is_active','can_post_vouchers','can_approve_vouchers','can_lock_periods','can_reverse_entries'
     )
-    await auditLog(req.companyId, req.user.id, 'UPDATE_USER', 'users', req.params.id, { name: updates.name }, req.ip)
+    // A disabled account's outstanding refresh tokens must not keep
+    // minting new access tokens (its access token itself is already
+    // re-checked against is_active on every request — see authenticate —
+    // but the refresh path needs its own cutoff too).
+    if (updates.is_active === false) {
+      await revokeAllForUser(req.params.id, 'account_disabled').catch(() => {})
+    }
+    await auditLog(req.companyId, req.user.id, 'UPDATE_USER', 'users', req.params.id, { name: updates.name, role: updates.role, is_active: updates.is_active }, req.ip)
     return successResponse(res, updated)
   } catch (err) { next(err) }
 })

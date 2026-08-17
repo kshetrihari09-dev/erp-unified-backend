@@ -55,9 +55,13 @@ class SMSService {
 
   /** Development: log to console */
   _consoleSend(phone, otp, message) {
+    const shown = process.env.NODE_ENV === 'production' ? `***${otp.slice(-2)}` : otp
+    if (process.env.NODE_ENV === 'production') {
+      console.warn('[SMS] console-mode OTP delivery is configured in production — no SMS is actually being sent. Set SMS_PROVIDER to a real provider.')
+    }
     console.log('\n' + '═'.repeat(50))
     console.log(`📱 SMS (console mode) → ${phone}`)
-    console.log(`   OTP: ${otp}`)
+    console.log(`   OTP: ${shown}`)
     console.log(`   Msg: ${message}`)
     console.log('═'.repeat(50) + '\n')
     return { success: true, messageId: `console-${Date.now()}` }

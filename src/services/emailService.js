@@ -174,10 +174,17 @@ class EmailService {
   /* ── Providers ──────────────────────────────────────────────────────────── */
 
   _consoleSend(email, otp, subject) {
+    // Never print a usable OTP to logs in production, even if console mode
+    // is (mis)configured there — log aggregation could capture it, and an
+    // OTP is a live credential. Masked here; dev/staging keep full OTP.
+    const shown = process.env.NODE_ENV === 'production' ? `***${otp.slice(-2)}` : otp
+    if (process.env.NODE_ENV === 'production') {
+      console.warn('[Email] console-mode OTP delivery is configured in production — no email is actually being sent. Set EMAIL_PROVIDER to a real provider.')
+    }
     console.log('\n' + '═'.repeat(54))
     console.log(`📧 Email OTP (console mode) → ${email}`)
     console.log(`   Subject : ${subject}`)
-    console.log(`   OTP     : ${otp}`)
+    console.log(`   OTP     : ${shown}`)
     console.log(`   Expires : 5 minutes`)
     console.log('═'.repeat(54) + '\n')
     return { success: true, messageId: `email-console-${Date.now()}`, provider: 'console' }

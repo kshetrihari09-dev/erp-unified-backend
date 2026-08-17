@@ -103,9 +103,15 @@ app.use(extraSecurityHeaders)
 // Origin resolution order:
 //   1. No Origin header (server-to-server, curl, Postman)  → allow
 //   2. Explicitly listed in config.cors.origins            → allow
-//   3. Render / Vercel deploy preview domains              → allow
-//   4. LAN IPs in dev (mobile scanner on same WiFi)        → allow
-//   5. Everything else                                     → 403 (not 500)
+//   3. LAN IPs in dev (mobile scanner on same WiFi)        → allow, dev only
+//   4. Everything else                                     → 403 (not 500)
+//
+// Production origins are an explicit allow-list ONLY (config.cors.origins,
+// from the CORS_ORIGIN env var) — no "any *.vercel.app" / "any
+// *.onrender.com" wildcard. That previously let ANY deployment on either
+// platform — including one an attacker spun up themselves — pass CORS and
+// make credentialed requests against this API. A real preview/staging
+// deploy just needs its exact origin added to CORS_ORIGIN.
 //
 // Previously callback(new Error(...)) caused Express's error handler to
 // return 500. We now handle the rejection inline with res.status(403).json()
@@ -117,8 +123,6 @@ app.use((req, res, next) => {
   function isAllowed(o) {
     if (!o) return true                               // no Origin → allow (server-to-server)
     if (config.cors.origins.includes(o)) return true // explicit allow-list
-    if (o.endsWith('.onrender.com')) return true    // Render deploy previews
-    if (o.endsWith('.vercel.app'))   return true    // Vercel deploy previews
 
     // LAN IPs — dev only (mobile phones / tablets on the same WiFi)
     if (!config.isProd) {
@@ -142,12 +146,15 @@ app.use((req, res, next) => {
     return
   }
 
-  // Origin is allowed — delegate to the cors package for correct header injection
+  // Origin is allowed — delegate to the cors package for correct header
+  // injection. `credentials: true` is only ever combined with a specific,
+  // validated origin above — never with `origin: '*'` (which the `cors`
+  // package would in fact refuse to send alongside credentials anyway).
   cors({
     origin: true,           // reflect the matched origin back
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-Step-Up-Token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-Step-Up-Token', 'X-Device-Id', 'X-Device-Secret'],
     exposedHeaders: ['X-Request-Id', 'RateLimit-Limit', 'RateLimit-Remaining'],
   })(req, res, next)
 })
@@ -172,21 +179,40 @@ app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads'), {
 }))
 
 // ── 9. Health check (no rate limit — monitoring tools call this frequently) ───
+// Public and unauthenticated by necessity (uptime monitors, load balancer
+// health checks) — so it must never reveal anything about the server's
+// internals. DB connectivity is still checked (that's the whole point of
+// a health check) but only a plain ok/error status is returned; no
+// environment name, version, LAN IP, HTTPS config, or DB error detail.
 app.get('/health', async (req, res) => {
   try {
     await db.raw('SELECT 1')
+    res.json({ status: 'ok' })
+  } catch {
+    res.status(503).json({ status: 'error' })
+  }
+})
+
+// ── 9b. Diagnostics (authenticated — for ops/support, not monitoring tools) ──
+// Everything /health used to expose publicly now lives here instead,
+// behind a real session. Any authenticated user can see it (it's
+// non-sensitive once you already have a valid account) — tighten to
+// requireRole('owner','admin') if you'd rather restrict it further.
+app.get(`${'/api/v1'}/diagnostics`, require('./middleware/index').authenticate, async (req, res) => {
+  try {
+    await db.raw('SELECT 1')
     res.json({
-      status:   'ok',
-      db:       'connected',
-      version:  '2.2.0',
-      env:      config.env,
-      time:     new Date().toISOString(),
-      name:     'Byapar Unified Backend',
-      https:    config.server.https,
-      lan:      config.server.lan,
+      status:  'ok',
+      db:      'connected',
+      version: '2.2.0',
+      env:     config.env,
+      time:    new Date().toISOString(),
+      name:    'Byapar Unified Backend',
+      https:   config.server.https,
+      lan:     config.server.lan,
     })
   } catch (err) {
-    res.status(503).json({ status: 'error', db: 'disconnected', error: err.message })
+    res.status(503).json({ status: 'error', db: 'disconnected' })
   }
 })
 

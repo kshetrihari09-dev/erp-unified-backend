@@ -3,6 +3,7 @@
  */
 const jwt    = require('jsonwebtoken')
 const bcrypt = require('bcryptjs')
+const { v4: uuidv4 } = require('uuid')
 const db     = require('../db/knex')
 const { withDefaults } = require('../utils/settingsDefaults')
 const { verifyStepUpToken } = require('../utils/stepUp')
@@ -12,12 +13,30 @@ async function authenticate(req, res, next) {
   try {
     const auth = req.headers.authorization
     if (!auth?.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, message: 'No token provided' })
+      return res.status(401).json({ success: false, code: 'AUTH_REQUIRED', message: 'No token provided' })
     }
     const token   = auth.slice(7)
     const payload = jwt.verify(token, process.env.JWT_SECRET)
-    req.user      = { id: payload.userId, email: payload.email, role: payload.role }
     req.companyId = payload.companyId
+
+    // ── Current user / role — ALWAYS from the database ─────────────────────
+    // The JWT is only used to prove who the caller authenticated as
+    // (userId) — never trusted for authorization data. A JWT can be up to
+    // JWT_EXPIRES_IN old (default 8h), and in that window an owner/admin
+    // could have deactivated the account, demoted the role, or revoked
+    // company access. Re-resolving from the DB on every request is what
+    // makes that change take effect immediately instead of only at next
+    // login/refresh — this is also what makes explicit "session
+    // invalidation" after a role change unnecessary: there is no cached
+    // privilege left anywhere for a revoked JWT to smuggle in.
+    const currentUser = await db('users').where({ id: payload.userId }).first('id', 'email', 'role', 'is_active')
+    if (!currentUser) {
+      return res.status(401).json({ success: false, code: 'USER_NOT_FOUND', message: 'Account not found.' })
+    }
+    if (!currentUser.is_active) {
+      return res.status(403).json({ success: false, code: 'ACCOUNT_DISABLED', message: 'This account has been disabled.' })
+    }
+    req.user = { id: currentUser.id, email: currentUser.email, role: currentUser.role }
 
     // ── Multi-company membership check ─────────────────────────────────────
     // The JWT already carries the active companyId, but we re-verify on
@@ -31,13 +50,13 @@ async function authenticate(req, res, next) {
       .where({ user_id: req.user.id, company_id: req.companyId })
       .first('id')
     if (!membership) {
-      return res.status(403).json({ success: false, message: 'You no longer have access to this company. Please switch companies or log in again.' })
+      return res.status(403).json({ success: false, code: 'COMPANY_ACCESS_REVOKED', message: 'You no longer have access to this company. Please switch companies or log in again.' })
     }
 
     next()
   } catch (err) {
-    if (err.name === 'TokenExpiredError') return res.status(401).json({ success: false, message: 'Token expired' })
-    if (err.name === 'JsonWebTokenError') return res.status(401).json({ success: false, message: 'Invalid token' })
+    if (err.name === 'TokenExpiredError') return res.status(401).json({ success: false, code: 'TOKEN_EXPIRED', message: 'Token expired' })
+    if (err.name === 'JsonWebTokenError') return res.status(401).json({ success: false, code: 'INVALID_TOKEN', message: 'Invalid token' })
     next(err)
   }
 }
@@ -106,16 +125,27 @@ async function requireActiveDevice(req, res, next) {
 function requireRole(...roles) {
   return (req, res, next) => {
     const userRole = req.user?.role
-    // owner and admin always pass — they have full access to everything
-    if (userRole === 'owner' || userRole === 'admin') return next()
+    // 'owner' is the one true superuser role and always passes. 'admin'
+    // does NOT get a blanket bypass — it must be explicitly listed by the
+    // route, same as every other role. (Previously 'admin' silently
+    // bypassed every requireRole() check, including requireRole('owner')
+    // routes like company deletion/restore and period unlock — that
+    // defeated the owner-only protection those routes were written to
+    // have, per their own comments. Every existing route that intends for
+    // admins to have access already lists 'admin' explicitly, so this
+    // does not remove any intentionally-granted access.)
+    if (userRole === 'owner') return next()
     if (!roles.includes(userRole)) {
-      return res.status(403).json({ success: false, message: `Access denied. Required: ${roles.join(' or ')}` })
+      return res.status(403).json({ success: false, code: 'ROLE_FORBIDDEN', message: `Access denied. Required: ${roles.join(' or ')}` })
     }
     next()
   }
 }
 
-/* ── Accounting permission guard ────────────────────────────────────────── */
+/* ── Accounting permission guard ─────────────────────────────────────────
+ * Fails CLOSED: an unrecognized `permission` key is a bug in the calling
+ * route (a typo, or a capability that was never wired into permMap), and
+ * must never be treated as "no restriction" / silently allowed. */
 function requirePermission(permission) {
   const permMap = {
     post_vouchers:    u => u.can_post_vouchers,
@@ -129,10 +159,14 @@ function requirePermission(permission) {
   }
   return async (req, res, next) => {
     try {
-      const user    = await db('users').where({ id: req.user.id }).first()
       const checker = permMap[permission]
-      if (checker && !checker(user)) {
-        return res.status(403).json({ success: false, message: `Permission denied: ${permission}` })
+      if (!checker) {
+        console.error('[requirePermission] unknown permission key:', permission)
+        return res.status(500).json({ success: false, code: 'AUTHORIZATION_CONFIG_ERROR', message: 'Authorization configuration error.' })
+      }
+      const user = await db('users').where({ id: req.user.id }).first()
+      if (!user || !checker(user)) {
+        return res.status(403).json({ success: false, code: 'PERMISSION_DENIED', message: `Permission denied: ${permission}` })
       }
       next()
     } catch (err) { next(err) }
@@ -172,11 +206,14 @@ function requirePermission(permission) {
  * being checked against always comes from `req.user`/`req.companyId`,
  * which `authenticate` already derived from the verified session JWT.
  */
-async function stepUpSatisfied(req) {
+async function stepUpSatisfied(req, { strictAction } = {}) {
   const headerToken = req.headers['x-step-up-token']
-  if (headerToken && verifyStepUpToken(headerToken, { userId: req.user.id, companyId: req.companyId })) {
+  if (headerToken && verifyStepUpToken(headerToken, { userId: req.user.id, companyId: req.companyId, strictAction })) {
     return 'ok'
   }
+  // An inline confirmPassword/PIN is a live credential re-check performed
+  // at the exact moment of THIS action, so it's inherently action-bound —
+  // no scope concept needed for it.
   const { confirmPassword } = req.body || {}
   if (!confirmPassword) return 'no-credential'
 
@@ -193,12 +230,17 @@ function requireSensitiveConfirm(actionKey) {
       const required = !!settings.sensitiveActions?.[actionKey]
       if (!required) return next()
 
+      // Optional, per-company-toggle action — any valid, correctly-scoped
+      // step-up token satisfies it (general-purpose or action-specific
+      // alike). This preserves the existing "verify once, reuse for the
+      // rest of the window" UX for these lower-stakes, admin-togglable
+      // actions.
       const result = await stepUpSatisfied(req)
       if (result === 'ok') return next()
       if (result === 'wrong-credential') {
-        return res.status(401).json({ success: false, message: 'Incorrect password', requiresPasswordConfirm: true })
+        return res.status(401).json({ success: false, code: 'STEP_UP_INVALID', message: 'Incorrect password', requiresPasswordConfirm: true })
       }
-      return res.status(400).json({ success: false, message: 'Password confirmation is required for this action', requiresPasswordConfirm: true })
+      return res.status(400).json({ success: false, code: 'STEP_UP_REQUIRED', message: 'Password confirmation is required for this action', requiresPasswordConfirm: true })
     } catch (err) { next(err) }
   }
 }
@@ -206,12 +248,16 @@ function requireSensitiveConfirm(actionKey) {
 function requireStepUp(actionKey) {
   return async (req, res, next) => {
     try {
-      const result = await stepUpSatisfied(req)
+      // Mandatory, non-toggleable action — a token minted for some OTHER
+      // action (or a general-purpose token from setting a PIN, etc.) must
+      // NOT satisfy this. Only a token issued specifically for actionKey,
+      // or a fresh inline credential entered for this exact request, do.
+      const result = await stepUpSatisfied(req, { strictAction: actionKey })
       if (result === 'ok') return next()
       if (result === 'wrong-credential') {
-        return res.status(401).json({ success: false, message: 'Incorrect password', requiresPasswordConfirm: true, action: actionKey })
+        return res.status(401).json({ success: false, code: 'STEP_UP_INVALID', message: 'Incorrect password', requiresPasswordConfirm: true, action: actionKey })
       }
-      return res.status(400).json({ success: false, message: 'Verification is required for this action', requiresPasswordConfirm: true, action: actionKey })
+      return res.status(400).json({ success: false, code: 'STEP_UP_REQUIRED', message: 'Verification is required for this action', requiresPasswordConfirm: true, action: actionKey })
     } catch (err) { next(err) }
   }
 }
@@ -225,16 +271,46 @@ function paginated(res, { data, total, page, limit }) {
 }
 
 /* ── Global error handler ───────────────────────────────────────────────── */
+/* Never forwards raw DB errors (message, detail, constraint name, stack) to
+ * the client — those can leak schema/column/table names and internal
+ * implementation details. Everything is logged server-side with a
+ * requestId the client is given, for support/debugging purposes, but the
+ * client only ever sees a safe, generic code+message. `err.status` /
+ * `err.statusCode` (thrown deliberately by route code via AppError, e.g.
+ * "Invalid email or password") are the one exception — those messages are
+ * already written to be user-facing. */
 function errorHandler(err, req, res, next) {
-  console.error('[ERROR]', err.message, err.status || 500)
-  if (err.code === '23505') return res.status(409).json({ success: false, message: 'Duplicate value: ' + (err.detail || '') })
-  if (err.code === '23514') return res.status(400).json({ success: false, message: 'Constraint violated: ' + (err.constraint || err.detail || '') })
-  if (err.code === '23503') return res.status(400).json({ success: false, message: 'Referenced record does not exist' })
-  if (err.code === '23502') return res.status(400).json({ success: false, message: 'Required field missing' })
-  if (err.code === 'P0001') return res.status(400).json({ success: false, message: err.message })
-  const status  = err.status || err.statusCode || 500
-  const message = err.message || 'Internal server error'
-  res.status(status).json({ success: false, message })
+  const requestId = req.id || req.headers['x-request-id'] || uuidv4()
+  console.error('[ERROR]', requestId, err.code || '', err.message, err.stack)
+
+  // Known Postgres error codes → safe, generic application-facing codes.
+  // The real detail/constraint/message is logged above, never returned.
+  const PG_ERROR_MAP = {
+    '23505': { status: 409, code: 'DUPLICATE_RESOURCE', message: 'A record with this value already exists.' },
+    '23514': { status: 400, code: 'INVALID_REQUEST', message: 'The request violates a data constraint.' },
+    '23503': { status: 400, code: 'INVALID_REQUEST', message: 'Referenced record does not exist.' },
+    '23502': { status: 400, code: 'INVALID_REQUEST', message: 'A required field is missing.' },
+    '22P02': { status: 400, code: 'INVALID_REQUEST', message: 'Invalid value provided.' },
+  }
+  if (PG_ERROR_MAP[err.code]) {
+    const mapped = PG_ERROR_MAP[err.code]
+    return res.status(mapped.status).json({ success: false, code: mapped.code, message: mapped.message, requestId })
+  }
+  if (err.code === 'P0001') {
+    // Custom RAISE EXCEPTION from a trigger/function — these are written
+    // by us to already be user-safe (e.g. voucher balance checks).
+    return res.status(400).json({ success: false, code: 'INVALID_REQUEST', message: err.message, requestId })
+  }
+
+  // Any error explicitly thrown by route code (AppError, etc.) with a
+  // 4xx status was authored to be shown to the user. Anything else
+  // (unexpected 5xx, unhandled exceptions, raw driver/library errors)
+  // gets a fully generic message — the specifics stay in the server log.
+  const status = err.status || err.statusCode || 500
+  if (status >= 400 && status < 500 && err.message) {
+    return res.status(status).json({ success: false, code: err.code || 'INVALID_REQUEST', message: err.message, requestId })
+  }
+  res.status(status >= 500 ? status : 500).json({ success: false, code: 'INTERNAL_ERROR', message: 'An unexpected error occurred.', requestId })
 }
 
 module.exports = { authenticate, identifyDevice, requireActiveDevice, requireRole, requirePermission, requireSensitiveConfirm, requireStepUp, errorHandler, ok, paginated }

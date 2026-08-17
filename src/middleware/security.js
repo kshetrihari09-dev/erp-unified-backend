@@ -125,10 +125,15 @@ function helmetConfig() {
     crossOriginResourcePolicy: { policy: 'cross-origin' },
 
     // Content Security Policy
+    // scriptSrc drops 'unsafe-inline' in production: this API server
+    // itself renders no HTML with inline scripts, so there is nothing
+    // that depends on it there. Kept in dev because the app is normally
+    // developed against the separately-hosted Vite dev server (which
+    // injects an inline HMR client script) proxying through here.
     contentSecurityPolicy: {
       directives: {
         defaultSrc:     ["'self'"],
-        scriptSrc:      ["'self'", "'unsafe-inline'"],   // Vite inlines scripts in dev
+        scriptSrc:      config.isProd ? ["'self'"] : ["'self'", "'unsafe-inline'"],
         styleSrc:       ["'self'", "'unsafe-inline'"],   // Tailwind
         imgSrc:         ["'self'", 'data:', 'blob:'],    // QR codes (data:), camera (blob:)
         mediaSrc:       ["'self'", 'blob:'],             // Camera stream

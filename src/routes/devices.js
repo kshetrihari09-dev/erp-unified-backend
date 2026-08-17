@@ -25,6 +25,34 @@ const { isValidUUID, auditLog } = require('../utils/helpers')
 
 const PAIRING_TOKEN_TTL_MS = 10 * 60_000 // 10 minutes — short-lived per requirement #11
 
+/* ── Device credential helpers ─────────────────────────────────────────────
+ * A client-supplied device_id (UUID) is never, on its own, proof that the
+ * caller controls that physical device — it's just a value the client
+ * remembers and sends. `device_secret` is the actual credential: minted
+ * server-side the first time a device row is created (register or pair
+ * claim), returned to the client exactly once, and required on every
+ * later register/heartbeat call for that same device_id. This is what
+ * stops an authenticated user (same company OR a different one) from
+ * "adopting" an already-registered device just by knowing/guessing its
+ * UUID — device identity is now separate from user/session identity.
+ */
+function hashDeviceSecret(raw) {
+  return crypto.createHash('sha256').update(raw).digest('hex')
+}
+function generateDeviceSecret() {
+  const raw = crypto.randomBytes(32).toString('base64url')
+  return { raw, hash: hashDeviceSecret(raw) }
+}
+/** Does the presented X-Device-Secret header match this device's stored
+ *  credential? A device with no credential yet (created before this
+ *  migration/feature) is treated as not-yet-claimed — see callers for how
+ *  each route handles that transitional case. */
+function secretMatches(device, presented) {
+  if (!device.device_secret_hash) return null // "legacy device, no credential set"
+  if (!presented) return false
+  return hashDeviceSecret(presented) === device.device_secret_hash
+}
+
 router.use(authenticate)
 
 /* ── GET /devices ──────────────────────────────────────────────────────────
@@ -77,9 +105,28 @@ router.post('/register', async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'device_name is required' })
     }
 
-    const existing = await db('devices').where({ id: device_id, company_id: req.companyId }).first()
+    // Look up this device_id GLOBALLY (not scoped to req.companyId) first —
+    // a device row with this id belonging to a DIFFERENT company must
+    // never be silently adopted/merged into the caller's company, and we
+    // must not even confirm its existence/details in the response.
+    const anyExisting = await db('devices').where({ id: device_id }).first()
+    if (anyExisting && anyExisting.company_id !== req.companyId) {
+      return res.status(409).json({ success: false, code: 'DEVICE_ID_CONFLICT', message: 'This device ID is already registered to a different account.' })
+    }
+    const existing = anyExisting // same company (or undefined)
 
-    if (!existing) {
+    if (existing) {
+      // Existing device in OUR company — proof of possession required
+      // before letting this call rename it / reassign its user_id, unless
+      // it predates device credentials entirely (see secretMatches).
+      const match = secretMatches(existing, req.headers['x-device-secret'])
+      if (match === false) {
+        return res.status(403).json({ success: false, code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device credential is missing or incorrect for this device.' })
+      }
+      if (existing.status === 'revoked') {
+        return res.status(403).json({ success: false, message: 'This device has been revoked. Contact an admin to re-authorize it.', code: 'DEVICE_REVOKED' })
+      }
+    } else {
       const company = await db('companies').where({ id: req.companyId }).first('settings')
       const maxDevices = withDefaults(company?.settings).devices.maxDevices
       const [{ count }] = await db('devices').where({ company_id: req.companyId, status: 'active' }).count('id as count')
@@ -91,21 +138,32 @@ router.post('/register', async (req, res, next) => {
           max_devices: maxDevices,
         })
       }
-    } else if (existing.status === 'revoked') {
-      return res.status(403).json({ success: false, message: 'This device has been revoked. Contact an admin to re-authorize it.', code: 'DEVICE_REVOKED' })
     }
+
+    // Mint a fresh device_secret when this device has none yet — either a
+    // brand-new device, or a pre-existing row from before this feature
+    // shipped. Only ever returned in the response body, never logged.
+    const needsSecret = !existing || !existing.device_secret_hash
+    const minted = needsSecret ? generateDeviceSecret() : null
 
     const [device] = await db('devices')
       .insert({
         id: device_id, company_id: req.companyId, branch_id: branch_id || null,
         user_id: req.user.id, device_name, platform: platform || null, app_version: app_version || null,
         status: 'active', registered_at: existing?.registered_at || new Date(), last_seen_at: new Date(),
+        ...(minted ? { device_secret_hash: minted.hash } : {}),
       })
-      .onConflict('id').merge(['device_name', 'platform', 'app_version', 'user_id', 'last_seen_at', 'branch_id'])
+      .onConflict('id').merge(['device_name', 'platform', 'app_version', 'user_id', 'last_seen_at', 'branch_id', ...(minted ? ['device_secret_hash'] : [])])
       .returning('*')
 
     auditLog(req.companyId, req.user.id, existing ? 'UPDATE' : 'CREATE', 'devices', device.id, { device_name }, req.ip)
-    return successResponse(res, device, existing ? 'Device updated' : 'Device registered', existing ? 200 : 201)
+    const { device_secret_hash: _omit, ...safeDevice } = device
+    return successResponse(
+      res,
+      minted ? { ...safeDevice, device_secret: minted.raw } : safeDevice,
+      existing ? 'Device updated' : 'Device registered',
+      existing ? 200 : 201
+    )
   } catch (err) { next(err) }
 })
 
@@ -121,16 +179,22 @@ router.post('/heartbeat', async (req, res, next) => {
     const deviceId = req.headers['x-device-id'] || req.body.device_id
     if (!deviceId) return res.status(400).json({ success: false, message: 'device_id is required' })
 
-    const [device] = await db('devices')
-      .where({ id: deviceId, company_id: req.companyId })
-      .update({ last_seen_at: new Date(), user_id: req.user.id })
-      .returning('*')
-
+    const device = await db('devices').where({ id: deviceId, company_id: req.companyId }).first()
     if (!device) return res.status(404).json({ success: false, message: 'Device not registered' })
     if (device.status === 'revoked') {
       return res.status(403).json({ success: false, message: 'Device revoked', code: 'DEVICE_REVOKED' })
     }
-    return successResponse(res, { status: device.status, last_seen_at: device.last_seen_at })
+    const match = secretMatches(device, req.headers['x-device-secret'])
+    if (match === false) {
+      return res.status(403).json({ success: false, code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device credential is missing or incorrect for this device.' })
+    }
+
+    const [updated] = await db('devices')
+      .where({ id: deviceId, company_id: req.companyId })
+      .update({ last_seen_at: new Date(), user_id: req.user.id })
+      .returning('*')
+
+    return successResponse(res, { status: updated.status, last_seen_at: updated.last_seen_at })
   } catch (err) { next(err) }
 })
 
@@ -252,12 +316,40 @@ publicRouter.post('/claim', async (req, res, next) => {
     if (!device_id || !isValidUUID(device_id)) { await trx.rollback(); return res.status(400).json({ success: false, message: 'A valid device_id (UUID) is required' }) }
     if (!device_name) { await trx.rollback(); return res.status(400).json({ success: false, message: 'device_name is required' }) }
 
-    const pairing = await trx('device_pairing_tokens').where({ token }).first()
-    if (!pairing)                     { await trx.rollback(); return res.status(400).json({ success: false, message: 'Invalid pairing code', code: 'PAIRING_INVALID' }) }
-    if (pairing.used_at)              { await trx.rollback(); return res.status(400).json({ success: false, message: 'This pairing code has already been used', code: 'PAIRING_USED' }) }
-    if (new Date(pairing.expires_at) < new Date()) {
+    // Atomic single-use consumption: this UPDATE only affects a row that
+    // is still unused and unexpired, and RETURNING tells us whether WE won
+    // the race. Two concurrent requests for the same token can both reach
+    // this statement, but the database's row lock during the UPDATE
+    // serializes them — only one can flip used_at from NULL, the other
+    // gets back zero rows and is rejected below. This replaces the
+    // previous SELECT-then-UPDATE pattern, which had a window between the
+    // two where a second concurrent request could still read used_at as
+    // NULL and also proceed to create a device.
+    const claimed = await trx('device_pairing_tokens')
+      .where({ token })
+      .whereNull('used_at')
+      .where('expires_at', '>', new Date())
+      .update({ used_at: new Date(), used_by_device_id: device_id })
+      .returning('*')
+
+    if (!claimed.length) {
+      // Distinguish the reasons only for logging/audit — the client
+      // response stays generic-but-accurate without leaking which case
+      // it was via timing, since we still do one lookup either way.
+      const pairing = await trx('device_pairing_tokens').where({ token }).first()
       await trx.rollback()
+      if (!pairing) return res.status(400).json({ success: false, message: 'Invalid pairing code', code: 'PAIRING_INVALID' })
+      if (pairing.used_at) return res.status(400).json({ success: false, message: 'This pairing code has already been used', code: 'PAIRING_USED' })
       return res.status(400).json({ success: false, message: 'This pairing code has expired — generate a new one', code: 'PAIRING_EXPIRED' })
+    }
+    const pairing = claimed[0]
+
+    // Same cross-company protection as /register — this device_id must
+    // not already belong to a different company.
+    const anyExisting = await trx('devices').where({ id: device_id }).first()
+    if (anyExisting && anyExisting.company_id !== pairing.company_id) {
+      await trx.rollback()
+      return res.status(409).json({ success: false, code: 'DEVICE_ID_CONFLICT', message: 'This device ID is already registered to a different account.' })
     }
 
     const company = await trx('companies').where({ id: pairing.company_id }).first('settings')
@@ -268,20 +360,21 @@ publicRouter.post('/claim', async (req, res, next) => {
       return res.status(403).json({ success: false, code: 'DEVICE_LIMIT_REACHED', message: 'Maximum registered devices reached.', max_devices: maxDevices })
     }
 
+    const minted = generateDeviceSecret()
     const [device] = await trx('devices')
       .insert({
         id: device_id, company_id: pairing.company_id, branch_id: pairing.branch_id,
         user_id: pairing.created_by, device_name, platform: platform || null, app_version: app_version || null,
         status: 'active', registered_at: new Date(), last_seen_at: new Date(),
+        device_secret_hash: minted.hash,
       })
-      .onConflict('id').merge(['device_name', 'platform', 'app_version', 'last_seen_at', 'branch_id', 'status'])
+      .onConflict('id').merge(['device_name', 'platform', 'app_version', 'last_seen_at', 'branch_id', 'status', 'device_secret_hash'])
       .returning('*')
-
-    await trx('device_pairing_tokens').where({ token }).update({ used_at: new Date(), used_by_device_id: device_id })
 
     await trx.commit()
     auditLog(pairing.company_id, pairing.created_by, 'CREATE', 'devices', device.id, { device_name, via: 'pairing' }, req.ip)
-    return successResponse(res, { device, company_id: pairing.company_id, branch_id: pairing.branch_id }, 'Device paired — sign in on this device to continue', 201)
+    const { device_secret_hash: _omit, ...safeDevice } = device
+    return successResponse(res, { device: { ...safeDevice, device_secret: minted.raw }, company_id: pairing.company_id, branch_id: pairing.branch_id }, 'Device paired — sign in on this device to continue', 201)
   } catch (err) { await trx.rollback(); next(err) }
 })
 

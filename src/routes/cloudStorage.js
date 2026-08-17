@@ -18,6 +18,7 @@ const { successResponse } = require('../middleware/helpers')
 const { auditLog } = require('../utils/helpers')
 const cloudStorageService = require('../services/cloudStorage/cloudStorageService')
 const { isValidProviderId } = require('../services/cloudStorage/CloudStorageRegistry')
+const { validateUploadedFile } = require('../utils/uploadValidation')
 
 // Files are buffered in memory (never written to disk) and streamed
 // straight to the provider's upload API. 20MB cap comfortably covers
@@ -160,15 +161,23 @@ router.post('/upload', upload.single('file'), async (req, res, next) => {
       return res.status(400).json({ success: false, message: `Unknown provider: ${provider}` })
     }
 
+    // Never trust the client-supplied mimetype/filename alone (see
+    // security audit item 9) — sniff the real type from file signature
+    // and generate a safe server-side name from that, not the client's.
+    const validated = validateUploadedFile(req.file.buffer, req.file.originalname)
+    if (!validated.ok) {
+      return res.status(400).json({ success: false, code: validated.code, message: validated.message })
+    }
+
     const result = await cloudStorageService.uploadDocument({
       companyId: req.companyId,
       providerId: provider || undefined,
       buffer: req.file.buffer,
-      fileName: req.file.originalname,
-      mimeType: req.file.mimetype || 'application/pdf',
+      fileName: validated.safeFileName,
+      mimeType: validated.mimeType,
     })
 
-    await auditLog(req.companyId, req.user.id, 'UPLOAD', 'cloud_storage_document', result.fileId, { fileName: req.file.originalname, provider: result.provider }, req.ip)
+    await auditLog(req.companyId, req.user.id, 'UPLOAD', 'cloud_storage_document', result.fileId, { fileName: validated.safeFileName, provider: result.provider }, req.ip)
     return successResponse(res, result)
   } catch (err) {
     const status = err.status || 502

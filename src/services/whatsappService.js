@@ -60,10 +60,14 @@ class WhatsAppService {
 
   /* ── Console (dev) ──────────────────────────────────────────────────────── */
   _consoleSend(phone, otp) {
+    const shown = process.env.NODE_ENV === 'production' ? `***${otp.slice(-2)}` : otp
+    if (process.env.NODE_ENV === 'production') {
+      console.warn('[WhatsApp] console-mode OTP delivery is configured in production — no WhatsApp message is actually being sent. Set WA_PROVIDER to a real provider.')
+    }
     console.log('\n' + '═'.repeat(52))
     console.log(`📲 WhatsApp OTP (console mode) → ${phone}`)
-    console.log(`   OTP   : ${otp}`)
-    console.log(`   Msg   : Your Byapar code is ${otp}. Valid 5 min.`)
+    console.log(`   OTP   : ${shown}`)
+    console.log(`   Msg   : Your Byapar code is ${shown}. Valid 5 min.`)
     console.log('═'.repeat(52) + '\n')
     return { success: true, messageId: `wa-console-${Date.now()}`, provider: 'console' }
   }

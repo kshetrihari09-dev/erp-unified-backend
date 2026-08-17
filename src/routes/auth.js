@@ -29,6 +29,7 @@ const emailService    = require('../services/emailService')
 const { resolveActiveCompanyId } = require('../services/companyContext')
 const { signStepUpToken, STEP_UP_TTL_SECONDS } = require('../utils/stepUp')
 const { verifyStepUpCredential } = require('../utils/pinAuth')
+const { issueRefreshToken, rotateRefreshToken, revokeToken, revokeAllForUser } = require('../utils/refreshTokens')
 
 const otpService = new OTPService(db)
 
@@ -41,12 +42,15 @@ class AppError extends Error {
 function signToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' })
 }
-function signRefresh(userId) {
-  return jwt.sign(
-    { userId, type: 'refresh' },
-    process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' }
-  )
+/**
+ * Issues a new server-tracked refresh-token session (see utils/refreshTokens.js)
+ * and returns just the raw bearer string — the DB row (hash, family, expiry)
+ * is what actually backs revocation/rotation/reuse-detection, the JWT-style
+ * signing this used to do is gone entirely.
+ */
+async function signRefresh(userId, req) {
+  const { raw } = await issueRefreshToken({ userId, ip: req?.ip, userAgent: req?.headers?.['user-agent'] })
+  return raw
 }
 
 /* ── Validation helpers ──────────────────────────────────────────────────── */
@@ -133,9 +137,14 @@ router.post('/send-otp', async (req, res, next) => {
       }
       if (purpose === 'login') {
         const user = await db('users').where({ email: destination }).first()
-        if (!user) throw new AppError('No account found with this email address.', 404)
-        if (!user.is_active) throw new AppError('Account is disabled.', 403)
-        userId = user.id
+        // Deliberately generic from here on regardless of whether the
+        // account exists, is disabled, or is unverified — a distinguishable
+        // response for each case lets an attacker enumerate which emails
+        // have accounts on this system. If the account is real, active,
+        // and eligible, userId is set and an OTP actually goes out below;
+        // otherwise the code silently no-ops but still returns the same
+        // generic success response.
+        if (user && user.is_active) userId = user.id
       }
     } else {
       // whatsapp or sms — needs phone
@@ -149,10 +158,8 @@ router.post('/send-otp', async (req, res, next) => {
       }
       if (purpose === 'login') {
         const user = await db('users').where({ phone: destination }).first()
-        if (!user) throw new AppError('No account found with this phone number.', 404)
-        if (!user.phone_verified) throw new AppError('Phone not verified. Please complete signup.', 400)
-        if (!user.is_active) throw new AppError('Account is disabled.', 403)
-        userId = user.id
+        // Same generic-response reasoning as the email branch above.
+        if (user && user.is_active && user.phone_verified) userId = user.id
       }
     }
 
@@ -237,7 +244,7 @@ router.post('/verify-otp', async (req, res, next) => {
       await db('users').where({ id: user.id }).update({ last_login_at: new Date(), last_active_company_id: companyId })
       const company = await db('companies').where({ id: companyId }).first()
       const token   = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
-      const refresh_token = signRefresh(user.id)
+      const refresh_token = await signRefresh(user.id, req)
       const { password_hash: _, ...safeUser } = user
 
       await AuditLogger.log(db, {
@@ -413,7 +420,7 @@ router.post('/register', async (req, res, next) => {
         const user    = await trx('users').where({ id: userId }).first()
         const company = await trx('companies').where({ id: companyId }).first()
         const jwtTok  = signToken({ userId, email: user.email, role: user.role, companyId })
-        const refresh = signRefresh(userId)
+        const refresh = await signRefresh(userId, req)
         const { password_hash: _, ...safeUser } = user
 
         await AuditLogger.log(db, {
@@ -492,7 +499,7 @@ router.post('/register', async (req, res, next) => {
       const user    = await trx('users').where({ id: userId }).first()
       const company = await trx('companies').where({ id: companyId }).first()
       const tok     = signToken({ userId, email: user.email, role: user.role, companyId })
-      const refresh = signRefresh(userId)
+      const refresh = await signRefresh(userId, req)
       const { password_hash: _, ...safeUser } = user
 
       return res.status(201).json({
@@ -588,7 +595,7 @@ router.post('/login', async (req, res, next) => {
     await db('users').where({ id: user.id }).update({ last_login_at: new Date(), last_active_company_id: companyId })
     const company     = await db('companies').where({ id: companyId }).first()
     const token       = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
-    const refresh_token = signRefresh(user.id)
+    const refresh_token = await signRefresh(user.id, req)
     const { password_hash: _, ...safeUser } = user
     await AuditLogger.log(db, { companyId, userId: user.id, action: 'LOGIN', entityType: 'auth', entityId: user.id, ipAddress: req.ip })
     return res.json({ success: true, data: { token, refresh_token, user: safeUser, company } })
@@ -596,8 +603,30 @@ router.post('/login', async (req, res, next) => {
 })
 
 router.post('/logout', authenticate, async (req, res) => {
+  // Revoke the specific session's refresh token so a copy of it (already
+  // leaked, or retained by a "retried" client) can't keep minting new
+  // access tokens after the user explicitly signed out. Best-effort: a
+  // missing/already-invalid token here just means there's nothing to
+  // revoke, never a reason to fail the logout itself.
+  if (req.body?.refresh_token) {
+    await revokeToken(req.body.refresh_token, 'logout').catch(() => {})
+  }
   await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: 'LOGOUT', entityType: 'auth', entityId: req.user.id, ipAddress: req.ip })
   return res.json({ success: true, message: 'Logged out' })
+})
+
+/* ── POST /auth/revoke-sessions ───────────────────────────────────────────
+ * "Log out everywhere" — revokes every refresh-token session for the
+ * current user (including the one that made this request; the caller's
+ * own access token remains valid until it naturally expires, since access
+ * tokens are short-lived and not tracked server-side, but no session will
+ * be able to silently refresh past that point). */
+router.post('/revoke-sessions', authenticate, async (req, res, next) => {
+  try {
+    await revokeAllForUser(req.user.id, 'user_requested')
+    await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: 'REVOKE_ALL_SESSIONS', entityType: 'auth', entityId: req.user.id, ipAddress: req.ip })
+    return res.json({ success: true, message: 'All sessions have been signed out.' })
+  } catch (err) { next(err) }
 })
 
 router.get('/me', authenticate, async (req, res, next) => {
@@ -633,7 +662,7 @@ router.get('/me', authenticate, async (req, res, next) => {
  */
 router.post('/verify-password', authenticate, async (req, res, next) => {
   try {
-    const { password, pin } = req.body || {}
+    const { password, pin, action } = req.body || {}
     if (!password && !pin) throw new AppError('Password or PIN is required', 400)
 
     const result = await verifyStepUpCredential({
@@ -643,7 +672,12 @@ router.post('/verify-password', authenticate, async (req, res, next) => {
       return res.status(result.status).json({ success: false, message: result.message, needsPinSetup: result.needsPinSetup })
     }
 
-    const stepUpToken = signStepUpToken({ userId: req.user.id, companyId: req.companyId })
+    // `action`, when the caller knows which specific mandatory
+    // (requireStepUp) action it's about to perform, scopes the token to
+    // just that action (see utils/stepUp.js). Omitted → a general-purpose
+    // token, valid for any optional/toggleable sensitive action but not
+    // for a strict one.
+    const stepUpToken = signStepUpToken({ userId: req.user.id, companyId: req.companyId, action })
     return res.json({
       success: true,
       message: 'Verified',
@@ -696,16 +730,28 @@ router.post('/refresh', async (req, res, next) => {
   try {
     const { refresh_token } = req.body
     if (!refresh_token) throw new AppError('Refresh token required', 400)
-    const payload = jwt.verify(refresh_token, process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET)
-    if (payload.type !== 'refresh') throw new AppError('Invalid refresh token', 401)
-    const user = await db('users').where({ id: payload.userId }).first()
+
+    const result = await rotateRefreshToken({ token: refresh_token, ip: req.ip, userAgent: req.headers['user-agent'] })
+    if (!result.ok) {
+      if (result.code === 'REUSE_DETECTED') {
+        // Don't distinguish this from a normal invalid/expired token in the
+        // response — no need to tell a possible attacker their reuse was
+        // caught, and the client-side handling is identical either way
+        // (force a full re-login). The family-wide revocation already
+        // happened inside rotateRefreshToken.
+        console.warn('[auth] refresh token reuse detected for user', result.userId)
+      }
+      return res.status(401).json({ success: false, code: 'INVALID_TOKEN', message: 'Invalid or expired refresh token' })
+    }
+
+    const user = await db('users').where({ id: result.userId }).first()
     if (!user || !user.is_active) throw new AppError('User not found or disabled', 401)
     // Preserve whatever company the user currently has active (survives a
     // company switch across a silent token refresh) rather than resetting
     // back to their default company on every refresh.
     const companyId = await resolveActiveCompanyId(user)
     const token = signToken({ userId: user.id, email: user.email, role: user.role, companyId })
-    return res.json({ success: true, data: { token } })
+    return res.json({ success: true, data: { token, refresh_token: result.raw } })
   } catch (err) {
     if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
       return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' })
@@ -724,6 +770,11 @@ router.put('/change-password', authenticate, async (req, res, next) => {
     const valid = await bcrypt.compare(current_password, user.password_hash)
     if (!valid) throw new AppError('Current password is incorrect', 400)
     await db('users').where({ id: req.user.id }).update({ password_hash: await bcrypt.hash(new_password, 12) })
+    // A stolen refresh token issued before the password change must not
+    // keep working after it — revoke every session and force re-login
+    // everywhere (this device included; it'll simply mint a fresh pair
+    // via the normal login flow the UI already redirects to on a 401).
+    await revokeAllForUser(req.user.id, 'password_changed').catch(() => {})
     await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: 'CHANGE_PASSWORD', entityType: 'auth', entityId: req.user.id, ipAddress: req.ip })
     return res.json({ success: true, message: 'Password changed successfully' })
   } catch (err) { next(err) }
