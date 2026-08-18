@@ -130,6 +130,14 @@ router.post('/sales', async (req, res, next) => {
       }
     }
 
+    // Only need to validate party_id ourselves when no original sale was
+    // given — if a sale_id was provided, party_id gets ignored below in
+    // favor of originalSale.party_id (already company-verified above).
+    if (!originalSale && party_id) {
+      const party = await trx('parties').where({ id: party_id, company_id: req.companyId }).first()
+      if (!party) { await trx.rollback(); return res.status(404).json({ success: false, message: 'Party not found' }) }
+    }
+
     const returnItems = []
     for (const item of items) {
       const qty  = Number(item.qty)  || 0
@@ -140,6 +148,9 @@ router.post('/sales', async (req, res, next) => {
 
       // Re-add stock to inventory (customer returns goods)
       if (item.product_id) {
+        const productOk = await trx('products').where({ id: item.product_id, company_id: req.companyId }).first('id')
+        if (!productOk) { await trx.rollback(); return res.status(404).json({ success: false, message: `Product not found: ${item.product_id}` }) }
+
         await trx(T).insert({
           company_id:    req.companyId,
           product_id:    item.product_id,
@@ -255,6 +266,11 @@ router.post('/purchase', async (req, res, next) => {
         await trx.rollback()
         return res.status(400).json({ success: false, message: 'Cannot return items from a cancelled purchase' })
       }
+    }
+
+    if (!originalPurchase && party_id) {
+      const party = await trx('parties').where({ id: party_id, company_id: req.companyId }).first()
+      if (!party) { await trx.rollback(); return res.status(404).json({ success: false, message: 'Party not found' }) }
     }
 
     const returnItems = []

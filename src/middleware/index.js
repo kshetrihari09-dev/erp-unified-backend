@@ -17,19 +17,24 @@ async function authenticate(req, res, next) {
     }
     const token   = auth.slice(7)
     const payload = jwt.verify(token, process.env.JWT_SECRET)
-    req.companyId = payload.companyId
 
-    // ── Current user / role — ALWAYS from the database ─────────────────────
-    // The JWT is only used to prove who the caller authenticated as
-    // (userId) — never trusted for authorization data. A JWT can be up to
+    // ── Current user / role / company — ALWAYS from the database ───────────
+    // The JWT only proves who the caller authenticated as (userId) — it is
+    // never trusted for authorization data. A JWT can be up to
     // JWT_EXPIRES_IN old (default 8h), and in that window an owner/admin
-    // could have deactivated the account, demoted the role, or revoked
-    // company access. Re-resolving from the DB on every request is what
-    // makes that change take effect immediately instead of only at next
-    // login/refresh — this is also what makes explicit "session
-    // invalidation" after a role change unnecessary: there is no cached
-    // privilege left anywhere for a revoked JWT to smuggle in.
-    const currentUser = await db('users').where({ id: payload.userId }).first('id', 'email', 'role', 'is_active')
+    // could have deactivated the account, demoted the role, or (if this
+    // were a multi-company setup) revoked company access. Re-resolving
+    // from the DB on every request is what makes that change take effect
+    // immediately instead of only at next login/refresh.
+    //
+    // One user belongs to exactly one company (users.company_id) — that
+    // column, read fresh here, is the sole source of truth for req.companyId.
+    // We deliberately ignore payload.companyId: even though it was itself
+    // set server-side at login, re-deriving it from the user row on every
+    // request means a revoked/disabled account loses access this same
+    // request, with nothing cached anywhere that a still-valid JWT could
+    // use to smuggle in stale company access.
+    const currentUser = await db('users').where({ id: payload.userId }).first('id', 'email', 'role', 'company_id', 'is_active')
     if (!currentUser) {
       return res.status(401).json({ success: false, code: 'USER_NOT_FOUND', message: 'Account not found.' })
     }
@@ -37,21 +42,7 @@ async function authenticate(req, res, next) {
       return res.status(403).json({ success: false, code: 'ACCOUNT_DISABLED', message: 'This account has been disabled.' })
     }
     req.user = { id: currentUser.id, email: currentUser.email, role: currentUser.role }
-
-    // ── Multi-company membership check ─────────────────────────────────────
-    // The JWT already carries the active companyId, but we re-verify on
-    // every request (not just at switch time) that this user still has a
-    // live membership to that company. This closes the gap where access to
-    // a company is revoked mid-session but an existing token would
-    // otherwise keep working until it expires — the exact scenario the
-    // "company switching must not allow access to another company's data"
-    // requirement guards against.
-    const membership = await db('user_companies')
-      .where({ user_id: req.user.id, company_id: req.companyId })
-      .first('id')
-    if (!membership) {
-      return res.status(403).json({ success: false, code: 'COMPANY_ACCESS_REVOKED', message: 'You no longer have access to this company. Please switch companies or log in again.' })
-    }
+    req.companyId = currentUser.company_id
 
     next()
   } catch (err) {

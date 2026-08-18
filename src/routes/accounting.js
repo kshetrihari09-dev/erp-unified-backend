@@ -126,6 +126,10 @@ router.post('/accounts', requireRole('owner','admin','accountant'), async (req, 
     if (!code || !name || !type) throw new AppError('code, name, type are required', 400)
     const exists = await db('accounts').where({ company_id: req.companyId, code }).first()
     if (exists) throw new AppError(`Account code ${code} already exists`, 409)
+    if (parent_id) {
+      const parent = await db('accounts').where({ id: parent_id, company_id: req.companyId }).first()
+      if (!parent) throw new AppError('Parent account not found', 404)
+    }
     const [account] = await db('accounts').insert({
       company_id:     req.companyId, code, name, type,
       sub_type:       sub_type || null,

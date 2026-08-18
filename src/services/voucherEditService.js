@@ -97,6 +97,14 @@ class VoucherEditService {
       throw new AppError('Only posted vouchers go through this edit workflow (drafts can be edited directly)', 400)
     }
 
+    // Validate the new party (if one was given) belongs to this company —
+    // prevents a cross-company party_id being attached during an edit and
+    // later leaking that party's PII through joins that trust it.
+    if (partyId) {
+      const party = await db('parties').where({ id: partyId, company_id: companyId }).first()
+      if (!party) throw new AppError('Party not found', 404)
+    }
+
     const newDate = voucherDate || voucher.voucher_date
 
     // Respect existing period locks — same DB function the rest of the
@@ -194,6 +202,10 @@ class VoucherEditService {
         for (const [i, line] of lines.entries()) {
           const account = await trx('accounts').where({ id: line.account_id, company_id: companyId }).first()
           if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
+          if (line.party_id) {
+            const lineParty = await trx('parties').where({ id: line.party_id, company_id: companyId }).first()
+            if (!lineParty) throw new AppError(`Party not found: ${line.party_id}`, 404)
+          }
           await trx('voucher_lines').insert({
             voucher_id:  anchor.id,
             account_id:  line.account_id,
@@ -230,6 +242,10 @@ class VoucherEditService {
       for (const [i, line] of lines.entries()) {
         const account = await trx('accounts').where({ id: line.account_id, company_id: companyId }).first()
         if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
+        if (line.party_id) {
+          const lineParty = await trx('parties').where({ id: line.party_id, company_id: companyId }).first()
+          if (!lineParty) throw new AppError(`Party not found: ${line.party_id}`, 404)
+        }
         await trx('voucher_lines').insert({
           voucher_id:  voucherId,
           account_id:  line.account_id,

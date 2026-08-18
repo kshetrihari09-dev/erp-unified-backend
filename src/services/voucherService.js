@@ -84,6 +84,13 @@ class VoucherService {
       )
       const voucherNo = voucherNoResult.rows[0].voucher_no
 
+      // Validate the voucher-level party the same way — see the per-line
+      // check below for why.
+      if (partyId) {
+        const party = await trx('parties').where({ id: partyId, company_id: companyId }).first()
+        if (!party) throw new AppError('Party not found', 404)
+      }
+
       // Insert voucher
       const [voucher] = await trx('vouchers').insert({
         company_id:    companyId,
@@ -111,6 +118,17 @@ class VoucherService {
           .where({ id: line.account_id, company_id: companyId })
           .first()
         if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
+
+        // Validate party belongs to this company — never trust a client-
+        // supplied party_id at face value. Without this, a cross-company
+        // party_id attached here would later leak that party's name/phone/
+        // address/PAN through any report that joins voucher_lines→parties
+        // (those joins reasonably assume party_id here was already
+        // company-checked, same as account_id above).
+        if (line.party_id) {
+          const lineParty = await trx('parties').where({ id: line.party_id, company_id: companyId }).first()
+          if (!lineParty) throw new AppError(`Party not found: ${line.party_id}`, 404)
+        }
 
         await trx('voucher_lines').insert({
           voucher_id:  voucher.id,
@@ -313,6 +331,15 @@ class VoucherService {
     )
     const voucherNo = voucherNoResult.rows[0].voucher_no
 
+    // Validate party belongs to this company — see VoucherService.create()
+    // for why (cross-company party_id would otherwise leak that party's
+    // PII through any join that trusts party_id here is already company-
+    // checked).
+    if (partyId) {
+      const party = await trx('parties').where({ id: partyId, company_id: companyId }).first()
+      if (!party) throw new AppError('Party not found', 404)
+    }
+
     const [voucher] = await trx('vouchers').insert({
       company_id:    companyId,
       period_id:     resolvedPeriodId,
@@ -337,6 +364,11 @@ class VoucherService {
         .where({ id: line.account_id, company_id: companyId })
         .first()
       if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
+
+      if (line.party_id) {
+        const lineParty = await trx('parties').where({ id: line.party_id, company_id: companyId }).first()
+        if (!lineParty) throw new AppError(`Party not found: ${line.party_id}`, 404)
+      }
 
       await trx('voucher_lines').insert({
         voucher_id:  voucher.id,

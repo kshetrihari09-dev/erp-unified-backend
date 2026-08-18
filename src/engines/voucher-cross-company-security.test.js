@@ -115,6 +115,7 @@ function makeTrx(state) {
     const ref = { get rows() { return state[table] }, set rows(v) { state[table] = v } }
     return makeQB(ref)
   }
+  trx._state = state
   trx.raw = async (sql) => {
     if (sql.includes('is_period_locked'))            return { rows: [{ locked: false }] }
     if (sql.includes('next_voucher_number'))          return { rows: [{ voucher_no: 'REV-2082-00001' }] }
@@ -132,7 +133,23 @@ function makeTrx(state) {
 let mockCurrentTrx = null
 jest.mock('../db/knex', () => {
   const fn = (...args) => mockCurrentTrx(...args)
-  fn.transaction = async (fn2) => fn2(mockCurrentTrx)
+  // Mirrors real Postgres semantics: if the callback throws, every mutation
+  // made through `trx` inside it is rolled back — a partially-applied write
+  // (e.g. a voucher inserted before a later line's party_id check fails)
+  // must never survive. Snapshot state before running, restore it on throw.
+  fn.transaction = async (fn2) => {
+    const state = mockCurrentTrx._state
+    const snapshot = state ? JSON.parse(JSON.stringify(state)) : null
+    try {
+      return await fn2(mockCurrentTrx)
+    } catch (err) {
+      if (state && snapshot) {
+        for (const key of Object.keys(state)) delete state[key]
+        Object.assign(state, snapshot)
+      }
+      throw err
+    }
+  }
   fn.setRLSContext = async (trx, companyId) => trx.raw(`SET LOCAL app.current_company_id = '${companyId}'`)
   return fn
 })
@@ -158,9 +175,15 @@ const ACCOUNTS = [
   { id: 'b-acc-rev', company_id: COMPANY_B, code: '4000', name: 'Rev B',  type: 'income',  sub_type: 'sales', is_group: false, is_active: true },
 ]
 
+const PARTIES = [
+  { id: 'a-party-1', company_id: COMPANY_A, name: 'Customer A', type: 'customer' },
+  { id: 'b-party-1', company_id: COMPANY_B, name: 'Customer B (private)', type: 'customer', phone: '9999999999', pan_no: 'B-PAN-SECRET' },
+]
+
 function baseState() {
   return {
     accounts:         [...ACCOUNTS],
+    parties:          [...PARTIES],
     vouchers:         [],
     voucher_lines:    [],
     journal_entries:  [],
@@ -205,6 +228,7 @@ function addCompanyAVoucher(state, override = {}) {
 const PostingEngine     = require('./postingEngine')
 const VoucherService     = require('../services/voucherService')
 const VoucherEditService = require('../services/voucherEditService')
+const db                 = require('../db/knex')
 
 function setup() {
   const s = baseState()
@@ -458,3 +482,71 @@ describe('Cross-company IDOR — step-up token binding', () => {
     expect(okForReverse).toBe(false)
   })
 })
+
+// ─── H. Cross-company party_id / product_id injection ────────────────────────
+//
+// Separate from the voucher-ownership IDOR above: several write endpoints
+// accepted a client-supplied party_id/product_id and stored it on THIS
+// company's own record with no check it actually belongs to this company.
+// Read-side joins elsewhere (GET /sales, /purchases, reports, etc.) then
+// trust that id is already company-scoped and join straight to the
+// parties/products table — so a smuggled-in foreign id would leak that
+// party's name/phone/PAN or that product's details back to the attacker.
+// VoucherService.createInTransaction() is the shared path used by
+// receipts/payments/contra/returns, so it's the most representative place
+// to verify the fix.
+
+describe('Cross-company party_id injection — VoucherService.createInTransaction()', () => {
+
+  function balancedLines(csh, rev, partyId) {
+    return [
+      { account_id: csh, debit: 500, credit: 0 },
+      { account_id: rev, debit: 0, credit: 500, party_id: partyId },
+    ]
+  }
+
+  test('H: Company A cannot attach a Company B party_id to a new voucher', async () => {
+    const s = setup()
+    await expect(VoucherService.createInTransaction({
+      trx: mockCurrentTrx, companyId: COMPANY_A, userId: USER_A,
+      voucherType: 'RECEIPT', voucherDate: '2024-01-15',
+      partyId: 'b-party-1', // Company B's party — must be rejected
+      lines: balancedLines('a-acc-csh', 'a-acc-rev'),
+    }, null)).rejects.toMatchObject({ status: 404 })
+
+    // No voucher, no lines — the injection attempt left no trace.
+    expect(s.vouchers).toHaveLength(0)
+    expect(s.voucher_lines).toHaveLength(0)
+  })
+
+  test('H: Company A cannot attach a Company B party_id on a single LINE either', async () => {
+    const s = setup()
+    // Wrapped in db.transaction(), exactly like the real callers
+    // (accountingIntegration.js, the /contra route) always do — this is
+    // what guarantees the atomicity being asserted below.
+    await expect(db.transaction(trx => VoucherService.createInTransaction({
+      trx, companyId: COMPANY_A, userId: USER_A,
+      voucherType: 'RECEIPT', voucherDate: '2024-01-15',
+      lines: balancedLines('a-acc-csh', 'a-acc-rev', 'b-party-1'), // line-level party_id
+    }, null))).rejects.toMatchObject({ status: 404 })
+
+    // Transaction rolled back — the voucher row inserted before the bad
+    // line was reached does not survive.
+    expect(s.vouchers).toHaveLength(0)
+  })
+
+  test('E: Company A CAN attach its own Company A party_id (no regression)', async () => {
+    const s = setup()
+    const result = await VoucherService.createInTransaction({
+      trx: mockCurrentTrx, companyId: COMPANY_A, userId: USER_A,
+      voucherType: 'RECEIPT', voucherDate: '2024-01-15',
+      partyId: 'a-party-1',
+      lines: balancedLines('a-acc-csh', 'a-acc-rev'),
+    }, null)
+
+    expect(result.voucher).toBeDefined()
+    expect(s.vouchers).toHaveLength(1)
+    expect(s.vouchers[0].party_id).toBe('a-party-1')
+  })
+})
+
