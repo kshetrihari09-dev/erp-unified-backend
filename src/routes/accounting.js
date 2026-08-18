@@ -71,7 +71,7 @@ router.post('/vouchers/:id/reverse', requirePermission('reverse_entries'), async
   } catch (err) { next(err) }
 })
 
-router.post('/vouchers/:id/cancel', async (req, res, next) => {
+router.post('/vouchers/:id/cancel', requirePermission('cancel_vouchers'), async (req, res, next) => {
   try {
     const { reason } = req.body
     if (!reason?.trim()) throw new AppError('Cancellation reason is required', 400)

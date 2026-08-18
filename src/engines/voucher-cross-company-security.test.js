@@ -341,6 +341,74 @@ describe('Cross-company IDOR — VoucherService.cancel()', () => {
 
 })
 
+// ─── C2. POST /vouchers/:id/cancel — server-side permission gate ────────────
+//
+// VoucherService.cancel() enforces company ownership, but that alone doesn't
+// stop ANY authenticated member of the right company from cancelling
+// vouchers — the route must also require a permission, same as /post
+// (post_vouchers) and /reverse (reverse_entries) already do. These tests
+// exercise requirePermission('cancel_vouchers') exactly as Express calls it.
+
+describe('Cancellation authorization — requirePermission(\'cancel_vouchers\')', () => {
+  const { requirePermission } = require('../middleware/index')
+
+  function mockRes() {
+    const res = {}
+    res.status = jest.fn(() => res)
+    res.json   = jest.fn(() => res)
+    return res
+  }
+
+  test('user WITH can_post_vouchers passes the cancel_vouchers gate', async () => {
+    const s = setup()
+    s.users = [{ id: USER_A, can_post_vouchers: true }]
+    const req = { user: { id: USER_A }, companyId: COMPANY_A }
+    const res = mockRes()
+    const next = jest.fn()
+
+    await requirePermission('cancel_vouchers')(req, res, next)
+
+    expect(next).toHaveBeenCalled()
+    expect(res.status).not.toHaveBeenCalled()
+  })
+
+  test('user WITHOUT can_post_vouchers is rejected with 403 and never reaches the service (no mutation)', async () => {
+    const s = setup()
+    addCompanyAVoucher(s) // DRAFT — would be cancellable if the gate were skipped
+    s.users = [{ id: USER_A, can_post_vouchers: false }]
+    const req = { user: { id: USER_A }, companyId: COMPANY_A }
+    const res = mockRes()
+    const next = jest.fn()
+
+    await requirePermission('cancel_vouchers')(req, res, next)
+
+    expect(next).not.toHaveBeenCalled()
+    expect(res.status).toHaveBeenCalledWith(403)
+    // The gate short-circuits before VoucherService.cancel() is ever
+    // invoked, so the voucher this unauthorized user targeted is untouched.
+    expect(s.vouchers.find(v => v.id === 'voucher-belongs-to-A').status).toBe('DRAFT')
+  })
+
+  test('a full unauthorized request (no permission + wrong company) still yields zero mutation end-to-end', async () => {
+    const s = setup()
+    addCompanyBVoucher(s) // DRAFT, belongs to Company B
+    s.users = [{ id: USER_A, can_post_vouchers: false }]
+    const req = { user: { id: USER_A }, companyId: COMPANY_A }
+    const res = mockRes()
+    const next = jest.fn()
+
+    await requirePermission('cancel_vouchers')(req, res, next)
+    expect(next).not.toHaveBeenCalled() // permission gate stops it first
+
+    // Even if it had, VoucherService.cancel() would independently stop it
+    // on company ownership — belt-and-suspenders, verified directly:
+    await expect(VoucherService.cancel('voucher-belongs-to-B', COMPANY_A, USER_A, 'x', null))
+      .rejects.toMatchObject({ status: 404 })
+
+    expect(s.vouchers.find(v => v.id === 'voucher-belongs-to-B').status).toBe('DRAFT')
+  })
+})
+
 // ─── D. UPDATE / EDIT ────────────────────────────────────────────────────────
 
 describe('Cross-company IDOR — VoucherEditService.edit()', () => {

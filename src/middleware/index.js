@@ -156,6 +156,12 @@ function requirePermission(permission) {
     // entry under the hood, so it demands the same trust level as reversing
     // one outright — reuse the existing can_reverse_entries flag.
     edit_posted_vouchers: u => u.can_reverse_entries,
+    // Cancelling only ever applies to a DRAFT (not-yet-posted) voucher — it
+    // never touches the ledger. That's the same trust tier as creating/
+    // posting one in the first place, so it reuses can_post_vouchers rather
+    // than can_reverse_entries (which gates undoing an already-POSTED,
+    // immutable ledger entry — a materially more sensitive action).
+    cancel_vouchers: u => u.can_post_vouchers,
   }
   return async (req, res, next) => {
     try {
