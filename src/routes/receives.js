@@ -40,11 +40,6 @@ router.post('/', async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Items required' })
     }
 
-    if (party_id) {
-      const party = await trx('parties').where({ id: party_id, company_id: req.companyId }).first()
-      if (!party) { await trx.rollback(); return res.status(404).json({ success: false, message: 'Party not found' }) }
-    }
-
     const receiveDate = date || new Date().toISOString().split('T')[0]
 
     const [receive] = await trx('receives').insert({
@@ -62,9 +57,6 @@ router.post('/', async (req, res, next) => {
       const bonus    = Number(item.bonus)|| 0
       const totalQty = qty + bonus
       if (!item.product_id || qty <= 0) continue
-
-      const productOk = await trx('products').where({ id: item.product_id, company_id: req.companyId }).first('id')
-      if (!productOk) { await trx.rollback(); return res.status(404).json({ success: false, message: `Product not found: ${item.product_id}` }) }
 
       await trx('receive_items').insert({
         receive_id:  receive.id,

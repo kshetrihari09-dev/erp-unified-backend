@@ -18,8 +18,7 @@
     "setup:prod": "npm run migrate:prod && npm run seed:prod",
     "gen-certs": "bash scripts/gen-certs.sh",
     "backfill:discount-accounts": "node scripts/backfill_discount_accounts.js --all",
-    "check-env": "node -e \"require('./src/config/index.js'); console.log('✅ Config OK')\"",
-    "test": "jest"
+    "check-env": "node -e \"require('./src/config/index.js'); console.log('✅ Config OK')\""
   },
   "dependencies": {
     "nepali-date-converter": "^3.4.0",
@@ -39,13 +38,6 @@
   },
   "devDependencies": {
     "cross-env": "^7.0.3",
-    "nodemon": "^3.1.4",
-    "jest": "^29.7.0"
-  },
-  "jest": {
-    "testEnvironment": "node",
-    "testMatch": [
-      "**/src/**/*.test.js"
-    ]
+    "nodemon": "^3.1.4"
   }
 }

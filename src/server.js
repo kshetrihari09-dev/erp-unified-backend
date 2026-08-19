@@ -67,6 +67,7 @@ const cloudStorageOAuthRouter  = require('./routes/cloudStorage').publicRouter
 // conflict review (additive only — does not touch any existing route).
 const devicesRouter       = require('./routes/devices')
 const devicesPairingRouter = require('./routes/devices').publicRouter
+const { startLanDiscoveryResponder } = require('./services/lanDiscovery')
 
 
 const { errorHandler } = require('./middleware/index')
@@ -192,6 +193,25 @@ app.get('/health', async (req, res) => {
     res.status(503).json({ status: 'error' })
   }
 })
+
+// ── 9a. LAN discovery info (public, unauthenticated by necessity — a device
+// asking "are you a Byapar server?" has, by definition, not logged in yet).
+// Deliberately minimal: no company name, no user/device counts, nothing
+// that identifies WHO this server belongs to or any credential — matches
+// requirement #9 ("LAN discovery only identifies the server", "do not
+// expose passwords, JWT secrets, database credentials, or sensitive
+// information through LAN discovery"). This is what both the UDP
+// responder (services/lanDiscovery.js) and the frontend's HTTP subnet
+// sweep return/expect — see that file for why there are two mechanisms.
+function discoveryInfo() {
+  return {
+    name:    process.env.SERVER_DISPLAY_NAME || 'Byapar ERP Server',
+    version: '2.2.0',
+    port:    config.server.port,
+    https:   config.server.https,
+  }
+}
+app.get(`${'/api/v1'}/discovery/info`, (req, res) => res.json({ success: true, data: discoveryInfo() }))
 
 // ── 9b. Diagnostics (authenticated — for ops/support, not monitoring tools) ──
 // Everything /health used to expose publicly now lives here instead,
@@ -333,6 +353,13 @@ async function start() {
       console.log(`   Health: ${proto}://localhost:${PORT}/health`)
       console.log(`   HTTPS:  ${config.server.https ? '✓ enabled' : '✗ disabled (HTTP)'}`)
       console.log(`   Env:    ${config.env}\n`)
+
+      // Best-effort — see services/lanDiscovery.js for why this can't be
+      // the only discovery mechanism (browsers can't send raw UDP), and
+      // why a failure here must never affect the HTTP server above.
+      startLanDiscoveryResponder({
+        getInfo: () => ({ ...discoveryInfo(), host: config.server.lan.ip }),
+      })
     })
 
     // ── Automatic backups (Settings → Backup & Cloud) ───────────────────────

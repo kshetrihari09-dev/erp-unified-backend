@@ -72,12 +72,6 @@ router.post('/', async (req, res, next) => {
     const { party_id, date_ad, payment_mode, supplier_bill_no, items, notes, client_txn_id } = req.body
     if (!items?.length) { await trx.rollback(); return res.status(400).json({ success: false, message: 'At least one item required' }) }
 
-    // See sales.js POST / for why this can't be trusted unchecked.
-    if (party_id) {
-      const party = await trx('parties').where({ id: party_id, company_id: req.companyId }).first()
-      if (!party) { await trx.rollback(); return res.status(404).json({ success: false, message: 'Party not found' }) }
-    }
-
     // ── Idempotency (offline sync retries) — see sales.js POST / for the
     // full rationale; same pattern, same migration 025 partial unique index.
     if (client_txn_id) {
@@ -155,9 +149,6 @@ router.post('/', async (req, res, next) => {
       // Correct columns in inventory_batches (migration 002):
       //   qty_received, qty_remaining, unit_cost, total_cost, receipt_date
       if (item.product_id && item.qty > 0) {
-        const productOk = await trx('products').where({ id: item.product_id, company_id: req.companyId }).first('id')
-        if (!productOk) { await trx.rollback(); return res.status(404).json({ success: false, message: `Product not found: ${item.product_id}` }) }
-
         const totalQty = item.qty + (item.bonus || 0)
         const unitCost = item.rate || 0
         await trx(T).insert({

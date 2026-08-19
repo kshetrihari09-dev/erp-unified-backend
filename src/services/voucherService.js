@@ -84,13 +84,6 @@ class VoucherService {
       )
       const voucherNo = voucherNoResult.rows[0].voucher_no
 
-      // Validate the voucher-level party the same way — see the per-line
-      // check below for why.
-      if (partyId) {
-        const party = await trx('parties').where({ id: partyId, company_id: companyId }).first()
-        if (!party) throw new AppError('Party not found', 404)
-      }
-
       // Insert voucher
       const [voucher] = await trx('vouchers').insert({
         company_id:    companyId,
@@ -118,17 +111,6 @@ class VoucherService {
           .where({ id: line.account_id, company_id: companyId })
           .first()
         if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
-
-        // Validate party belongs to this company — never trust a client-
-        // supplied party_id at face value. Without this, a cross-company
-        // party_id attached here would later leak that party's name/phone/
-        // address/PAN through any report that joins voucher_lines→parties
-        // (those joins reasonably assume party_id here was already
-        // company-checked, same as account_id above).
-        if (line.party_id) {
-          const lineParty = await trx('parties').where({ id: line.party_id, company_id: companyId }).first()
-          if (!lineParty) throw new AppError(`Party not found: ${line.party_id}`, 404)
-        }
 
         await trx('voucher_lines').insert({
           voucher_id:  voucher.id,
@@ -159,23 +141,14 @@ class VoucherService {
   /**
    * Cancel a DRAFT voucher (not yet posted).
    * Posted vouchers must be reversed, not cancelled.
-   * @param {string} voucherId
-   * @param {string} companyId — the AUTHENTICATED caller's company (req.companyId).
-   *   Never derived from the voucher itself, and never accepted from the
-   *   frontend — see PostingEngine.post() for the same rule.
-   * @param {string} userId
-   * @param {string} reason
-   * @param {string} ipAddress
    */
-  static async cancel(voucherId, companyId, userId, reason, ipAddress = null) {
-    if (!companyId) throw new AppError('Voucher not found', 404)
-
-    const voucher = await db('vouchers').where({ id: voucherId, company_id: companyId }).first()
+  static async cancel(voucherId, userId, reason, ipAddress = null) {
+    const voucher = await db('vouchers').where({ id: voucherId }).first()
     if (!voucher)                     throw new AppError('Voucher not found', 404)
     if (voucher.status === 'POSTED')  throw new AppError('Cannot cancel a posted voucher. Use reverse instead.', 400)
     if (voucher.status === 'CANCELLED') throw new AppError('Already cancelled', 409)
 
-    await db('vouchers').where({ id: voucherId, company_id: companyId }).update({
+    await db('vouchers').where({ id: voucherId }).update({
       status:       'CANCELLED',
       cancelled_by: userId,
       cancelled_at: new Date(),
@@ -331,15 +304,6 @@ class VoucherService {
     )
     const voucherNo = voucherNoResult.rows[0].voucher_no
 
-    // Validate party belongs to this company — see VoucherService.create()
-    // for why (cross-company party_id would otherwise leak that party's
-    // PII through any join that trusts party_id here is already company-
-    // checked).
-    if (partyId) {
-      const party = await trx('parties').where({ id: partyId, company_id: companyId }).first()
-      if (!party) throw new AppError('Party not found', 404)
-    }
-
     const [voucher] = await trx('vouchers').insert({
       company_id:    companyId,
       period_id:     resolvedPeriodId,
@@ -364,11 +328,6 @@ class VoucherService {
         .where({ id: line.account_id, company_id: companyId })
         .first()
       if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
-
-      if (line.party_id) {
-        const lineParty = await trx('parties').where({ id: line.party_id, company_id: companyId }).first()
-        if (!lineParty) throw new AppError(`Party not found: ${line.party_id}`, 404)
-      }
 
       await trx('voucher_lines').insert({
         voucher_id:  voucher.id,

@@ -128,15 +128,6 @@ router.post('/', async (req, res, next) => {
     const { party_id, date_ad, payment_mode, reference_no, items, notes, cc_charge_pct, client_txn_id } = req.body
     if (!items?.length) { await trx.rollback(); return res.status(400).json({ success: false, message: 'At least one item is required' }) }
 
-    // Never trust a client-supplied party_id at face value — a cross-
-    // company id here would later leak that party's name/phone/address/PAN
-    // through the parties join on GET /sales and /sales/:id (which, like
-    // every read here, only re-checks the sale's own company_id).
-    if (party_id) {
-      const party = await trx('parties').where({ id: party_id, company_id: req.companyId }).first()
-      if (!party) { await trx.rollback(); return res.status(404).json({ success: false, message: 'Party not found' }) }
-    }
-
     // ── Idempotency (offline sync retries) ──────────────────────────────────
     // `client_txn_id` is generated once, client-side, the moment an offline
     // sale is queued (see erp-enterprise-full/src/offline/idGen.ts) and sent

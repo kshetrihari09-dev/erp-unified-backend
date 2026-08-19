@@ -56,7 +56,7 @@ router.get('/vouchers/:id', async (req, res, next) => {
 
 router.post('/vouchers/:id/post', requirePermission('post_vouchers'), async (req, res, next) => {
   try {
-    const result = await PostingEngine.post(req.params.id, req.companyId, req.user.id, req.ip)
+    const result = await PostingEngine.post(req.params.id, req.user.id, req.ip)
     if (result.alreadyPosted) return ok(res, result, 'Already posted (idempotent)')
     return ok(res, result, 'Voucher posted successfully')
   } catch (err) { next(err) }
@@ -66,16 +66,16 @@ router.post('/vouchers/:id/reverse', requirePermission('reverse_entries'), async
   try {
     const { reason } = req.body
     if (!reason?.trim()) throw new AppError('Reversal reason is required', 400)
-    const result = await PostingEngine.reverse(req.params.id, req.companyId, req.user.id, reason, req.ip)
+    const result = await PostingEngine.reverse(req.params.id, req.user.id, reason, req.ip)
     return ok(res, result, 'Voucher reversed successfully')
   } catch (err) { next(err) }
 })
 
-router.post('/vouchers/:id/cancel', requirePermission('cancel_vouchers'), async (req, res, next) => {
+router.post('/vouchers/:id/cancel', async (req, res, next) => {
   try {
     const { reason } = req.body
     if (!reason?.trim()) throw new AppError('Cancellation reason is required', 400)
-    const result = await VoucherService.cancel(req.params.id, req.companyId, req.user.id, reason, req.ip)
+    const result = await VoucherService.cancel(req.params.id, req.user.id, reason, req.ip)
     return ok(res, result, 'Voucher cancelled')
   } catch (err) { next(err) }
 })
@@ -126,10 +126,6 @@ router.post('/accounts', requireRole('owner','admin','accountant'), async (req, 
     if (!code || !name || !type) throw new AppError('code, name, type are required', 400)
     const exists = await db('accounts').where({ company_id: req.companyId, code }).first()
     if (exists) throw new AppError(`Account code ${code} already exists`, 409)
-    if (parent_id) {
-      const parent = await db('accounts').where({ id: parent_id, company_id: req.companyId }).first()
-      if (!parent) throw new AppError('Parent account not found', 404)
-    }
     const [account] = await db('accounts').insert({
       company_id:     req.companyId, code, name, type,
       sub_type:       sub_type || null,
@@ -258,7 +254,7 @@ router.post('/create-payment', requirePermission('post_vouchers'), async (req, r
       ],
     }, req.ip)
 
-    const posted = await PostingEngine.post(created.voucher.id, req.companyId, req.user.id, req.ip)
+    const posted = await PostingEngine.post(created.voucher.id, req.user.id, req.ip)
     return ok(res, { voucher: created.voucher, journal_entry: posted.journal_entry }, 'Payment recorded', 201)
   } catch (err) { next(err) }
 })

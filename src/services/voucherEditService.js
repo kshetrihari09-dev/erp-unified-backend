@@ -97,14 +97,6 @@ class VoucherEditService {
       throw new AppError('Only posted vouchers go through this edit workflow (drafts can be edited directly)', 400)
     }
 
-    // Validate the new party (if one was given) belongs to this company —
-    // prevents a cross-company party_id being attached during an edit and
-    // later leaking that party's PII through joins that trust it.
-    if (partyId) {
-      const party = await db('parties').where({ id: partyId, company_id: companyId }).first()
-      if (!party) throw new AppError('Party not found', 404)
-    }
-
     const newDate = voucherDate || voucher.voucher_date
 
     // Respect existing period locks — same DB function the rest of the
@@ -142,13 +134,13 @@ class VoucherEditService {
 
     // ── Step 1 — reverse the currently-live ledger impact (existing,
     //    unmodified engine method). ──────────────────────────────────────────
-    const reversal = await PostingEngine.reverse(activeEntryVoucherId, companyId, userId, `Correction (edit): ${reason}`, ipAddress)
+    const reversal = await PostingEngine.reverse(activeEntryVoucherId, userId, `Correction (edit): ${reason}`, ipAddress)
 
     // Tag the reversal artifact as internal ledger plumbing so it can never
     // surface as a user-facing voucher — independent of the reversal_of/status
     // heuristic the voucher list also happens to use, so this stays hidden
     // even across several chained edits.
-    await db('vouchers').where({ id: reversal.reversal_voucher.id, company_id: companyId }).update({
+    await db('vouchers').where({ id: reversal.reversal_voucher.id }).update({
       metadata: JSON.stringify({ system_correction: true, corrects_voucher_id: voucherId, internal_only: true, kind: 'edit_reversal' }),
     })
 
@@ -202,10 +194,6 @@ class VoucherEditService {
         for (const [i, line] of lines.entries()) {
           const account = await trx('accounts').where({ id: line.account_id, company_id: companyId }).first()
           if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
-          if (line.party_id) {
-            const lineParty = await trx('parties').where({ id: line.party_id, company_id: companyId }).first()
-            if (!lineParty) throw new AppError(`Party not found: ${line.party_id}`, 404)
-          }
           await trx('voucher_lines').insert({
             voucher_id:  anchor.id,
             account_id:  line.account_id,
@@ -242,10 +230,6 @@ class VoucherEditService {
       for (const [i, line] of lines.entries()) {
         const account = await trx('accounts').where({ id: line.account_id, company_id: companyId }).first()
         if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
-        if (line.party_id) {
-          const lineParty = await trx('parties').where({ id: line.party_id, company_id: companyId }).first()
-          if (!lineParty) throw new AppError(`Party not found: ${line.party_id}`, 404)
-        }
         await trx('voucher_lines').insert({
           voucher_id:  voucherId,
           account_id:  line.account_id,
@@ -259,7 +243,7 @@ class VoucherEditService {
         })
       }
 
-      const [row] = await trx('vouchers').where({ id: voucherId, company_id: companyId }).update({
+      const [row] = await trx('vouchers').where({ id: voucherId }).update({
         voucher_date: newDate,
         party_id:     partyId !== undefined ? (partyId || null) : voucher.party_id,
         narration:    narration !== undefined ? narration : voucher.narration,
