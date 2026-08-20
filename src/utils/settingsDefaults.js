@@ -58,7 +58,6 @@ const DEFAULT_SETTINGS = {
     // (see accounting.js PUT /vouchers/:id/edit + verify-password), so
     // it can't be weakened from here.
     paymentModeEdit:   false,
-    saleDateEdit:      false,
     invoiceCancel:     false,
     fiscalYearChange:  false,
     companySettings:   false,
