@@ -524,4 +524,96 @@ router.put('/:id/payment-mode', requireSensitiveConfirm('paymentModeEdit'), asyn
   } catch (err) { next(err) }
 })
 
+/* ── PUT /sales/:id/date ────────────────────────────────────────────────────
+ * Sales List inline edit — lets an already-saved invoice's date be
+ * corrected (e.g. a cashier picked the wrong day) without touching
+ * anything else on the sale.
+ *
+ *   - Updates ONLY `date_ad` (+ its derived `date_bs`). Totals, items,
+ *     stock, payment_mode, vouchers/accounting postings are all left
+ *     exactly as they were — same "isolated column edit" shape as
+ *     PUT /:id/payment-mode above.
+ *   - Restricted to 'active' sales, same rule as payment-mode edit and
+ *     cancel.
+ *   - Gated by requireSensitiveConfirm('saleDateEdit') — opt-in per
+ *     company, off by default, same mechanism as paymentModeEdit.
+ *   - Sequence-preserving: POST /sales only ever checked the new date
+ *     against the single latest invoice, which — applied invoice by
+ *     invoice at creation time — keeps date_ad non-decreasing in
+ *     creation order across the whole company. An edit must not break
+ *     that invariant for invoices created before/after this one, so the
+ *     new date is bounded by the immediate neighbors (by created_at,
+ *     which is what creation order actually means — invoice_no is
+ *     derived from it) rather than only checked against the global max.
+ *     A sale with no earlier/later active neighbor simply has no bound
+ *     on that side.
+ */
+router.put('/:id/date', requireSensitiveConfirm('saleDateEdit'), async (req, res, next) => {
+  try {
+    const { date_ad } = req.body
+    if (!date_ad || !/^\d{4}-\d{2}-\d{2}$/.test(date_ad)) {
+      return res.status(400).json({ success: false, message: 'A valid date (YYYY-MM-DD) is required' })
+    }
+
+    const sale = await db('sales').where({ id: req.params.id, company_id: req.companyId }).first()
+    if (!sale) return res.status(404).json({ success: false, message: 'Sale not found' })
+    if (sale.status !== 'active') {
+      return res.status(400).json({ success: false, message: `Cannot change the date on a ${sale.status} invoice.` })
+    }
+
+    const existingDate = String(sale.date_ad).slice(0, 10)
+    if (existingDate === date_ad) {
+      return successResponse(res, sale, 'Date unchanged')
+    }
+
+    const [prevSale, nextSale] = await Promise.all([
+      db('sales')
+        .where({ company_id: req.companyId, status: 'active' })
+        .where('created_at', '<', sale.created_at)
+        .orderBy('created_at', 'desc')
+        .select('date_ad', 'invoice_no')
+        .first(),
+      db('sales')
+        .where({ company_id: req.companyId, status: 'active' })
+        .where('created_at', '>', sale.created_at)
+        .orderBy('created_at', 'asc')
+        .select('date_ad', 'invoice_no')
+        .first(),
+    ])
+
+    if (prevSale && date_ad < String(prevSale.date_ad).slice(0, 10)) {
+      return res.status(400).json({
+        success: false,
+        message: `Date cannot be earlier than the previous invoice date.`,
+        detail:  `Invoice ${prevSale.invoice_no} is dated ${String(prevSale.date_ad).slice(0, 10)}. This entry must be on or after that date.`,
+        last_invoice_date: prevSale.date_ad,
+        last_invoice_no:   prevSale.invoice_no,
+      })
+    }
+    if (nextSale && date_ad > String(nextSale.date_ad).slice(0, 10)) {
+      return res.status(400).json({
+        success: false,
+        message: `Date cannot be later than the next invoice date.`,
+        detail:  `Invoice ${nextSale.invoice_no} is dated ${String(nextSale.date_ad).slice(0, 10)}. This entry must be on or before that date.`,
+        next_invoice_date: nextSale.date_ad,
+        next_invoice_no:   nextSale.invoice_no,
+      })
+    }
+
+    const date_bs = adToBS(date_ad) || sale.date_bs
+
+    const [updated] = await db('sales')
+      .where({ id: req.params.id, company_id: req.companyId })
+      .update({ date_ad, date_bs, updated_at: new Date() })
+      .returning('*')
+
+    auditLog(
+      req.companyId, req.user.id, 'UPDATE', 'sales', req.params.id,
+      { field: 'date_ad', from: existingDate, to: date_ad },
+      req.ip,
+    )
+    return successResponse(res, updated, 'Invoice date updated')
+  } catch (err) { next(err) }
+})
+
 module.exports = router
