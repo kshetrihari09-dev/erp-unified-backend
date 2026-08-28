@@ -69,8 +69,25 @@ router.get('/:id', async (req, res, next) => {
 router.post('/', async (req, res, next) => {
   const trx = await db.transaction()
   try {
-    const { party_id, date_ad, payment_mode, supplier_bill_no, items, notes, client_txn_id } = req.body
+    const { party_id, date_ad, payment_mode, supplier_bill_no, items, notes, client_txn_id, purchase_order_id } = req.body
     if (!items?.length) { await trx.rollback(); return res.status(400).json({ success: false, message: 'At least one item required' }) }
+
+    // ── Optional: this bill fulfils a Purchase Order (see migration 031 /
+    // routes/purchaseOrders.js). Additive — omitting purchase_order_id
+    // behaves exactly as before. Validated up front so a bad/foreign id
+    // fails fast instead of silently posting stock the PO never expected.
+    let linkedOrder = null
+    if (purchase_order_id) {
+      linkedOrder = await trx('purchase_orders').where({ id: purchase_order_id, company_id: req.companyId }).first()
+      if (!linkedOrder) {
+        await trx.rollback()
+        return res.status(404).json({ success: false, message: 'Purchase order not found' })
+      }
+      if (['received', 'cancelled'].includes(linkedOrder.status)) {
+        await trx.rollback()
+        return res.status(400).json({ success: false, message: `This purchase order is already '${linkedOrder.status}' and cannot receive more stock` })
+      }
+    }
 
     // ── Idempotency (offline sync retries) — see sales.js POST / for the
     // full rationale; same pattern, same migration 025 partial unique index.
@@ -138,6 +155,7 @@ router.post('/', async (req, res, next) => {
       payment_mode: payment_mode || 'credit', net_total, round_off, paid_amount, due_amount,
       notes: notes || null, status: 'active',
       client_txn_id: client_txn_id || null, device_id: req.deviceId || null,
+      purchase_order_id: linkedOrder?.id || null,
     }).returning('*')
 
     for (const item of purchaseItems) {
@@ -165,6 +183,44 @@ router.post('/', async (req, res, next) => {
           total_cost:    Math.round(totalQty * unitCost * 100) / 100,
         })
       }
+    }
+
+    // ── Fulfil linked Purchase Order (additive; see migration 031) ──────────
+    // Applies received quantities to the PO's line items (capped at what was
+    // ordered — extra/unordered quantity on the bill doesn't overfill a PO
+    // line, it's simply not counted against it) and rolls the PO status up
+    // to partially_received/received once every line has arrived.
+    if (linkedOrder) {
+      const poItems = await trx('purchase_order_items').where({ purchase_order_id: linkedOrder.id })
+      const poItemsByProduct = {}
+      for (const poi of poItems) {
+        if (!poi.product_id) continue
+        (poItemsByProduct[poi.product_id] ||= []).push(poi)
+      }
+      for (const item of purchaseItems) {
+        if (!item.product_id) continue
+        const candidates = poItemsByProduct[item.product_id] || []
+        let remainingToApply = item.qty
+        for (const poi of candidates) {
+          if (remainingToApply <= 0) break
+          const stillOpen = Number(poi.qty_ordered) - Number(poi.qty_received)
+          if (stillOpen <= 0) continue
+          const applied = Math.min(stillOpen, remainingToApply)
+          await trx('purchase_order_items').where({ id: poi.id }).update({
+            qty_received: Number(poi.qty_received) + applied,
+            updated_at: new Date(),
+          })
+          poi.qty_received = Number(poi.qty_received) + applied // keep local copy in sync for this loop
+          remainingToApply -= applied
+        }
+      }
+      const refreshedItems = await trx('purchase_order_items').where({ purchase_order_id: linkedOrder.id })
+      const fullyReceived = refreshedItems.every(i => Number(i.qty_received) >= Number(i.qty_ordered))
+      const anyReceived   = refreshedItems.some(i => Number(i.qty_received) > 0)
+      await trx('purchase_orders').where({ id: linkedOrder.id }).update({
+        status: fullyReceived ? 'received' : (anyReceived ? 'partially_received' : linkedOrder.status),
+        updated_at: new Date(),
+      })
     }
 
     // ── Accounting Integration ─────────────────────────────────────────────────

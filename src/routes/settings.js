@@ -71,7 +71,9 @@ router.get('/users', requireRole('admin', 'manager'), async (req, res, next) => 
     const [{ count }] = await db('users').where({ company_id: req.companyId }).count('id as count')
     const data = await db('users').where({ company_id: req.companyId }).select(
       'id','name','email','phone','role','is_active','last_login_at','created_at',
-      'can_post_vouchers','can_approve_vouchers','can_lock_periods','can_reverse_entries'
+      'can_post_vouchers','can_approve_vouchers','can_lock_periods','can_reverse_entries',
+      'can_view_purchase_suggestions','can_manage_purchase_suggestions',
+      'can_create_po_from_suggestions','can_configure_purchase_suggestion_settings'
     ).orderBy('name').limit(limit).offset(offset)
     return paginatedResponse(res, { data, total: Number(count), page, limit })
   } catch (err) { next(err) }
@@ -161,7 +163,11 @@ router.put('/users/:id', requireRole('admin'), async (req, res, next) => {
     // middleware/index.js) — surfaced in Settings → Users & Permissions.
     // Admin-only route already (see requireRole('admin') above), but an
     // owner-only target is still off-limits to a non-owner admin.
-    const flagFields = ['can_post_vouchers', 'can_approve_vouchers', 'can_lock_periods', 'can_reverse_entries']
+    const flagFields = [
+      'can_post_vouchers', 'can_approve_vouchers', 'can_lock_periods', 'can_reverse_entries',
+      'can_view_purchase_suggestions', 'can_manage_purchase_suggestions',
+      'can_create_po_from_suggestions', 'can_configure_purchase_suggestion_settings',
+    ]
     if (flagFields.some(f => req.body[f] !== undefined)) {
       if (user.role === 'owner' && req.user.role !== 'owner') {
         return res.status(403).json({ success: false, code: 'TARGET_ROLE_PROTECTED', message: 'The owner account cannot be modified.' })
@@ -175,7 +181,9 @@ router.put('/users/:id', requireRole('admin'), async (req, res, next) => {
       updates.password_hash = await bcrypt.hash(req.body.password, 12)
     }
     const [updated] = await db('users').where({ id: req.params.id }).update({ ...updates, updated_at: new Date() }).returning(
-      'id','name','email','phone','role','is_active','can_post_vouchers','can_approve_vouchers','can_lock_periods','can_reverse_entries'
+      'id','name','email','phone','role','is_active','can_post_vouchers','can_approve_vouchers','can_lock_periods','can_reverse_entries',
+      'can_view_purchase_suggestions','can_manage_purchase_suggestions',
+      'can_create_po_from_suggestions','can_configure_purchase_suggestion_settings'
     )
     // A disabled account's outstanding refresh tokens must not keep
     // minting new access tokens (its access token itself is already

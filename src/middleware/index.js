@@ -156,6 +156,11 @@ function requirePermission(permission) {
     // entry under the hood, so it demands the same trust level as reversing
     // one outright — reuse the existing can_reverse_entries flag.
     edit_posted_vouchers: u => u.can_reverse_entries,
+    // Smart Purchase Suggestions (migration 031) — see routes/purchaseSuggestions.js
+    view_purchase_suggestions:              u => u.can_view_purchase_suggestions,
+    manage_purchase_suggestions:            u => u.can_manage_purchase_suggestions,
+    create_po_from_suggestions:             u => u.can_create_po_from_suggestions,
+    configure_purchase_suggestion_settings: u => u.can_configure_purchase_suggestion_settings,
   }
   return async (req, res, next) => {
     try {

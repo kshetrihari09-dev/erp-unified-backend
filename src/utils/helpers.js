@@ -118,6 +118,20 @@ async function nextBillNo(companyId) {
   return `PUR-${year}-${String(last + 1).padStart(3, '0')}`
 }
 
+/** Shared by routes/purchaseOrders.js and routes/purchaseSuggestions.js.
+ *  Accepts a knex instance or transaction as `runner`. */
+async function nextOrderNo(runner, companyId) {
+  const year = (todayBS() || '2081-04-01').split('-')[0]
+  const like = `PO-${year}-%`
+  const row = await runner('purchase_orders')
+    .where({ company_id: companyId })
+    .andWhereLike('order_no', like)
+    .orderBy('order_no', 'desc')
+    .first()
+  const last = row ? parseInt(row.order_no.split('-').pop()) || 0 : 0
+  return `PO-${year}-${String(last + 1).padStart(3, '0')}`
+}
+
 async function nextPartyCode(companyId, type) {
   const prefix = type === 'customer' ? 'CUS' : 'SUP'
   const row = await db('parties')
@@ -253,4 +267,4 @@ function isValidUUID(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str)
 }
 
-module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextPartyCode, nextItemCode, nextAutoBarcode, buildAutoBarcode, auditLog, clampExpiry, isValidUUID }
+module.exports = { adToBS, bsToAD, todayBS, nextInvoiceNo, nextBillNo, nextOrderNo, nextPartyCode, nextItemCode, nextAutoBarcode, buildAutoBarcode, auditLog, clampExpiry, isValidUUID }

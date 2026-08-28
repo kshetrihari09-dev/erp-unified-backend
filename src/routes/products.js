@@ -193,6 +193,11 @@ router.post('/', async (req, res, next) => {
       name, generic_name, company_name, category, unit, barcode,
       purchase_rate, sales_rate, mrp, cc_pct, min_stock,
       tax_rate, vat_percent,
+      // Optional "Inventory Planning" fields (Smart Purchase Suggestions,
+      // migration 031) — every one of these is nullable/defaulted, so a
+      // product created without them behaves exactly as before.
+      preferred_supplier_id, supplier_lead_time_days, safety_stock_days,
+      safety_stock_qty, reorder_point_override, exclude_from_suggestions,
     } = req.body
 
     if (!name?.trim())
@@ -258,6 +263,12 @@ router.post('/', async (req, res, next) => {
       tax_rate:     Math.min(100, Math.max(0, Number(taxRateValue) || 0)),
       min_stock:    Number(min_stock) || 50,
       is_active:    true,
+      preferred_supplier_id:   preferred_supplier_id || null,
+      supplier_lead_time_days: supplier_lead_time_days != null ? Number(supplier_lead_time_days) : null,
+      safety_stock_days:       safety_stock_days != null ? Number(safety_stock_days) : null,
+      safety_stock_qty:        safety_stock_qty != null ? Number(safety_stock_qty) : null,
+      reorder_point_override:  reorder_point_override != null ? Number(reorder_point_override) : null,
+      exclude_from_suggestions: !!exclude_from_suggestions,
     }).returning('*')
 
     await auditLog(req.companyId, req.user.id, 'CREATE', 'products', product.id, { name }, req.ip)
@@ -281,12 +292,17 @@ router.put('/:id', async (req, res, next) => {
     const allowed = [
       'name', 'generic_name', 'company_name', 'category', 'unit', 'barcode',
       'purchase_rate', 'sales_rate', 'mrp', 'cc_pct', 'tax_rate', 'min_stock', 'is_active',
+      // Inventory Planning (Smart Purchase Suggestions, migration 031)
+      'preferred_supplier_id', 'supplier_lead_time_days', 'safety_stock_days',
+      'safety_stock_qty', 'reorder_point_override', 'exclude_from_suggestions',
     ]
     // `vat_percent` is the field name both the Quick Add and Product Add
     // forms send — alias it onto the real `tax_rate` column before the
     // allowed-fields pass below, same as on create.
     const body = { ...req.body }
     if (body.tax_rate === undefined && body.vat_percent !== undefined) body.tax_rate = body.vat_percent
+
+    const nullableNumericPlanningFields = ['supplier_lead_time_days', 'safety_stock_days', 'safety_stock_qty', 'reorder_point_override']
 
     const updates = {}
     for (const k of allowed) {
@@ -297,6 +313,13 @@ router.put('/:id', async (req, res, next) => {
           updates[k] = Math.min(100, Math.max(0, Number(body[k]) || 0))
         else if (k === 'barcode')
           updates[k] = body[k]?.toString().trim() || null
+        else if (nullableNumericPlanningFields.includes(k))
+          // '' / null clears the override back to "use company default"
+          updates[k] = (body[k] === '' || body[k] === null) ? null : Number(body[k])
+        else if (k === 'preferred_supplier_id')
+          updates[k] = body[k] || null
+        else if (k === 'exclude_from_suggestions')
+          updates[k] = !!body[k]
         else
           updates[k] = body[k]
       }

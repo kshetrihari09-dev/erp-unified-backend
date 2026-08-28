@@ -74,6 +74,23 @@ const DEFAULT_SETTINGS = {
     // toggle in this file.
     maxDevices: 5,
   },
+  // Read by services/purchaseSuggestionsEngine.js + routes/purchaseSuggestions.js.
+  // Product-specific columns (products.supplier_lead_time_days,
+  // safety_stock_days, safety_stock_qty, reorder_point_override) always take
+  // precedence over these company-wide defaults when useProductSpecificSettings
+  // is true and a product has set them.
+  purchaseSuggestions: {
+    defaultPeriodDays:          30,    // 7 | 30 | 60 | 90 | custom (custom handled via explicit date_from/date_to params)
+    includeZeroSalesProducts:   false, // if true, products with no sales in the period still appear (status "No Sales Data")
+    salesAnalysisMethod:        'average', // 'average' — reserved for future methods (e.g. weighted/moving average)
+    defaultLeadTimeDays:        3,
+    safetyStockDays:            2,
+    criticalStockDays:          3,     // days_remaining <= this → Critical
+    lowStockDays:                7,    // days_remaining <= this (and > critical) → Low
+    considerIncomingPurchaseOrders: true,
+    considerReservedStock:      false, // reserved_stock is always 0 in this system today (no sales-order/reservation module); kept as a forward-compatible toggle
+    useProductSpecificSettings: true,
+  },
 }
 
 /** One level deep-merge per top-level section — enough for this flat shape
