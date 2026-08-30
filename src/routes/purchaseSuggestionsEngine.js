@@ -68,7 +68,20 @@ function resolveDateRange({ period, date_from, date_to }, defaultPeriodDays) {
  * remaining and reorder point; No Sales Data overrides all of them when
  * there genuinely was no sales activity to base a recommendation on.
  */
-function classifyStatus({ avgDailySales, daysRemaining, availableStock, reorderPoint, thresholds }) {
+function classifyStatus({ avgDailySales, daysRemaining, availableStock, reorderPoint, minStock, thresholds }) {
+  // A product below its own configured minimum stock is unambiguously
+  // actionable — regardless of whether it has recent sales velocity to
+  // compute a days-remaining figure from. Without this check, a product
+  // with zero sales in the selected period (new item, seasonal, recently
+  // restocked-then-stalled, etc.) would fall through to 'no_sales_data'
+  // and be silently hidden from the default view even while sitting at
+  // literally zero stock — exactly the case the basic Products-page
+  // low-stock flag (current_stock < min_stock) already catches. This
+  // keeps the two views consistent: anything flagged low-stock there is
+  // never invisible here.
+  if (minStock > 0 && availableStock < minStock) {
+    return avgDailySales <= 0 || (daysRemaining !== null && daysRemaining <= thresholds.criticalStockDays) ? 'critical' : 'low_stock'
+  }
   if (avgDailySales <= 0) return 'no_sales_data'
   if (daysRemaining !== null && daysRemaining <= thresholds.criticalStockDays) return 'critical'
   if (daysRemaining !== null && daysRemaining <= thresholds.lowStockDays) return 'low_stock'
@@ -204,7 +217,12 @@ async function computeAll(companyId, queryParams = {}) {
 
     const reorderPoint = (useProductOverrides && p.reorder_point_override != null)
       ? Number(p.reorder_point_override)
-      : (leadTimeDemand + safetyStock)
+      // Never let the computed reorder point fall below the product's own
+      // configured minimum stock — otherwise a product with little/no
+      // sales history could show a "Critical"/"Low Stock" status (from the
+      // min-stock floor in classifyStatus below) yet still get suggested
+      // 0 units to purchase, which would be a confusing, useless result.
+      : Math.max(leadTimeDemand + safetyStock, Number(p.min_stock) || 0)
 
     const netRequired = reorderPoint - availableStock - incomingStock
     const suggestedQty = Math.max(0, Math.round(netRequired * 100) / 100)
@@ -212,7 +230,7 @@ async function computeAll(companyId, queryParams = {}) {
     const daysRemaining = avgDailySales > 0 ? Math.round((availableStock / avgDailySales) * 10) / 10 : null
 
     const status = classifyStatus({
-      avgDailySales, daysRemaining, availableStock, reorderPoint,
+      avgDailySales, daysRemaining, availableStock, reorderPoint, minStock: Number(p.min_stock) || 0,
       thresholds: { criticalStockDays: settings.criticalStockDays, lowStockDays: settings.lowStockDays },
     })
 
