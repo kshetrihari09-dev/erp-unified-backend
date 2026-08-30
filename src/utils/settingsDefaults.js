@@ -91,6 +91,54 @@ const DEFAULT_SETTINGS = {
     considerReservedStock:      false, // reserved_stock is always 0 in this system today (no sales-order/reservation module); kept as a forward-compatible toggle
     useProductSpecificSettings: true,
   },
+  // Read by services/creditRiskEngine.js + routes/creditRisk.js.
+  creditRisk: {
+    scoringPeriodDays: 180, // "Last 6 months" — 90 | 180 | 365 | custom (custom via explicit date params)
+    weights: {
+      // Must sum to 100 — validated in routes/creditRisk.js PUT /settings.
+      onTimePaymentRate:   25,
+      paymentDelay:        20,
+      overdueExposure:     20,
+      creditUtilization:   15,
+      latePaymentFrequency: 10,
+      defaultHistory:      10,
+    },
+    thresholds: {
+      lowRiskMin:    80, // score >= this → Low Risk
+      mediumRiskMin: 50, // score >= this (and < lowRiskMin) → Medium Risk; below → High Risk
+    },
+    // How many risk-score points an average day of payment delay costs,
+    // before weighting — e.g. 3 → a 33-day average delay alone drives the
+    // payment-delay factor to 0. Transparent & configurable per requirement #2/#4.
+    delayScorePenaltyPerDay: 3,
+    onTimeGraceDays: 0, // a payment this many days after due date still counts as "on time"
+    // Bad debt: kept as a single transparent multiplier + per-incident
+    // penalty rather than a black-box model — requirement #6 explicitly
+    // forbids presenting this as an AI prediction.
+    badDebt: {
+      probabilityMultiplier: 1.15, // bad_debt_probability = min(100, (100 - score) * multiplier + badDebtRecordCount * perIncidentBump)
+      perIncidentBump: 10,
+    },
+    // Trend comparison: recent window vs. the remainder of the scoring
+    // period (e.g. scoringPeriodDays=180 → last 90 days vs. prior 90 days).
+    trendRecentWindowDays: 90,
+    trendChangeThresholdDays: 3, // recent avg delay must differ by more than this to call it Improving/Worsening rather than Stable
+    // Recommendation rules (requirement #8) — recommendation-only by default (requirement #9).
+    recommendations: {
+      mediumRiskLimitPct: 65,   // recommended limit = this % of current limit, when Medium Risk
+      highRiskLowLimit:   0,    // recommended limit when High Risk (0 = require prepayment, no open credit)
+      mediumRiskTermsDays: 15,  // "Net-15"
+      highRiskTermsDays:   0,   // 0 = prepayment
+    },
+    automaticActions: 'recommendation_only', // 'recommendation_only' | 'require_approval' | 'block_high_risk'
+    alerts: {
+      highRiskEnabled: true,
+      scoreDropThreshold: 15,      // alert when score drops by more than this within scoreDropWindowDays
+      scoreDropWindowDays: 30,
+      badDebtProbabilityThreshold: 60, // alert when bad-debt probability exceeds this
+      criticalOverdueAmount: 100000,    // company-currency amount; alert when a customer's overdue exceeds this
+    },
+  },
 }
 
 /** One level deep-merge per top-level section — enough for this flat shape

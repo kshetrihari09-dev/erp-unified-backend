@@ -66,7 +66,14 @@ router.post('/vouchers/:id/reverse', requirePermission('reverse_entries'), async
   try {
     const { reason } = req.body
     if (!reason?.trim()) throw new AppError('Reversal reason is required', 400)
+    const original = await db('vouchers').where({ id: req.params.id }).first('party_id')
     const result = await PostingEngine.reverse(req.params.id, req.user.id, reason, req.ip)
+    // Event-based credit-risk recalculation (requirement #2: "payment
+    // reversed" / "invoice cancelled or reversed") — covers reversing a
+    // SALES, RECEIPT, or CREDIT_NOTE voucher tied to a customer.
+    if (original?.party_id) {
+      require('../services/creditRiskRecalc').recalcCustomerAsync(req.companyId, original.party_id, { trigger: 'voucher_reversed', userId: req.user.id })
+    }
     return ok(res, result, 'Voucher reversed successfully')
   } catch (err) { next(err) }
 })
@@ -434,6 +441,12 @@ function voucherTypeRouter(voucherType) {
 
           return { voucher, journal_entry: posted.journal_entry }
         })
+
+        // Event-based credit-risk recalculation (requirement #2: "payment
+        // received") — only meaningful for customer receipts.
+        if (voucherType === 'RECEIPT' && party_id) {
+          require('../services/creditRiskRecalc').recalcCustomerAsync(req.companyId, party_id, { trigger: 'payment_received', userId: req.user.id })
+        }
 
         return ok(res, { ...result.voucher, journal_entry: result.journal_entry },
           `${voucherType === 'RECEIPT' ? 'Receipt' : 'Payment'} recorded`, 201)

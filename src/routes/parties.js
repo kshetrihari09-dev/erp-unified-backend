@@ -130,6 +130,11 @@ router.put('/:id', async (req, res, next) => {
     }
     const [updated] = await db('parties').where({ id: req.params.id }).update({ ...updates, updated_at: new Date() }).returning('*')
     await AuditLogger.log(db, { companyId: req.companyId, userId: req.user.id, action: 'UPDATE', entityType: 'parties', entityId: req.params.id, payloadAfter: updates, ipAddress: req.ip })
+    // Event-based credit-risk recalculation (requirement #2: "credit limit
+    // changed" / "payment term changed").
+    if (existing.type === 'customer' && (updates.credit_limit !== undefined || updates.credit_days !== undefined)) {
+      require('../services/creditRiskRecalc').recalcCustomerAsync(req.companyId, req.params.id, { trigger: 'credit_terms_changed', userId: req.user.id })
+    }
     return successResponse(res, updated)
   } catch (err) { next(err) }
 })

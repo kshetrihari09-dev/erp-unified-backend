@@ -161,6 +161,14 @@ function requirePermission(permission) {
     manage_purchase_suggestions:            u => u.can_manage_purchase_suggestions,
     create_po_from_suggestions:             u => u.can_create_po_from_suggestions,
     configure_purchase_suggestion_settings: u => u.can_configure_purchase_suggestion_settings,
+    // Credit-Risk & Bad-Debt Scoring (migration 032) — see routes/creditRisk.js
+    view_credit_risk_dashboard:        u => u.can_view_credit_risk_dashboard,
+    view_customer_credit_risk:         u => u.can_view_customer_credit_risk,
+    recalculate_credit_risk:           u => u.can_recalculate_credit_risk,
+    configure_credit_risk_settings:    u => u.can_configure_credit_risk_settings,
+    override_credit_risk_warning:      u => u.can_override_credit_risk_warning,
+    approve_high_risk_credit_sale:     u => u.can_approve_high_risk_credit_sale,
+    view_expected_credit_loss:         u => u.can_view_expected_credit_loss,
   }
   return async (req, res, next) => {
     try {

@@ -392,6 +392,11 @@ router.post('/', async (req, res, next) => {
 
     await trx.commit()
     auditLog(req.companyId, req.user.id, 'CREATE', 'sales', sale.id, { invoice_no, net_total }, req.ip)
+    // Event-based credit-risk recalculation (requirement #2) — fire-and-forget,
+    // never blocks the response or fails the sale if scoring errors out.
+    if (sale.payment_mode === 'credit' && sale.party_id) {
+      require('../services/creditRiskRecalc').recalcCustomerAsync(req.companyId, sale.party_id, { trigger: 'credit_sale_created', userId: req.user.id })
+    }
     return successResponse(res, {
       ...sale,
       items: saleItems,
@@ -457,6 +462,9 @@ router.put('/:id/cancel', requireSensitiveConfirm('invoiceCancel'), async (req, 
     const [updated] = await trx('sales').where({ id: req.params.id }).update({ status: 'cancelled', updated_at: new Date() }).returning('*')
     await trx.commit()
     auditLog(req.companyId, req.user.id, 'CANCEL', 'sales', req.params.id, { reason: req.body.reason }, req.ip)
+    if (sale.payment_mode === 'credit' && sale.party_id) {
+      require('../services/creditRiskRecalc').recalcCustomerAsync(req.companyId, sale.party_id, { trigger: 'credit_sale_cancelled', userId: req.user.id })
+    }
     return successResponse(res, updated, 'Invoice cancelled')
   } catch (err) { await trx.rollback(); next(err) }
 })

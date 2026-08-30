@@ -115,6 +115,19 @@ async function buildSaleVoucher({ sale, items, trx, companyId, userId }) {
   const netTotal  = Number(sale.net_total)  || 0
   const salesNet  = netTotal - vatAmount
 
+  // Due date for credit sales — read by services/creditRiskEngine.js.
+  // Not stored anywhere else in this schema (sales has no due_date column),
+  // and the party's credit_days can change later, so this is the only
+  // place the due date as of the actual sale date is ever captured.
+  let dueDate = null
+  if (isCredit && sale.party_id) {
+    const party = await trx('parties').where({ id: sale.party_id }).first('credit_days')
+    const creditDays = Number(party?.credit_days) || 0
+    const d = new Date(sale.date_ad + 'T00:00:00Z')
+    d.setUTCDate(d.getUTCDate() + creditDays)
+    dueDate = d.toISOString().split('T')[0]
+  }
+
   // Aggregate line-level discount, same formula used everywhere else
   // (print, sale_items.amount calc): sum(qty × rate × discount_pct / 100),
   // rounded to 2dp. `items` here is saleItems — already carries discount_pct
@@ -204,6 +217,7 @@ async function buildSaleVoucher({ sale, items, trx, companyId, userId }) {
     narration:    `Sales Invoice ${sale.invoice_no}` + (sale.notes ? ` — ${sale.notes}` : ''),
     referenceNo:  sale.invoice_no,
     currency:     'NPR',
+    dueDate,
     metadata: {
       source_type: 'SALE',
       source_id:   sale.id,

@@ -202,6 +202,12 @@ router.post('/sales', async (req, res, next) => {
       req.ip,
     )
 
+    // Event-based credit-risk recalculation (requirement #2: "invoice
+    // cancelled or reversed" / returns affect outstanding + overdue).
+    if (party_id) {
+      require('../services/creditRiskRecalc').recalcCustomerAsync(req.companyId, party_id, { trigger: 'sale_return', userId: req.user.id })
+    }
+
     return successResponse(res, {
       type:     'sale_return',
       total,
