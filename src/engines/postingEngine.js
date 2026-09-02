@@ -407,7 +407,11 @@ class PostingEngine {
       [resolvedCompanyId, voucher.voucher_date]
     )
     if (periodLocked.rows[0].locked) {
-      throw new AppError(`Cannot post — accounting period containing ${voucher.voucher_date} is locked`, 400)
+      // Non-retryable: the period stays locked until a human reopens it or
+      // corrects the date — an offline-sync queue retrying this exact
+      // payload every backoff interval will fail identically forever
+      // otherwise (see routes/sales.js / offline/syncEngine.ts).
+      throw new AppError(`Cannot post — accounting period containing ${voucher.voucher_date} is locked`, 400, 'PERIOD_LOCKED')
     }
 
     // Load lines
@@ -519,7 +523,12 @@ class PostingEngine {
 }
 
 class AppError extends Error {
-  constructor(message, status = 400) { super(message); this.status = status }
+  // `code` is an optional machine-readable tag (e.g. 'PERIOD_LOCKED') so
+  // callers upstream (AccountingIntegration → routes/sales.js) can tell a
+  // structural/config rejection — one that will NEVER succeed on its own,
+  // no matter how many times the same payload is retried — from an
+  // ordinary validation error. See routes/sales.js's postSale catch block.
+  constructor(message, status = 400, code = null) { super(message); this.status = status; this.code = code }
 }
 
 module.exports = PostingEngine

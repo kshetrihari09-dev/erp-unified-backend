@@ -157,24 +157,39 @@ router.post('/', async (req, res, next) => {
     // ── Date sequence validation ──────────────────────────────────────────────
     // New invoice date must be >= latest active sales invoice date for this company.
     // Same date is allowed. Future dates are allowed. Earlier dates are rejected.
+    //
+    // EXCEPT for offline-sync replays (client_txn_id present): that date was
+    // fixed the moment the cashier made the sale on a disconnected device,
+    // and the transaction can sit in the local queue for hours or days
+    // before this endpoint ever sees it — during which perfectly ordinary
+    // online sales keep advancing "latest active invoice date" past it.
+    // Rejecting it here isn't catching a data-entry mistake, it's punishing
+    // the sale for having been made offline: the queue would retry the
+    // exact same payload forever on a fixed backoff, fail this check every
+    // single time (the date never becomes "not earlier"), and the
+    // transaction would never post even though the device is fully online
+    // and every other queued sale syncs fine. A cashier's live-entered date
+    // still gets the strict check; a replayed offline transaction does not.
     const date = date_ad || new Date().toISOString().split('T')[0]
 
-    const latestSale = await trx('sales')
-      .where({ company_id: req.companyId, status: 'active' })
-      .whereNotNull('date_ad')
-      .orderBy('date_ad', 'desc')
-      .select('date_ad', 'invoice_no')
-      .first()
+    if (!client_txn_id) {
+      const latestSale = await trx('sales')
+        .where({ company_id: req.companyId, status: 'active' })
+        .whereNotNull('date_ad')
+        .orderBy('date_ad', 'desc')
+        .select('date_ad', 'invoice_no')
+        .first()
 
-    if (latestSale && date < latestSale.date_ad) {
-      await trx.rollback()
-      return res.status(400).json({
-        success: false,
-        message: `Sales entry date cannot be earlier than the previous sales invoice date.`,
-        detail:  `Last invoice ${latestSale.invoice_no} is dated ${latestSale.date_ad}. New entry must be on or after this date.`,
-        last_invoice_date: latestSale.date_ad,
-        last_invoice_no:   latestSale.invoice_no,
-      })
+      if (latestSale && date < latestSale.date_ad) {
+        await trx.rollback()
+        return res.status(400).json({
+          success: false,
+          message: `Sales entry date cannot be earlier than the previous sales invoice date.`,
+          detail:  `Last invoice ${latestSale.invoice_no} is dated ${latestSale.date_ad}. New entry must be on or after this date.`,
+          last_invoice_date: latestSale.date_ad,
+          last_invoice_no:   latestSale.invoice_no,
+        })
+      }
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -386,7 +401,20 @@ router.post('/', async (req, res, next) => {
         accountingResult = { voucher: null, journal_entry: null, accountingError: acctErr.message }
       } else {
         await trx.rollback()
-        return res.status(acctErr.status || 400).json({ success: false, message: acctErr.message })
+        // Everything that lands here (period lock, unbalanced voucher,
+        // inactive/group account, etc.) is a structural/config problem,
+        // not a transient one — retrying the identical payload will fail
+        // identically every time. `retryable: false` lets the offline
+        // sync queue (offline/syncEngine.ts) stop backing off and instead
+        // surface this to a person immediately, rather than looping
+        // silently forever. `code` gives the UI something machine-
+        // readable to key a specific message off of.
+        return res.status(acctErr.status || 400).json({
+          success: false,
+          message: acctErr.message,
+          code: acctErr.code || undefined,
+          retryable: false,
+        })
       }
     }
 
