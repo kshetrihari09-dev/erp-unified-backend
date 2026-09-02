@@ -34,6 +34,7 @@ const { authenticate, identifyDevice, requireSensitiveConfirm } = require('../mi
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { nextInvoiceNo, adToBS, todayBS, auditLog, clampExpiry, isValidUUID } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
+const VoucherEditService    = require('../services/voucherEditService')
 
 router.use(authenticate)
 router.use(identifyDevice)
@@ -242,143 +243,177 @@ router.post('/', async (req, res, next) => {
       client_txn_id: client_txn_id || null, device_id: req.deviceId || null,
     }).returning('*')
 
-    for (const item of saleItems) {
-      // ── Batch-specific deduction — SERVER AUTHORITY / atomic ───────────────
-      // The Sale page's Batch Selection popup only ever offers batches that
-      // belong to this exact product, so an item posted from Sale always
-      // carries the id of the one lot the user picked. Stock must come out
-      // of that exact inventory_batches row and nothing else — never a FIFO
-      // sweep across every batch of the product, which could silently pull
-      // from a different lot (including one the user never saw/selected).
-      //
-      // The deduction itself is now a single atomic conditional UPDATE
-      // (`SET qty_remaining = qty_remaining - ? WHERE id = ? AND
-      // qty_remaining >= ?`) instead of the previous SELECT → check in JS →
-      // UPDATE. That older pattern is exactly the race condition two
-      // devices selling the same low-stock batch can hit: both read the
-      // same qty_remaining before either writes, both see "enough stock",
-      // both deduct. Postgres takes a row lock for the duration of an
-      // UPDATE, so under this pattern a second concurrent request for the
-      // same batch genuinely waits for the first to commit, then evaluates
-      // qty_remaining >= ? against the POST-commit value — the second
-      // request correctly sees 0 rows affected and is rejected, exactly
-      // matching the worked example in the spec (A: 50→0 SUCCESS, B:
-      // available 0, requested 50, REJECTED).
-      let resolvedBatchId = null
-      if (item.product_id && item.qty > 0) {
-        let batchIdToUse = item.batch_id || null
+    // ── Stock deduction (batched) ────────────────────────────────────────────
+    // Previously: one atomic conditional UPDATE + one INSERT per item,
+    // sequentially awaited — for a 90+ item invoice that's 180+ round trips
+    // to the database, one after another, easily exceeding the frontend's
+    // request timeout (config/env.ts's apiTimeout). When that happens the
+    // request aborts with no HTTP response at all, which offline/
+    // syncEngine.ts's isNetworkError() can only read as "the connection
+    // dropped" — the sale silently gets reset to pending and retried,
+    // timing out identically every time, even though the server was still
+    // working on it and the device never actually went offline.
+    //
+    // This keeps the exact same correctness guarantee — a concurrent
+    // request can't oversell a batch, because each row's qty_remaining is
+    // still checked against ITS OWN current value at the moment Postgres
+    // locks that specific row — but does it as one multi-row UPDATE
+    // instead of N separate ones, for every item that already carries a
+    // batch_id (the normal case: the Sale page's Batch Selection popup
+    // always resolves one before a row can be posted). The two rarer
+    // legacy paths (batch_no-only clients; no batch selected at all) are
+    // still handled with their own smaller queries below — genuine edge
+    // cases, not the shape of a large everyday invoice.
 
-        if (!batchIdToUse && item.batch_no) {
-          // Back-compat for older clients that only send batch_no: resolve
-          // to the exact lot by product + batch number (read-only lookup —
-          // the actual deduction below is still the atomic conditional
-          // UPDATE, so this lookup racing another request is harmless).
-          const batchByNo = await trx(T)
-            .where({ product_id: item.product_id, company_id: req.companyId, batch_no: item.batch_no })
-            .where(QTY, '>', 0)
-            .orderBy('created_at', 'asc')
-            .first('id')
-          if (!batchByNo) {
-            await trx.rollback()
-            return res.status(400).json({ success: false, message: `Batch "${item.batch_no}" has no available stock for "${item.product_name}".` })
-          }
-          batchIdToUse = batchByNo.id
+    // Legacy back-compat: items that only sent batch_no, not batch_id.
+    // Resolved with one query for every such item instead of one query each.
+    const needsBatchNoLookup = saleItems.filter(it => it.product_id && it.qty > 0 && !it.batch_id && it.batch_no)
+    if (needsBatchNoLookup.length) {
+      const candidates = await trx(T)
+        .whereIn('batch_no', [...new Set(needsBatchNoLookup.map(it => it.batch_no))])
+        .andWhere({ company_id: req.companyId })
+        .andWhere(QTY, '>', 0)
+        .orderBy('created_at', 'asc')
+        .select('id', 'product_id', 'batch_no')
+      const firstMatch = new Map() // `${product_id}::${batch_no}` -> id, first (oldest) one only
+      for (const row of candidates) {
+        const key = `${row.product_id}::${row.batch_no}`
+        if (!firstMatch.has(key)) firstMatch.set(key, row.id)
+      }
+      for (const it of needsBatchNoLookup) {
+        const resolved = firstMatch.get(`${it.product_id}::${it.batch_no}`)
+        if (!resolved) {
+          await trx.rollback()
+          return res.status(400).json({ success: false, message: `Batch "${it.batch_no}" has no available stock for "${it.product_name}".` })
         }
+        it._batchIdToUse = resolved
+      }
+    }
+    for (const it of saleItems) {
+      if (it._batchIdToUse === undefined) it._batchIdToUse = it.batch_id || null
+    }
 
-        if (batchIdToUse) {
-          const [updatedBatch] = await trx(T)
-            .where({ id: batchIdToUse, product_id: item.product_id, company_id: req.companyId })
-            .andWhere(QTY, '>=', item.qty)
-            .update({ [QTY]: trx.raw(`?? - ?`, [QTY, item.qty]) })
-            .returning('*')
+    // Sum quantities per batch_id first — two lines can legitimately share
+    // one lot, and a single UPDATE...FROM(VALUES) can only carry one
+    // deduction amount per row. Also remember which product_id each batch
+    // was claimed under — the original per-item code cross-checked
+    // product_id against the batch (guarding against a batch_id that
+    // exists but belongs to a different product than the item claims),
+    // and the bulk version below preserves that same check.
+    const batchDeductions  = new Map() // batch_id -> total qty to deduct
+    const batchProductIds  = new Map() // batch_id -> product_id it was claimed under
+    for (const it of saleItems) {
+      if (it.product_id && it.qty > 0 && it._batchIdToUse) {
+        batchDeductions.set(it._batchIdToUse, (batchDeductions.get(it._batchIdToUse) || 0) + it.qty)
+        if (!batchProductIds.has(it._batchIdToUse)) batchProductIds.set(it._batchIdToUse, it.product_id)
+      }
+    }
 
-          if (updatedBatch) {
-            resolvedBatchId = updatedBatch.id
-          } else {
-            // Either the batch no longer exists, or it exists but doesn't
-            // currently have enough stock (including "another device/tab
-            // just took the last of it" — a genuine cross-device conflict,
-            // not just a stale local snapshot). This read-only lookup is
-            // only to build a clear message/response — it never re-decides
-            // whether the sale can proceed; the atomic UPDATE above already
-            // made that call authoritatively.
-            const currentBatch = await trx(T)
-              .where({ id: batchIdToUse, product_id: item.product_id, company_id: req.companyId })
-              .first()
+    const succeededBatchIds = new Set()
+    if (batchDeductions.size) {
+      const ids        = [...batchDeductions.keys()]
+      const qtys       = ids.map(id => batchDeductions.get(id))
+      const productIds = ids.map(id => batchProductIds.get(id))
+      const { rows: updatedRows } = await trx.raw(
+        `UPDATE ${T} AS ib
+            SET ${QTY} = ib.${QTY} - v.deduct
+           FROM (SELECT * FROM UNNEST(?::uuid[], ?::numeric[], ?::uuid[]) AS v(id, deduct, product_id)) AS v
+          WHERE ib.id = v.id
+            AND ib.company_id = ?
+            AND ib.product_id = v.product_id
+            AND ib.${QTY} >= v.deduct
+        RETURNING ib.id`,
+        [ids, qtys, productIds, req.companyId],
+      )
+      for (const row of updatedRows) succeededBatchIds.add(row.id)
+    }
 
-            await trx.rollback()
+    // Anything requested but not returned above either doesn't exist,
+    // belongs to another company, or didn't have enough stock left — same
+    // three cases the old per-item code distinguished; one follow-up
+    // read-only lookup (not one per item) builds the right message for
+    // whichever batch failed first.
+    const failedBatchId = [...batchDeductions.keys()].find(id => !succeededBatchIds.has(id))
+    if (failedBatchId) {
+      const failingItem  = saleItems.find(it => it._batchIdToUse === failedBatchId)
+      const currentBatch = await trx(T).where({ id: failedBatchId, product_id: batchProductIds.get(failedBatchId), company_id: req.companyId }).first()
+      await trx.rollback()
 
-            if (!currentBatch) {
-              return res.status(400).json({ success: false, message: `Selected batch for "${item.product_name}" no longer exists — please re-select a batch.` })
-            }
+      if (!currentBatch) {
+        return res.status(400).json({ success: false, message: `Selected batch for "${failingItem?.product_name}" no longer exists — please re-select a batch.` })
+      }
 
-            const available = Number(currentBatch[QTY])
-            // A structured conflict record only makes sense for a genuine
-            // cross-device/offline scenario (this request came from the
-            // offline sync queue and/or a registered device) — an ordinary
-            // online sale hitting a stale UI snapshot is just a normal
-            // validation error to the person looking right at the screen.
-            if (client_txn_id || req.deviceId) {
-              try {
-                await db('sync_conflicts').insert({
-                  transaction_id: client_txn_id || null, device_id: req.deviceId || null,
-                  company_id: req.companyId, user_id: req.user.id,
-                  conflict_type: 'STOCK_CONFLICT', transaction_type: 'sale',
-                  local_state:  JSON.stringify({ product_id: item.product_id, product_name: item.product_name, batch_id: batchIdToUse, requested: item.qty }),
-                  server_state: JSON.stringify({ batch_id: batchIdToUse, available }),
-                  reason: `Insufficient stock in batch "${currentBatch.batch_no || '—'}" for "${item.product_name}" (available ${available}, requested ${item.qty}).`,
-                })
-              } catch (logErr) {
-                console.error('[sync_conflicts] failed to log conflict', logErr.message)
-              }
-            }
-
-            return res.status(409).json({
-              success: false,
-              status: 'CONFLICT',
-              code: 'INSUFFICIENT_STOCK',
-              transaction_id: client_txn_id || null,
-              message: `Insufficient stock in batch "${currentBatch.batch_no || '—'}" for "${item.product_name}" (available ${available}, requested ${item.qty}).`,
-              available,
-              requested: item.qty,
-              product_id: item.product_id,
-              product_name: item.product_name,
-            })
-          }
-        } else {
-          // No batch selected at all — legacy fallback for non-batch-tracked
-          // callers/products only. The Sale page itself always resolves a
-          // batch before a row can be posted (see BatchSelect.tsx/QtyGate.tsx).
-          // Each candidate batch is still deducted via the same atomic
-          // conditional UPDATE as above, one row at a time; a batch that
-          // loses a race for its remaining stock to a concurrent request is
-          // simply skipped (its qty_remaining no longer satisfies the
-          // condition) rather than oversold.
-          const batches = await trx(T)
-            .where({ product_id: item.product_id, company_id: req.companyId })
-            .where(QTY, '>', 0)
-            .orderBy('expiry_date', 'asc')
-
-          let remaining = item.qty
-          for (const b of batches) {
-            if (remaining <= 0) break
-            const deduct = Math.min(remaining, Number(b[QTY]))
-            if (deduct <= 0) continue
-            const [updated] = await trx(T)
-              .where({ id: b.id })
-              .andWhere(QTY, '>=', deduct)
-              .update({ [QTY]: trx.raw(`?? - ?`, [QTY, deduct]) })
-              .returning('*')
-            if (updated) remaining -= deduct
-            // If `updated` is falsy, a concurrent request took this batch's
-            // stock between our SELECT above and this UPDATE — move on to
-            // the next candidate batch rather than oversell it.
-          }
+      const available = Number(currentBatch[QTY])
+      const requested = batchDeductions.get(failedBatchId)
+      // A structured conflict record only makes sense for a genuine
+      // cross-device/offline scenario (this request came from the offline
+      // sync queue and/or a registered device) — an ordinary online sale
+      // hitting a stale UI snapshot is just a normal validation error to
+      // the person looking right at the screen.
+      if (client_txn_id || req.deviceId) {
+        try {
+          await db('sync_conflicts').insert({
+            transaction_id: client_txn_id || null, device_id: req.deviceId || null,
+            company_id: req.companyId, user_id: req.user.id,
+            conflict_type: 'STOCK_CONFLICT', transaction_type: 'sale',
+            local_state:  JSON.stringify({ product_id: failingItem?.product_id, product_name: failingItem?.product_name, batch_id: failedBatchId, requested }),
+            server_state: JSON.stringify({ batch_id: failedBatchId, available }),
+            reason: `Insufficient stock in batch "${currentBatch.batch_no || '—'}" for "${failingItem?.product_name}" (available ${available}, requested ${requested}).`,
+          })
+        } catch (logErr) {
+          console.error('[sync_conflicts] failed to log conflict', logErr.message)
         }
       }
 
-      await trx('sale_items').insert({ sale_id: sale.id, ...item, batch_id: resolvedBatchId })
+      return res.status(409).json({
+        success: false,
+        status: 'CONFLICT',
+        code: 'INSUFFICIENT_STOCK',
+        transaction_id: client_txn_id || null,
+        message: `Insufficient stock in batch "${currentBatch.batch_no || '—'}" for "${failingItem?.product_name}" (available ${available}, requested ${requested}).`,
+        available,
+        requested,
+        product_id: failingItem?.product_id,
+        product_name: failingItem?.product_name,
+      })
     }
+
+    // Legacy fallback — no batch selected at all (non-batch-tracked
+    // callers only; the Sale page itself always resolves one before a row
+    // can be posted). Rare enough that the original per-item FIFO sweep is
+    // left exactly as it was — this is never the shape of a large invoice.
+    for (const it of saleItems) {
+      if (it.product_id && it.qty > 0 && !it._batchIdToUse) {
+        const batches = await trx(T)
+          .where({ product_id: it.product_id, company_id: req.companyId })
+          .where(QTY, '>', 0)
+          .orderBy('expiry_date', 'asc')
+
+        let remaining = it.qty
+        for (const b of batches) {
+          if (remaining <= 0) break
+          const deduct = Math.min(remaining, Number(b[QTY]))
+          if (deduct <= 0) continue
+          const [updated] = await trx(T)
+            .where({ id: b.id })
+            .andWhere(QTY, '>=', deduct)
+            .update({ [QTY]: trx.raw(`?? - ?`, [QTY, deduct]) })
+            .returning('*')
+          if (updated) remaining -= deduct
+          // If `updated` is falsy, a concurrent request took this batch's
+          // stock between our SELECT above and this UPDATE — move on to
+          // the next candidate batch rather than oversell it.
+        }
+      }
+    }
+
+    // One bulk insert for every sale_items row instead of one per item.
+    await trx('sale_items').insert(
+      saleItems.map(it => {
+        const { _batchIdToUse, ...clean } = it
+        return { sale_id: sale.id, ...clean, batch_id: _batchIdToUse || null }
+      }),
+    )
 
     // ── Accounting Integration ─────────────────────────────────────────────────
     // Every sale is posted through AccountingIntegration → VoucherService → PostingEngine.
@@ -637,6 +672,48 @@ router.put('/:id/date', requireSensitiveConfirm('saleDateEdit'), async (req, res
     }
 
     const date_bs = adToBS(date_ad) || sale.date_bs
+
+    // ── Propagate to the accounting ledger ──────────────────────────────────
+    // BUG (this is what was reported): this route used to update ONLY
+    // sales.date_ad/date_bs. The invoice's printed/displayed date changed,
+    // but the posted voucher's journal_entries.entry_date — the field every
+    // ledger/revenue report actually filters and sorts on (see
+    // reportingEngine.js) — never moved. The sale would show up under its
+    // new date on the invoice, but the sales revenue ledger kept it under
+    // the old date forever: the two records silently disagreed.
+    //
+    // journal_entries is append-only (no UPDATE/DELETE — see
+    // voucherEditService.js's docblock), so the correct fix is NOT to
+    // update entry_date directly. VoucherEditService.edit() already
+    // implements the accounting-correct pattern for this exact situation —
+    // reverse the voucher's current journal entry and repost an identical
+    // one under the corrected date, in place, same voucher_id/voucher_no —
+    // so reuse it here instead of writing a second, divergent code path.
+    // If posting fails for any reason (e.g. the target period is locked),
+    // this throws BEFORE the sales row is touched, so the invoice date and
+    // the ledger can never end up disagreeing.
+    if (sale.voucher_id) {
+      const currentLines = await db('voucher_lines')
+        .where({ voucher_id: sale.voucher_id })
+        .orderBy('line_no')
+        .select('account_id', 'party_id', 'description', 'debit', 'credit', 'tax_rate', 'tax_amount')
+
+      try {
+        await VoucherEditService.edit({
+          voucherId:   sale.voucher_id,
+          companyId:   req.companyId,
+          userId:      req.user.id,
+          reason:      `Invoice ${sale.invoice_no} date changed from ${existingDate} to ${date_ad}`,
+          voucherDate: date_ad,
+          lines:       currentLines,
+        }, req.ip)
+      } catch (editErr) {
+        return res.status(editErr.status || 400).json({
+          success: false,
+          message: `Could not update the ledger for this date change: ${editErr.message}`,
+        })
+      }
+    }
 
     const [updated] = await db('sales')
       .where({ id: req.params.id, company_id: req.companyId })
