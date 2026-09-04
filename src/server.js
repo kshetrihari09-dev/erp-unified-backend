@@ -61,6 +61,7 @@ const purchaseOrdersRouter      = require('./routes/purchaseOrders')
 const creditRiskRouter    = require('./routes/creditRisk')
 const approvalsRouter     = require('./routes/approvals')
 const notificationsRouter = require('./routes/notifications')
+const remindersRouter     = require('./routes/reminders')
 const scannerRouter    = require('./scanner/scannerRoutes')
 
 // New: Cloud Storage integration (additive only — does not touch any
@@ -263,6 +264,7 @@ app.use(`${API}/purchase-suggestions`,  purchaseSuggestionsRouter)
 app.use(`${API}/credit-risk`,    creditRiskRouter)
 app.use(`${API}/approvals`,      approvalsRouter)
 app.use(`${API}/notifications`,  notificationsRouter)
+app.use(`${API}/reminders`,      remindersRouter)
 app.use(`${API}/stock`,      stockRouter)
 app.use(`${API}/returns`,    returnsRouter)
 app.use(`${API}/settings`,   settingsRouter)
@@ -386,6 +388,31 @@ async function start() {
       setTimeout(() => { checkAndRunDueBackups().catch(err => console.error('[backup-scheduler]', err.message)) }, 30 * 1000)
     } catch (err) {
       console.error('[backup-scheduler] failed to start:', err.message)
+    }
+
+    // ── Reminders: notification + automatic-reminder scheduler ─────────────
+    // Same in-process setInterval shape as the backup scheduler right above
+    // — this codebase has no external job queue, and introducing one just
+    // for reminders would be the exact "incompatible service" the spec
+    // warns against. Two independent intervals:
+    //   - every 1 min:  notify anything that just became due (kept short
+    //     so "Business event → Reminder → Notification" feels near-
+    //     immediate, per the spec's end-to-end example)
+    //   - every 15 min: sweep for new automatic reminders (overdue
+    //     invoices, etc.) — no need to check as often as due-notifications
+    try {
+      const { processDueReminders, generateAutomaticReminders } = require('./services/reminderScheduler')
+      const REMINDER_CHECK_INTERVAL_MS   = 60 * 1000
+      const AUTO_REMINDER_INTERVAL_MS    = 15 * 60 * 1000
+      setInterval(() => { processDueReminders().catch(err => console.error('[reminder-scheduler]', err.message)) }, REMINDER_CHECK_INTERVAL_MS)
+      setInterval(() => { generateAutomaticReminders().catch(err => console.error('[reminder-scheduler]', err.message)) }, AUTO_REMINDER_INTERVAL_MS)
+      // Run both once shortly after boot, same reasoning as the backup
+      // scheduler's startup run — don't wait a full interval for the
+      // first pass.
+      setTimeout(() => { processDueReminders().catch(err => console.error('[reminder-scheduler]', err.message)) }, 20 * 1000)
+      setTimeout(() => { generateAutomaticReminders().catch(err => console.error('[reminder-scheduler]', err.message)) }, 40 * 1000)
+    } catch (err) {
+      console.error('[reminder-scheduler] failed to start:', err.message)
     }
 
     // ── Graceful shutdown ──────────────────────────────────────────────────

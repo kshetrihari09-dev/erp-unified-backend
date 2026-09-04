@@ -224,9 +224,10 @@ async function buildSaleVoucher({ sale, items, trx, companyId, userId }) {
       invoice_no:  sale.invoice_no,
       payment_mode: sale.payment_mode,
       items: inventoryItems.map(i => ({
-        product_id: i.product_id,
-        qty:        Number(i.qty),
-        unit_cost:  Number(i.rate) || 0,
+        product_id:   i.product_id,
+        product_name: i.product_name || null,
+        qty:          Number(i.qty),
+        unit_cost:    Number(i.rate) || 0,
       })),
     },
     lines,

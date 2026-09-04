@@ -41,7 +41,7 @@ class SalesStrategy {
       if (cogsAccount && inventoryAccount) {
         let totalCOGS = 0
         for (const item of voucher.metadata.items) {
-          const cogs = await deductFIFO(trx, companyId, item.product_id, item.qty, voucher.id)
+          const cogs = await deductFIFO(trx, companyId, item.product_id, item.qty, voucher.id, item.product_name)
           totalCOGS += cogs
         }
         if (totalCOGS > 0) {
@@ -215,7 +215,7 @@ class OpeningStrategy {
 }
 
 // ─── FIFO Deduction Engine ────────────────────────────────────────────────────
-async function deductFIFO(trx, companyId, productId, qtyNeeded, voucherId) {
+async function deductFIFO(trx, companyId, productId, qtyNeeded, voucherId, productName) {
   // Get available batches in FIFO order (oldest first, then by expiry)
   const batches = await trx('inventory_batches')
     .where({ company_id: companyId, product_id: productId })
@@ -257,7 +257,13 @@ async function deductFIFO(trx, companyId, productId, qtyNeeded, voucherId) {
   }
 
   if (remaining > 0) {
-    throw new Error(`Insufficient stock: ${remaining} units of product ${productId} not available`)
+    // Fall back to a lookup only in this (already-failing, one-time) path —
+    // callers that don't pass productName through (older code, or a
+    // caller added later) still get a readable message instead of a bare
+    // UUID, at the cost of one extra query only when stock has actually
+    // run out.
+    const name = productName || (await trx('products').where({ id: productId }).first('name'))?.name || productId
+    throw new Error(`Insufficient stock: ${remaining} units of "${name}" not available`)
   }
 
   return totalCOGS
