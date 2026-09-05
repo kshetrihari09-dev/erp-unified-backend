@@ -92,7 +92,7 @@ function baseQuery(companyId) {
       'cu.name as created_by_name',
       'p.name as customer_name',
       's.invoice_no as invoice_no', 's.due_amount as invoice_due_amount',
-      'pu.invoice_no as purchase_no',
+      'pu.bill_no as purchase_no',
     )
 }
 
