@@ -123,7 +123,18 @@ router.get('/:id', async (req, res, next) => {
 })
 
 /* ── POST /sales ───────────────────────────────────────────────────────────── */
-router.post('/', async (req, res, next) => {
+/**
+ * Named (not inline) specifically so it can be invoked directly — not
+ * just mounted as a route — by the Customer Ordering module's order-
+ * confirmation endpoint (routes/adminCustomerOrders.js). That endpoint
+ * builds a synthetic req/res and calls this function exactly as if the
+ * request had come in over HTTP, so a confirmed customer order becomes a
+ * real Sale through this exact same code path — same idempotency check,
+ * same batched atomic stock deduction, same accounting posting — rather
+ * than a second, competing implementation of "create a sale" existing
+ * anywhere else in the codebase. See that file for how it's called.
+ */
+async function createSaleHandler(req, res, next) {
   const trx = await db.transaction()
   try {
     const { party_id, date_ad, payment_mode, reference_no, items, notes, cc_charge_pct, client_txn_id } = req.body
@@ -484,7 +495,9 @@ router.post('/', async (req, res, next) => {
     }
     next(err)
   }
-})
+}
+router.post('/', createSaleHandler)
+
 router.put('/:id/cancel', requireSensitiveConfirm('invoiceCancel'), async (req, res, next) => {
   const trx = await db.transaction()
   try {
@@ -730,3 +743,4 @@ router.put('/:id/date', requireSensitiveConfirm('saleDateEdit'), async (req, res
 })
 
 module.exports = router
+module.exports.createSaleHandler = createSaleHandler

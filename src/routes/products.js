@@ -360,7 +360,107 @@ router.put('/:id', async (req, res, next) => {
   }
 })
 
-/* ── DELETE /products/:id ─────────────────────────────────────────────────── */
+/* ── PATCH /products/:id/online-settings ──────────────────────────────────
+ * Everything the Online Selling panel (spec section 6) needs — kept
+ * separate from PUT /:id rather than folded into its `allowed` whitelist:
+ * these fields have their own validation shape (min<=max, step>0, a price
+ * required only when source='online') that doesn't belong mixed into
+ * general product-edit validation, and it gives a clean, specific audit
+ * trail ("online visibility/price/quantity changed" — spec section 47/34)
+ * instead of a generic "product updated" entry.
+ *
+ * No extra role/permission check beyond the router-wide `authenticate` —
+ * matches this file's existing PUT/:id, which any authenticated company
+ * member can call today. If you want online-selling changes restricted
+ * to a subset of staff, that's a real access-control decision worth
+ * making deliberately (e.g. a can_manage_online_store flag, same pattern
+ * as can_manage_reminders) rather than me silently inventing a
+ * restriction the rest of this file doesn't have. */
+router.patch('/:id/online-settings', async (req, res, next) => {
+  try {
+    const existing = await db('products')
+      .where({ id: req.params.id, company_id: req.companyId })
+      .first()
+    if (!existing) return res.status(404).json({ success: false, message: 'Product not found' })
+
+    const b = req.body || {}
+    const updates = {}
+
+    if (b.is_online !== undefined) updates.is_online = !!b.is_online
+
+    if (b.online_price_source !== undefined) {
+      if (!['regular', 'online'].includes(b.online_price_source)) {
+        return res.status(400).json({ success: false, message: "Price source must be 'regular' or 'online'." })
+      }
+      updates.online_price_source = b.online_price_source
+    }
+
+    const effectiveSource = updates.online_price_source ?? existing.online_price_source
+    if (b.online_price !== undefined) {
+      updates.online_price = b.online_price === '' || b.online_price === null ? null : Number(b.online_price)
+    }
+    if (effectiveSource === 'online') {
+      const priceInEffect = updates.online_price !== undefined ? updates.online_price : existing.online_price
+      if ((b.is_online ?? existing.is_online) && (priceInEffect === null || priceInEffect === undefined || Number(priceInEffect) <= 0)) {
+        return res.status(400).json({ success: false, message: 'An online price greater than 0 is required when the price source is Online.' })
+      }
+    }
+
+    if (b.auto_sync_online_qty !== undefined) updates.auto_sync_online_qty = !!b.auto_sync_online_qty
+    if (b.online_qty !== undefined) {
+      updates.online_qty = b.online_qty === '' || b.online_qty === null ? null : Number(b.online_qty)
+      if (updates.online_qty !== null && updates.online_qty < 0) {
+        return res.status(400).json({ success: false, message: 'Online quantity cannot be negative.' })
+      }
+    }
+
+    const numericField = (key, { min = null, allowNull = false, mustBePositive = false } = {}) => {
+      if (b[key] === undefined) return { ok: true }
+      if (allowNull && (b[key] === '' || b[key] === null)) { updates[key] = null; return { ok: true } }
+      const n = Number(b[key])
+      if (Number.isNaN(n) || (mustBePositive && n <= 0) || (min !== null && n < min)) {
+        return { ok: false, message: `Invalid value for ${key}.` }
+      }
+      updates[key] = n
+      return { ok: true }
+    }
+    for (const [key, opts] of [
+      ['min_order_qty', { min: 0 }],
+      ['max_order_qty', { allowNull: true, mustBePositive: true }],
+      ['qty_step',      { mustBePositive: true }],
+      ['display_order', { min: 0 }],
+    ]) {
+      const result = numericField(key, opts)
+      if (!result.ok) return res.status(400).json({ success: false, message: result.message })
+    }
+
+    const effectiveMin = updates.min_order_qty ?? existing.min_order_qty
+    const effectiveMax = updates.max_order_qty !== undefined ? updates.max_order_qty : existing.max_order_qty
+    if (effectiveMax !== null && effectiveMax !== undefined && Number(effectiveMax) < Number(effectiveMin)) {
+      return res.status(400).json({ success: false, message: 'Maximum order quantity cannot be less than the minimum.' })
+    }
+
+    if (b.stock_visibility !== undefined) {
+      if (!['exact', 'range', 'available', 'hide'].includes(b.stock_visibility)) {
+        return res.status(400).json({ success: false, message: 'Invalid stock visibility option.' })
+      }
+      updates.stock_visibility = b.stock_visibility
+    }
+    if (b.allow_backorder !== undefined) updates.allow_backorder = !!b.allow_backorder
+    if (b.online_description !== undefined) updates.online_description = b.online_description || null
+    if (b.online_image_url !== undefined) updates.online_image_url = b.online_image_url || null
+
+    const [updated] = await db('products')
+      .where({ id: req.params.id })
+      .update({ ...updates, updated_at: new Date() })
+      .returning('*')
+
+    await auditLog(req.companyId, req.user.id, 'UPDATE', 'products_online_settings', req.params.id, updates, req.ip)
+    return successResponse(res, updated)
+  } catch (err) { next(err) }
+})
+
+
 router.delete('/:id', async (req, res, next) => {
   try {
     const product = await db('products')
