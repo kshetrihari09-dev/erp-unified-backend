@@ -23,6 +23,17 @@ const db     = require('../db/knex')
 const { authenticateCustomer, signCustomerToken } = require('../middleware/customerAuth')
 const { nextPartyCode, auditLog } = require('../utils/helpers')
 
+// companies.id is a uuid column (migrations/001_foundation.js) — a
+// malformed company_id (not empty, just not a valid uuid) makes the
+// `db('companies').where({ id: company_id })` lookup below throw a raw
+// Postgres 22P02 ("invalid input syntax for type uuid"), which the global
+// error handler turns into an opaque "Invalid value provided." for the
+// customer. Reject bad formats up front instead, with the same
+// "Store not found" message a nonexistent-but-valid id would get, so a
+// stale/mistyped storefront link fails clean rather than leaking a DB error.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const isValidCompanyId = (id) => typeof id === 'string' && UUID_RE.test(id)
+
 /* ── POST /customer-auth/register ─────────────────────────────────────────
  * Minimal required fields (spec #21): name, phone, password. Email is
  * optional — never required just because the staff auth system happens
@@ -31,6 +42,7 @@ router.post('/register', async (req, res, next) => {
   try {
     const { company_id, name, phone, password, email, address } = req.body || {}
     if (!company_id) return res.status(400).json({ success: false, message: 'company_id is required.' })
+    if (!isValidCompanyId(company_id)) return res.status(404).json({ success: false, message: 'Store not found.' })
     if (!name?.trim())  return res.status(400).json({ success: false, message: 'Name is required.' })
     if (!phone?.trim()) return res.status(400).json({ success: false, message: 'Phone number is required.' })
     if (!password || password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' })
@@ -84,6 +96,8 @@ router.post('/login', async (req, res, next) => {
     if (!company_id || !login_identifier || !password) {
       return res.status(400).json({ success: false, message: 'Phone number and password are required.' })
     }
+    // Same malformed-uuid guard as /register — see note above isValidCompanyId.
+    if (!isValidCompanyId(company_id)) return res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: 'Invalid phone number or password.' })
 
     const account = await db('customer_accounts as ca')
       .join('parties as p', 'p.id', 'ca.party_id')
