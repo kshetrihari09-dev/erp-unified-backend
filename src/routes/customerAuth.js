@@ -34,6 +34,22 @@ const { nextPartyCode, auditLog } = require('../utils/helpers')
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const isValidCompanyId = (id) => typeof id === 'string' && UUID_RE.test(id)
 
+// Shared by /register and /login (spec: "one resolved company ID, reused
+// everywhere" — no separate lookup logic per endpoint). Also enforces the
+// is_active business rule that was previously only checked for staff
+// company-switching (routes/companies.js): a deactivated ("deleted")
+// company must not be able to accept new customer registrations or
+// logins even though its row still exists. Returns the same "Store not
+// found." message for missing-vs-inactive so a deactivated storefront
+// doesn't confirm its own existence to a prober.
+async function resolveActiveCompany(company_id) {
+  if (!company_id) return { error: { status: 400, message: 'company_id is required.' } }
+  if (!isValidCompanyId(company_id)) return { error: { status: 404, message: 'Store not found.' } }
+  const company = await db('companies').where({ id: company_id }).first('id', 'is_active')
+  if (!company || company.is_active === false) return { error: { status: 404, message: 'Store not found.' } }
+  return { company }
+}
+
 /* ── POST /customer-auth/register ─────────────────────────────────────────
  * Minimal required fields (spec #21): name, phone, password. Email is
  * optional — never required just because the staff auth system happens
@@ -41,14 +57,11 @@ const isValidCompanyId = (id) => typeof id === 'string' && UUID_RE.test(id)
 router.post('/register', async (req, res, next) => {
   try {
     const { company_id, name, phone, password, email, address } = req.body || {}
-    if (!company_id) return res.status(400).json({ success: false, message: 'company_id is required.' })
-    if (!isValidCompanyId(company_id)) return res.status(404).json({ success: false, message: 'Store not found.' })
+    const { error } = await resolveActiveCompany(company_id)
+    if (error) return res.status(error.status).json({ success: false, message: error.message })
     if (!name?.trim())  return res.status(400).json({ success: false, message: 'Name is required.' })
     if (!phone?.trim()) return res.status(400).json({ success: false, message: 'Phone number is required.' })
     if (!password || password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' })
-
-    const company = await db('companies').where({ id: company_id }).first('id')
-    if (!company) return res.status(404).json({ success: false, message: 'Store not found.' })
 
     const loginIdentifier = phone.trim()
 
@@ -93,11 +106,18 @@ router.post('/register', async (req, res, next) => {
 router.post('/login', async (req, res, next) => {
   try {
     const { company_id, login_identifier, password } = req.body || {}
-    if (!company_id || !login_identifier || !password) {
+    if (!login_identifier || !password) {
       return res.status(400).json({ success: false, message: 'Phone number and password are required.' })
     }
-    // Same malformed-uuid guard as /register — see note above isValidCompanyId.
-    if (!isValidCompanyId(company_id)) return res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: 'Invalid phone number or password.' })
+    // Same resolution + is_active rule as /register (see resolveActiveCompany
+    // above) — reused rather than re-implemented so register/login/order
+    // entry can never drift into inconsistent company-validation logic.
+    // A bad/missing/inactive company_id here is a storefront configuration
+    // problem, not a credentials problem, so it gets the same "Store not
+    // found."/"company_id is required." wording as /register instead of
+    // being folded into the generic invalid-credentials message.
+    const { error } = await resolveActiveCompany(company_id)
+    if (error) return res.status(error.status).json({ success: false, message: error.message })
 
     const account = await db('customer_accounts as ca')
       .join('parties as p', 'p.id', 'ca.party_id')
