@@ -43,10 +43,14 @@ const isValidCompanyId = (id) => typeof id === 'string' && UUID_RE.test(id)
 // found." message for missing-vs-inactive so a deactivated storefront
 // doesn't confirm its own existence to a prober.
 async function resolveActiveCompany(company_id) {
-  if (!company_id) return { error: { status: 400, message: 'company_id is required.' } }
-  if (!isValidCompanyId(company_id)) return { error: { status: 404, message: 'Store not found.' } }
+  // Customer-friendly wording (spec §15) — this now only ever fires from a
+  // storefront-resolution bug (StorefrontContext failing to attach the
+  // resolved company_id), never from something a customer typed, since
+  // company_id is no longer a form field.
+  if (!company_id) return { error: { status: 400, message: 'Store configuration is unavailable. Please contact the store administrator.' } }
+  if (!isValidCompanyId(company_id)) return { error: { status: 404, message: 'This store is currently unavailable.' } }
   const company = await db('companies').where({ id: company_id }).first('id', 'is_active')
-  if (!company || company.is_active === false) return { error: { status: 404, message: 'Store not found.' } }
+  if (!company || company.is_active === false) return { error: { status: 404, message: 'This store is currently unavailable.' } }
   return { company }
 }
 

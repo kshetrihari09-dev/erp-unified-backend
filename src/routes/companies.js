@@ -25,6 +25,7 @@ const { authenticate, requireRole } = require('../middleware/index')
 const { successResponse } = require('../middleware/helpers')
 const { auditLog } = require('../utils/helpers')
 const { seedDefaultAccounts, seedAccountDefaults, signToken, signRefresh } = require('./auth')
+const { normalizeStorefrontCode, isValidStorefrontCode, generateStorefrontCode } = require('../utils/storefrontCode')
 
 class AppError extends Error {
   constructor(msg, status = 400) { super(msg); this.status = status }
@@ -69,6 +70,7 @@ router.post('/', requireRole('admin', 'manager'), async (req, res, next) => {
 
     const result = await db.transaction(async (trx) => {
       const companyId = uuid()
+      const storefrontCode = await generateStorefrontCode(trx, name.trim())
       await trx('companies').insert({
         id:              companyId,
         name:            name.trim(),
@@ -82,6 +84,7 @@ router.post('/', requireRole('admin', 'manager'), async (req, res, next) => {
         invoice_prefix:  (invoice_prefix || 'INV').toUpperCase().slice(0, 6),
         currency:        currency || 'NPR',
         vat_percent:     vat_percent ?? 13,
+        storefront_code: storefrontCode,
       })
 
       const seededAccountIds = await seedDefaultAccounts(trx, companyId)
@@ -141,10 +144,26 @@ router.put('/:id', requireRole('admin', 'manager'), async (req, res, next) => {
     const updates = {}
     for (const k of allowed) { if (req.body[k] !== undefined) updates[k] = req.body[k] }
 
-    const [updated] = await db('companies')
-      .where({ id: req.params.id })
-      .update({ ...updates, updated_at: new Date() })
-      .returning('*')
+    // storefront_code (migration 036) — same field/validation as
+    // PUT /settings/company; see that route's comment for why.
+    if (req.body.storefront_code !== undefined) {
+      const code = normalizeStorefrontCode(req.body.storefront_code)
+      if (!isValidStorefrontCode(code)) throw new AppError('Storefront code must be 2-80 characters, lowercase letters/numbers/hyphens only.', 400)
+      updates.storefront_code = code
+    }
+
+    let updated
+    try {
+      ;[updated] = await db('companies')
+        .where({ id: req.params.id })
+        .update({ ...updates, updated_at: new Date() })
+        .returning('*')
+    } catch (err) {
+      if (err?.code === '23505' && err?.constraint?.includes('storefront_code')) {
+        throw new AppError('That storefront code is already taken. Please choose another.', 400)
+      }
+      throw err
+    }
     if (!updated) throw new AppError('Company not found', 404)
 
     await auditLog(req.params.id, req.user.id, 'UPDATE', 'company', req.params.id, updates, req.ip)
