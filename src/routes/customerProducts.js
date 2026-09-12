@@ -1,17 +1,20 @@
 /**
  * routes/customerProducts.js — Customer Product Ordering module.
  *
- * Read-only, authenticateCustomer-gated. Every response goes through
- * customerCatalogService's resolveMany/toCatalogCard — the customer
- * never receives a raw `products` row (no cost price, no internal
- * flags, nothing beyond what toCatalogCard/toProductDetail expose).
+ * `resolveCustomerOrGuest`-gated, not `authenticateCustomer` — spec §14:
+ * "Do not force registration merely to browse." A logged-in customer and
+ * an anonymous browser both land here; every response goes through
+ * customerCatalogService's resolveMany/toCatalogCard either way — the
+ * customer never receives a raw `products` row (no cost price, no
+ * internal flags, nothing beyond what toCatalogCard/toProductDetail
+ * expose), regardless of whether they're signed in.
  */
 const router = require('express').Router()
 const db = require('../db/knex')
-const { authenticateCustomer } = require('../middleware/customerAuth')
+const { resolveCustomerOrGuest } = require('../middleware/customerAuth')
 const { resolveMany, toCatalogCard, toProductDetail } = require('../services/customerCatalogService')
 
-router.use(authenticateCustomer)
+router.use(resolveCustomerOrGuest)
 
 /* ── GET /customer-products ───────────────────────────────────────────────
  * ?search=&category=&page=&limit= — server-side search/pagination (spec

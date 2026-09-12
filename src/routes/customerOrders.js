@@ -34,11 +34,21 @@
  */
 const router = require('express').Router()
 const db = require('../db/knex')
-const { authenticateCustomer } = require('../middleware/customerAuth')
+const { resolveCustomerOrGuest } = require('../middleware/customerAuth')
 const { resolveMany, validateQuantity } = require('../services/customerCatalogService')
-const { auditLog, todayBS } = require('../utils/helpers')
+const { auditLog, todayBS, nextPartyCode } = require('../utils/helpers')
 
-router.use(authenticateCustomer)
+// POST / (checkout) must work for both a logged-in customer AND a guest
+// (spec §14) — resolveCustomerOrGuest, not authenticateCustomer, sets
+// req.customer to null rather than rejecting when there's no token.
+// GET / and GET /:id (order history) stay customer-only below via this
+// small local guard — a guest has no login and so no order list to look
+// at; the receipt returned directly from POST / is what a guest sees.
+router.use(resolveCustomerOrGuest)
+function requireLoggedInCustomer(req, res, next) {
+  if (!req.customer) return res.status(401).json({ success: false, code: 'AUTH_REQUIRED', message: 'Please log in to view your orders.' })
+  next()
+}
 
 async function nextOrderNo(trx, companyId) {
   const year = (todayBS() || '2081-04-01').split('-')[0]
@@ -52,7 +62,13 @@ async function nextOrderNo(trx, companyId) {
   return `CO-${year}-${String(last + 1).padStart(3, '0')}`
 }
 
-/* ── POST /customer-orders (checkout) ─────────────────────────────────── */
+/* ── POST /customer-orders (checkout) ─────────────────────────────────────
+ * Works for both a logged-in customer (persisted cart) and a guest
+ * (spec §14 — the guest's cart lives in the browser and its contents are
+ * submitted directly as `items`). Whichever path, everything past this
+ * point — re-validation, pricing, totals — is the exact same code
+ * operating on the exact same `cartRows` shape; a guest checkout is not
+ * a second, parallel implementation of "place an order". */
 router.post('/', async (req, res, next) => {
   const trx = await db.transaction()
   try {
@@ -68,14 +84,55 @@ router.post('/', async (req, res, next) => {
       await trx.rollback(); return res.status(400).json({ success: false, message: 'Invalid payment method.' })
     }
 
-    // ── Re-read the cart fresh, inside the transaction ────────────────────
-    const cartRows = await trx('customer_cart_items as ci')
-      .join('products as p', 'p.id', 'ci.product_id')
-      .where('ci.customer_account_id', req.customer.accountId)
-      .select('ci.id as cart_item_id', 'ci.quantity as cart_qty', 'p.*')
+    let cartRows
+    let guestName = null, guestPhone = null
 
-    if (!cartRows.length) {
-      await trx.rollback(); return res.status(400).json({ success: false, code: 'CART_EMPTY', message: 'Your cart is empty.' })
+    if (req.customer) {
+      // ── Logged-in path — re-read the persisted cart fresh, inside the
+      // transaction (unchanged from before guest checkout existed) ──────
+      cartRows = await trx('customer_cart_items as ci')
+        .join('products as p', 'p.id', 'ci.product_id')
+        .where('ci.customer_account_id', req.customer.accountId)
+        .select('ci.id as cart_item_id', 'ci.quantity as cart_qty', 'p.*')
+
+      if (!cartRows.length) {
+        await trx.rollback(); return res.status(400).json({ success: false, code: 'CART_EMPTY', message: 'Your cart is empty.' })
+      }
+    } else {
+      // ── Guest path — the cart arrives as a plain items array, exactly
+      // what customerCart.js's POST /preview also accepts (spec §14). ──
+      guestName = req.body?.guest_name?.trim()
+      guestPhone = req.body?.guest_phone?.trim()
+      if (!guestName) { await trx.rollback(); return res.status(400).json({ success: false, message: 'Name is required.' }) }
+      if (!guestPhone) { await trx.rollback(); return res.status(400).json({ success: false, message: 'Phone number is required.' }) }
+
+      const items = Array.isArray(req.body?.items) ? req.body.items : []
+      const qtyByProduct = new Map()
+      for (const it of items.slice(0, 100)) {
+        const pid = it?.product_id
+        const qty = Number(it?.quantity)
+        if (!pid || !Number.isFinite(qty) || qty <= 0) continue
+        qtyByProduct.set(pid, (qtyByProduct.get(pid) || 0) + qty)
+      }
+      if (!qtyByProduct.size) {
+        await trx.rollback(); return res.status(400).json({ success: false, code: 'CART_EMPTY', message: 'Your cart is empty.' })
+      }
+
+      // Same company scoping as every other product lookup in this
+      // module — a product_id outside req.companyId, or for a deleted
+      // product, simply won't be in `products` below and surfaces as a
+      // per-line "not found" problem, never a silent cross-company read.
+      const products = await trx('products').where({ company_id: req.companyId }).whereIn('id', [...qtyByProduct.keys()])
+      const foundIds = new Set(products.map(p => p.id))
+      cartRows = products.map(p => ({ cart_item_id: null, cart_qty: qtyByProduct.get(p.id), ...p }))
+
+      const missingProblems = [...qtyByProduct.keys()]
+        .filter(pid => !foundIds.has(pid))
+        .map(pid => ({ product_id: pid, name: null, message: 'Product not found or no longer available.' }))
+      if (missingProblems.length) {
+        await trx.rollback()
+        return res.status(409).json({ success: false, code: 'CART_INVALID', message: 'Some items in your cart need attention.', problems: missingProblems })
+      }
     }
 
     const products = cartRows.map(({ cart_item_id, cart_qty, ...p }) => p)
@@ -125,25 +182,49 @@ router.post('/', async (req, res, next) => {
     const delivery_charge = 0 // no delivery-fee rule configured anywhere yet — see final report
     const grand_total = Math.round((subtotal - discount_amount + tax_amount + delivery_charge) * 100) / 100
 
+    // ── Guest party: created only now, once the order is known to be
+    // valid (still inside the same transaction, so a failure anywhere
+    // above rolls this back too — no orphaned party from a rejected
+    // order). A fresh party every guest order, deliberately never
+    // reused/deduped by phone: matching an existing party by a
+    // guest-typed phone number risks attaching a guest's order to a
+    // real registered customer's ledger if the numbers happen to
+    // coincide. See the final report for this trade-off.
+    let partyId, customerAccountId, isGuest
+    if (req.customer) {
+      partyId = req.customer.partyId
+      customerAccountId = req.customer.accountId
+      isGuest = false
+    } else {
+      const code = await nextPartyCode(req.companyId, 'customer')
+      const [guestParty] = await trx('parties').insert({
+        company_id: req.companyId, code, type: 'customer', name: guestName, phone: guestPhone,
+      }).returning('*')
+      partyId = guestParty.id
+      customerAccountId = null
+      isGuest = true
+    }
+
     const order_no = await nextOrderNo(trx, req.companyId)
     const [order] = await trx('customer_orders').insert({
       company_id: req.companyId,
-      customer_account_id: req.customer.accountId,
-      party_id: req.customer.partyId,
+      customer_account_id: customerAccountId,
+      party_id: partyId,
+      is_guest: isGuest,
       order_no,
       fulfillment_type: fulfillment_type || 'pickup',
       delivery_address: fulfillment_type === 'delivery' ? delivery_address.trim() : null,
-      delivery_phone: fulfillment_type === 'delivery' ? (delivery_phone?.trim() || req.customer.phone) : null,
+      delivery_phone: fulfillment_type === 'delivery' ? (delivery_phone?.trim() || req.customer?.phone || guestPhone) : null,
       delivery_notes: notes?.trim() || delivery_notes?.trim() || null,
       payment_method: payment_method || 'pay_at_store',
       subtotal, discount_amount, tax_amount, delivery_charge, grand_total,
     }).returning('*')
 
     await trx('customer_order_items').insert(orderItemRows.map(it => ({ ...it, order_id: order.id })))
-    await trx('customer_cart_items').where({ customer_account_id: req.customer.accountId }).delete()
+    if (req.customer) await trx('customer_cart_items').where({ customer_account_id: req.customer.accountId }).delete()
 
     await trx.commit()
-    await auditLog(req.companyId, null, 'CREATE', 'customer_order', order.id, { order_no, grand_total }, req.ip)
+    await auditLog(req.companyId, null, 'CREATE', 'customer_order', order.id, { order_no, grand_total, is_guest: isGuest }, req.ip)
 
     res.status(201).json({ success: true, data: { ...order, items: orderItemRows } })
   } catch (err) {
@@ -153,7 +234,7 @@ router.post('/', async (req, res, next) => {
 })
 
 /* ── GET /customer-orders (own history) ───────────────────────────────── */
-router.get('/', async (req, res, next) => {
+router.get('/', requireLoggedInCustomer, async (req, res, next) => {
   try {
     const { page = 1, limit = 20 } = req.query
     const lim = Math.min(50, Number(limit) || 20)
@@ -177,7 +258,7 @@ router.get('/', async (req, res, next) => {
  * order id exists at all under someone else's account (spec #40's IDOR
  * requirement, applied the same way sales.js/reminders.js already do it
  * for their own ownership checks). */
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', requireLoggedInCustomer, async (req, res, next) => {
   try {
     const order = await db('customer_orders')
       .where({ id: req.params.id, customer_account_id: req.customer.accountId })

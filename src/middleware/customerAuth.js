@@ -81,4 +81,52 @@ async function authenticateCustomer(req, res, next) {
   } catch (err) { next(err) }
 }
 
-module.exports = { authenticateCustomer, signCustomerToken }
+// ── Guest support (spec §14: "do not force registration merely to
+// browse", and guest checkout) ───────────────────────────────────────────
+//
+// A guest has no token, so there's nothing to "authenticate" — what a
+// guest request DOES carry is the storefront's own company_id, already
+// publicly resolved client-side via GET /storefront/config (routes/
+// storefront.js). Trusting that value here for browsing/checkout is the
+// same trust boundary routes/customerAuth.js's /register and /login
+// already accept a client-supplied `company_id` at — not a new one
+// opened for this.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+async function resolveActiveCompanyById(companyId) {
+  if (typeof companyId !== 'string' || !UUID_RE.test(companyId)) return null
+  const company = await db('companies').where({ id: companyId }).first('id', 'is_active')
+  if (!company || company.is_active === false) return null
+  return company
+}
+
+/**
+ * Use in place of `authenticateCustomer` on routes that must work for
+ * BOTH a logged-in customer AND an anonymous browser/guest checkout
+ * (customerProducts.js, customerCart.js's preview endpoint,
+ * customerOrders.js). A request WITH a bearer token is held to exactly
+ * the same standard as authenticateCustomer (invalid/expired token still
+ * 401s — it never silently downgrades to "guest" just because the token
+ * didn't check out, which would be a confusing way to fail). A request
+ * with no token at all resolves req.companyId from `company_id` (body,
+ * then query, then the `X-Store-Company` header the frontend sends for
+ * every guest request — see services/customerHttp.ts) and sets
+ * `req.customer = null` so downstream handlers can branch on it.
+ */
+async function resolveCustomerOrGuest(req, res, next) {
+  if (req.headers.authorization?.startsWith('Bearer ')) {
+    return authenticateCustomer(req, res, next)
+  }
+  try {
+    const companyId = req.body?.company_id || req.query.company_id || req.headers['x-store-company']
+    const company = await resolveActiveCompanyById(companyId)
+    if (!company) {
+      return res.status(400).json({ success: false, message: 'Store configuration is unavailable. Please contact the store administrator.' })
+    }
+    req.companyId = company.id
+    req.customer = null
+    next()
+  } catch (err) { next(err) }
+}
+
+module.exports = { authenticateCustomer, signCustomerToken, resolveCustomerOrGuest, resolveActiveCompanyById }

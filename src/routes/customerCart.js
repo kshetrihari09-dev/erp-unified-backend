@@ -8,17 +8,15 @@
  */
 const router = require('express').Router()
 const db = require('../db/knex')
-const { authenticateCustomer } = require('../middleware/customerAuth')
+const { authenticateCustomer, resolveCustomerOrGuest } = require('../middleware/customerAuth')
 const { resolveMany, validateQuantity, toCatalogCard } = require('../services/customerCatalogService')
 
-router.use(authenticateCustomer)
-
-async function buildCartResponse(companyId, customerAccountId) {
-  const rows = await db('customer_cart_items as ci')
-    .join('products as p', 'p.id', 'ci.product_id')
-    .where('ci.customer_account_id', customerAccountId)
-    .select('ci.id as cart_item_id', 'ci.quantity as cart_qty', 'p.*')
-
+/* ── Shared computation: rows → the {items, subtotal, has_issues, ...}
+ * shape both the persisted cart (below) and the stateless guest preview
+ * (POST /preview) return. `rows` is any array of
+ * {cart_item_id, cart_qty, ...productFields} — cart_item_id is null for
+ * the guest preview, which has no persisted row to point back at. */
+async function computeCartResponse(companyId, rows) {
   const products = rows.map(r => {
     const { cart_item_id, cart_qty, ...product } = r
     return product
@@ -59,16 +57,66 @@ async function buildCartResponse(companyId, customerAccountId) {
     items,
     has_issues: items.some(i => !i.valid || !i.still_online),
     subtotal: Math.round(subtotal * 100) / 100,
-    // See routes/customerCart.js's sibling, customerOrders.js, for why
-    // these are 0 rather than invented: no product-level tax and no
-    // discount-by-rule exist anywhere in the current Sales module either
-    // (sale_items has no tax field at all — only an ad-hoc cashier-
-    // entered discount_pct/cc_pct per line) — there is no existing
-    // business rule to reuse here, so nothing is fabricated in its place.
+    // See routes/customerOrders.js for why these are 0 rather than
+    // invented: no product-level tax and no discount-by-rule exist
+    // anywhere in the existing Sales module either — there is no
+    // existing business rule to reuse here, so nothing is fabricated in
+    // its place.
     discount_amount: 0,
     tax_amount: 0,
   }
 }
+
+async function buildCartResponse(companyId, customerAccountId) {
+  const rows = await db('customer_cart_items as ci')
+    .join('products as p', 'p.id', 'ci.product_id')
+    .where('ci.customer_account_id', customerAccountId)
+    .select('ci.id as cart_item_id', 'ci.quantity as cart_qty', 'p.*')
+  return computeCartResponse(companyId, rows)
+}
+
+/* ── POST /customer-cart/preview ──────────────────────────────────────────
+ * Guest checkout's equivalent of GET /customer-cart: there's no server-
+ * side guest cart to persist to (a guest has no identity to key one on —
+ * see routes/customerOrders.js's guest checkout branch for why that's a
+ * deliberate scope choice, not an oversight), so the guest cart lives in
+ * the browser and this endpoint just prices/validates whatever it's
+ * holding — same live price/availability computation as the real cart,
+ * nothing cached or persisted. `resolveCustomerOrGuest`-gated so a
+ * logged-in customer could technically call this too (harmless — it's
+ * pure/stateless), but its actual purpose is the guest cart page. */
+router.post('/preview', resolveCustomerOrGuest, async (req, res, next) => {
+  try {
+    const items = Array.isArray(req.body?.items) ? req.body.items : []
+    if (!items.length) return res.json({ success: true, data: { items: [], has_issues: false, subtotal: 0, discount_amount: 0, tax_amount: 0 } })
+
+    // Merge duplicate product_ids (defensive — a client bug sending the
+    // same line twice shouldn't double-count) and cap the line count so
+    // an anonymous caller can't force an unbounded query.
+    const qtyByProduct = new Map()
+    for (const it of items.slice(0, 100)) {
+      const pid = it?.product_id
+      const qty = Number(it?.quantity)
+      if (!pid || !Number.isFinite(qty) || qty <= 0) continue
+      qtyByProduct.set(pid, (qtyByProduct.get(pid) || 0) + qty)
+    }
+    const productIds = [...qtyByProduct.keys()]
+    if (!productIds.length) return res.json({ success: true, data: { items: [], has_issues: false, subtotal: 0, discount_amount: 0, tax_amount: 0 } })
+
+    const products = await db('products').where({ company_id: req.companyId }).whereIn('id', productIds)
+    // Rows for a product_id that doesn't resolve (deleted, wrong company,
+    // never existed) are simply omitted here rather than erroring the
+    // whole preview — routes/customerOrders.js's checkout does the same
+    // "the client's list is a request, never a guarantee" re-validation
+    // one more time anyway, so a stale line in a guest's browser-held
+    // cart fails at the point that actually matters.
+    const rows = products.map(p => ({ cart_item_id: null, cart_qty: qtyByProduct.get(p.id), ...p }))
+
+    res.json({ success: true, data: await computeCartResponse(req.companyId, rows) })
+  } catch (err) { next(err) }
+})
+
+router.use(authenticateCustomer)
 
 /* ── GET /customer-cart ───────────────────────────────────────────────── */
 router.get('/', async (req, res, next) => {
