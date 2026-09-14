@@ -86,4 +86,38 @@ router.get('/config', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// GET /storefront/list — lets a customer pick a store instead of needing
+// to already know its slug (the whole point of this endpoint; before it
+// existed, GET /config alone meant a customer HAD to already have a
+// ?store=<slug> link — there was no way to browse "which stores are
+// there"). Public and deliberately minimal, same "safe storefront info
+// only" shape as /config's toSafeStore, minus company_id — a picker
+// doesn't need it, only /config's caller (the login/register pages,
+// after a store is already chosen) does.
+router.get('/list', async (req, res, next) => {
+  try {
+    const q = String(req.query.q || '').trim().slice(0, 100)
+
+    let query = db('companies')
+      .where({ is_active: true })
+      .whereNotNull('storefront_code')
+      .orderBy('name', 'asc')
+      .limit(100)
+      .select('name', 'logo_url', 'address', 'storefront_code')
+
+    if (q) query = query.andWhere('name', 'ilike', `%${q}%`)
+
+    const stores = await query
+    return res.json({
+      success: true,
+      stores: stores.map((c) => ({
+        name: c.name,
+        logo: c.logo_url || null,
+        address: c.address || null,
+        storefront_code: c.storefront_code,
+      })),
+    })
+  } catch (err) { next(err) }
+})
+
 module.exports = router

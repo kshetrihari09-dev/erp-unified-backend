@@ -18,9 +18,13 @@
 
 const router = require('express').Router()
 const db     = require('../db/knex')
+const fs     = require('fs')
+const path   = require('path')
+const multer = require('multer')
 const { authenticate }  = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { nextItemCode, nextAutoBarcode, auditLog } = require('../utils/helpers')
+const { validateUploadedFile } = require('../utils/uploadValidation')
 
 router.use(authenticate)
 
@@ -456,6 +460,101 @@ router.patch('/:id/online-settings', async (req, res, next) => {
       .returning('*')
 
     await auditLog(req.companyId, req.user.id, 'UPDATE', 'products_online_settings', req.params.id, updates, req.ip)
+    return successResponse(res, updated)
+  } catch (err) { next(err) }
+})
+
+/* ── Product image upload/removal ─────────────────────────────────────────
+ * Reuses `products.online_image_url` (migration 034) — the column already
+ * existed as a plain "paste a link" string for the customer storefront's
+ * product card/detail image; nothing new added to the schema (spec's own
+ * "do not create duplicate image fields"). What's new here is just a real
+ * upload path INTO that same column, alongside the existing plain-string
+ * PATCH .../online-settings above — a caller can still PATCH a raw URL in
+ * directly if they want to; this just also offers "upload a file and let
+ * the server fill that same field in safely."
+ *
+ * Storage: server.js already serves ./uploads statically (express.static,
+ * "Static uploads" section) — that mount existed before this feature and
+ * wasn't being written to by anything yet. Reused as-is rather than
+ * pulling in S3/Cloudinary/etc (spec's "do not introduce another storage
+ * provider unnecessarily") — this app has no paid object-storage
+ * dependency today, and product photos are small, so local disk under the
+ * already-public /uploads mount is the smallest safe fit, not a
+ * corner-cut: the moment this deployment ever needs a CDN/object store,
+ * only PRODUCTS_UPLOAD_DIR/buildImageUrl below would need to change, not
+ * every place that reads `online_image_url`.
+ *
+ * Every file lives at uploads/products/<companyId>/<random>.<ext> — the
+ * companyId path segment is what makes the multi-tenant isolation
+ * physical, not just logical: even the on-disk layout keeps one company's
+ * images out of another's folder, on top of the `company_id` WHERE clause
+ * every route in this file already applies before touching a product row.
+ */
+const PRODUCTS_UPLOAD_ROOT = path.join(__dirname, '..', '..', 'uploads', 'products')
+const productImageUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }) // 5MB — a product photo, not a scanned document
+
+// A previously-uploaded (not pasted-in) image lives under our own
+// /uploads/products/ mount — safe to best-effort delete when replaced or
+// removed. A pasted-in external URL (or anything else) is left alone:
+// this app doesn't own it and has no business deleting someone else's file.
+function deleteIfLocalUpload(imageUrl) {
+  if (!imageUrl || !imageUrl.startsWith('/uploads/products/')) return
+  const abs = path.join(__dirname, '..', '..', imageUrl)
+  fs.unlink(abs, () => {}) // best-effort — spec #10/#11: never let cleanup failure break the product
+}
+
+/* ── POST /products/:id/image ─────────────────────────────────────────────
+ * multipart/form-data, field "file". Replaces any existing image (old
+ * local file cleaned up best-effort, per spec #10). */
+router.post('/:id/image', productImageUpload.single('file'), async (req, res, next) => {
+  try {
+    const existing = await db('products').where({ id: req.params.id, company_id: req.companyId }).first()
+    if (!existing) return res.status(404).json({ success: false, message: 'Product not found' })
+    if (!req.file) return res.status(400).json({ success: false, message: 'No image provided. Attach it under field name "file".' })
+
+    // Same magic-byte sniffing as cloud-storage's document upload — never
+    // trust the client's mimetype/filename — narrowed to image types only
+    // (a correctly-detected PDF is still the wrong kind of file here).
+    const validated = validateUploadedFile(req.file.buffer, req.file.originalname, ['jpg', 'png', 'webp'])
+    if (!validated.ok) return res.status(400).json({ success: false, code: validated.code, message: validated.message })
+
+    const dir = path.join(PRODUCTS_UPLOAD_ROOT, req.companyId)
+    await fs.promises.mkdir(dir, { recursive: true })
+    await fs.promises.writeFile(path.join(dir, validated.safeFileName), req.file.buffer)
+
+    const newImageUrl = `/uploads/products/${req.companyId}/${validated.safeFileName}`
+    const oldImageUrl = existing.online_image_url
+
+    const [updated] = await db('products')
+      .where({ id: req.params.id })
+      .update({ online_image_url: newImageUrl, updated_at: new Date() })
+      .returning('*')
+
+    if (oldImageUrl && oldImageUrl !== newImageUrl) deleteIfLocalUpload(oldImageUrl)
+
+    await auditLog(req.companyId, req.user.id, 'UPDATE', 'products_image', req.params.id, { online_image_url: newImageUrl }, req.ip)
+    return successResponse(res, updated)
+  } catch (err) { next(err) }
+})
+
+/* ── DELETE /products/:id/image ───────────────────────────────────────────
+ * Clears the image field only — never touches any other product data
+ * (spec #3: "Do not remove the product or change unrelated product
+ * fields when removing an image"). */
+router.delete('/:id/image', async (req, res, next) => {
+  try {
+    const existing = await db('products').where({ id: req.params.id, company_id: req.companyId }).first()
+    if (!existing) return res.status(404).json({ success: false, message: 'Product not found' })
+
+    const [updated] = await db('products')
+      .where({ id: req.params.id })
+      .update({ online_image_url: null, updated_at: new Date() })
+      .returning('*')
+
+    deleteIfLocalUpload(existing.online_image_url)
+
+    await auditLog(req.companyId, req.user.id, 'UPDATE', 'products_image', req.params.id, { online_image_url: null }, req.ip)
     return successResponse(res, updated)
   } catch (err) { next(err) }
 })

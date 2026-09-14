@@ -23,21 +23,39 @@ const SIGNATURES = [
   { bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], mimeType: 'image/png', ext: 'png' },
 ]
 
+// WEBP's signature isn't a fixed byte run like the others — it's a RIFF
+// container ("RIFF" + 4-byte length + "WEBP") where bytes 4-7 are a file
+// size, not a fixed constant, so it doesn't fit the simple prefix-match
+// table above. Checked separately, same "trust nothing but the bytes"
+// principle: bytes 0-3 must be "RIFF" and bytes 8-11 must be "WEBP".
+function detectWebp(buffer) {
+  if (buffer.length < 12) return null
+  const isRiff = buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 // "RIFF"
+  const isWebp = buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50 // "WEBP"
+  return (isRiff && isWebp) ? { mimeType: 'image/webp', ext: 'webp' } : null
+}
+
 function detectType(buffer) {
   for (const sig of SIGNATURES) {
     if (buffer.length >= sig.bytes.length && sig.bytes.every((b, i) => buffer[i] === b)) {
       return sig
     }
   }
-  return null
+  return detectWebp(buffer)
 }
 
 /**
  * Validates an uploaded file buffer. Returns { ok: true, mimeType, ext,
  * safeFileName } on success, or { ok: false, code, message } on failure.
  * Never throws.
+ *
+ * `allowedExts` (optional) narrows the accepted set beyond the full
+ * pdf/jpg/png/webp table — e.g. the product-image endpoint passes
+ * ['jpg', 'png', 'webp'] so a PDF sniffed correctly is still rejected as
+ * the wrong kind of file for that field, without touching the shared
+ * detection logic above. Omitted = whatever detectType() recognizes.
  */
-function validateUploadedFile(buffer, originalName) {
+function validateUploadedFile(buffer, originalName, allowedExts) {
   if (!buffer || !buffer.length) {
     return { ok: false, code: 'INVALID_REQUEST', message: 'Uploaded file is empty.' }
   }
@@ -45,8 +63,9 @@ function validateUploadedFile(buffer, originalName) {
     return { ok: false, code: 'INVALID_REQUEST', message: 'File exceeds the maximum allowed size (20MB).' }
   }
   const detected = detectType(buffer)
-  if (!detected) {
-    return { ok: false, code: 'INVALID_REQUEST', message: 'Unsupported or invalid file type. Only PDF, JPG, and PNG are accepted.' }
+  if (!detected || (allowedExts && !allowedExts.includes(detected.ext))) {
+    const label = allowedExts ? allowedExts.map(e => e.toUpperCase()).join(', ') : 'PDF, JPG, PNG, WEBP'
+    return { ok: false, code: 'INVALID_REQUEST', message: `Unsupported or invalid file type. Only ${label} are accepted.` }
   }
 
   // Server-generated object name — never the client's filename/extension.

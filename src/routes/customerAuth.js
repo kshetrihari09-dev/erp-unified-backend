@@ -11,11 +11,19 @@
  * (or staff, later) explicitly register one.
  *
  * `company_id` is required in the request body for both register and
- * login: this app is multi-tenant and there is, as of this phase, no
- * customer-facing "which store am I on" resolution yet (subdomain, store
- * slug, QR code, etc.) — that's a Phase 4 (frontend) decision. Until
- * then, the storefront is responsible for knowing/passing which
- * company's catalog it's showing.
+ * login: this app is multi-tenant, resolved client-side via
+ * StorefrontContext (?store=<slug> — see routes/storefront.js) before
+ * either of these is ever called.
+ *
+ * Registration approval workflow (migration 037): a new registration
+ * does NOT get a token — status starts at 'pending' and there is
+ * nothing to log in to until a Store owner/admin approves it
+ * (routes/adminCustomerRegistrations.js). Enforcement lives entirely
+ * here, at login (the only place a customer token is ever minted) and
+ * in authenticateCustomer (middleware/customerAuth.js, the only place
+ * an existing token is ever re-validated) — nowhere else needs to know
+ * about `status` at all, since a pending/rejected customer can
+ * structurally never hold a valid token in the first place.
  */
 const router = require('express').Router()
 const bcrypt = require('bcryptjs')
@@ -83,6 +91,9 @@ router.post('/register', async (req, res, next) => {
       }).returning('*')
 
       const password_hash = await bcrypt.hash(password, 12)
+      // status defaults to 'pending' (migration 037) — deliberately NOT
+      // overridden here, so this insert fails loudly if that default is
+      // ever removed, rather than silently reintroducing auto-approval.
       const [account] = await trx('customer_accounts').insert({
         company_id, party_id: party.id, login_identifier: loginIdentifier, password_hash,
       }).returning('*')
@@ -90,14 +101,36 @@ router.post('/register', async (req, res, next) => {
       return { party, account }
     })
 
-    await auditLog(company_id, null, 'CREATE', 'customer_account', result.account.id, { name: name.trim(), phone: loginIdentifier }, req.ip)
+    await auditLog(company_id, null, 'CREATE', 'customer_account', result.account.id, { name: name.trim(), phone: loginIdentifier, status: 'pending' }, req.ip)
 
-    const token = signCustomerToken({ customerAccountId: result.account.id, companyId: company_id, partyId: result.party.id })
+    // Staff-facing notification (existing generic feed — routes/notifications.js,
+    // migration 032). company-wide (user_id null) so any owner/admin/manager
+    // sees it, same as a Credit-Risk alert. This is the only "notify
+    // someone" step for registration: there is no customer-facing push
+    // channel, so the customer's own path is checking back via Login
+    // (see /login below) — spec's own documented fallback when no such
+    // system exists.
+    await db('notifications').insert({
+      company_id,
+      user_id: null,
+      category: 'customer_registration',
+      severity: 'info',
+      title: 'New customer registration',
+      message: `${name.trim()} (${loginIdentifier}) registered and is awaiting approval.`,
+      related_customer_id: result.party.id,
+      metadata: JSON.stringify({ customer_account_id: result.account.id }),
+    }).catch(() => {}) // best-effort — a notification failure must never fail the registration itself
+
+    // No token: registration does not grant access (spec's own
+    // non-negotiable). The frontend takes this straight to a "Registration
+    // Submitted / Pending Approval" screen, not the storefront.
     res.status(201).json({
       success: true,
       data: {
-        token,
-        customer: { id: result.account.id, name: result.party.name, phone: result.party.phone, email: result.party.email },
+        status: result.account.status,
+        name: result.party.name,
+        phone: result.party.phone,
+        submitted_at: result.account.created_at,
       },
     })
   } catch (err) {
@@ -135,6 +168,27 @@ router.post('/login', async (req, res, next) => {
     const invalid = () => res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: 'Invalid phone number or password.' })
 
     if (!account || !(await bcrypt.compare(password, account.password_hash))) return invalid()
+
+    // Approval workflow (migration 037) — checked BEFORE is_active/
+    // party_is_active below, since a still-pending registration was
+    // never "enabled" in the first place; that's a distinct message a
+    // customer needs to see plainly, not folded into "This account has
+    // been disabled."
+    if (account.status === 'pending') {
+      return res.status(403).json({
+        success: false, code: 'REGISTRATION_PENDING',
+        message: 'Your registration is pending approval. Please wait for the store administrator to approve your registration.',
+        data: { status: 'pending', submitted_at: account.created_at },
+      })
+    }
+    if (account.status === 'rejected') {
+      return res.status(403).json({
+        success: false, code: 'REGISTRATION_REJECTED',
+        message: 'Your registration was not approved by this store.',
+        data: { status: 'rejected', reason: account.rejection_reason || null },
+      })
+    }
+
     if (!account.is_active || !account.party_is_active) {
       return res.status(403).json({ success: false, code: 'ACCOUNT_DISABLED', message: 'This account has been disabled.' })
     }
