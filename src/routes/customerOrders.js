@@ -37,6 +37,7 @@ const db = require('../db/knex')
 const { resolveCustomerOrGuest } = require('../middleware/customerAuth')
 const { resolveMany, validateQuantity } = require('../services/customerCatalogService')
 const { auditLog, todayBS, nextPartyCode } = require('../utils/helpers')
+const deliveryOtp = require('../services/deliveryOtpService')
 
 // POST / (checkout) must work for both a logged-in customer AND a guest
 // (spec §14) — resolveCustomerOrGuest, not authenticateCustomer, sets
@@ -48,6 +49,52 @@ router.use(resolveCustomerOrGuest)
 function requireLoggedInCustomer(req, res, next) {
   if (!req.customer) return res.status(401).json({ success: false, code: 'AUTH_REQUIRED', message: 'Please log in to view your orders.' })
   next()
+}
+
+/* ── What the customer sees of the delivery OTP ───────────────────────────
+ * This is the ONE place in the application that ever turns the stored
+ * code back into readable digits, and it is reached only after
+ * requireLoggedInCustomer plus an ownership-scoped WHERE clause — so
+ * "who is allowed to read this code" is answered by the same query that
+ * decides whether the order exists at all.
+ *
+ * The code appears only while the order is actually out for delivery
+ * (spec §6): not on the cart, not at checkout, not while the order is
+ * merely confirmed, and not once it has been delivered. Everywhere else
+ * `delivery_otp` is simply absent from the payload — not null-but-
+ * present, absent, so a UI cannot accidentally render a stale one.
+ *
+ * The raw columns are stripped unconditionally: the ciphertext and the
+ * bcrypt hash never leave the server, only the decrypted digits do, and
+ * only under the conditions above.
+ */
+function customerView(order) {
+  const { delivery_otp_hash, delivery_otp_secret, ...safe } = order
+
+  const view = {
+    ...safe,
+    // Delivery-partner privacy (spec §24): a display name and a phone
+    // number to call about this delivery. No user id, no email, no role,
+    // no internal flags — note the select list this is built from.
+    delivery_partner_name: order.delivery_partner_name || null,
+    delivery_partner_phone: order.delivery_partner_phone || null,
+    delivery_otp_verified_at: order.delivery_otp_verified_at || null,
+  }
+
+  if (order.status === 'out_for_delivery' && !order.delivery_otp_verified_at) {
+    const code = deliveryOtp.revealCodeForCustomer(order)
+    if (code) {
+      view.delivery_otp = code
+      view.delivery_otp_expires_at = order.delivery_otp_expires_at
+    } else {
+      // Issued but no longer readable — expired, or encrypted under a
+      // key this server no longer has. Tell the customer plainly that a
+      // new code is needed rather than showing a stale one.
+      view.delivery_otp_unavailable = true
+    }
+  }
+
+  return view
 }
 
 async function nextOrderNo(trx, companyId) {
@@ -226,7 +273,7 @@ router.post('/', async (req, res, next) => {
     await trx.commit()
     await auditLog(req.companyId, null, 'CREATE', 'customer_order', order.id, { order_no, grand_total, is_guest: isGuest }, req.ip)
 
-    res.status(201).json({ success: true, data: { ...order, items: orderItemRows } })
+    res.status(201).json({ success: true, data: { ...customerView(order), items: orderItemRows } })
   } catch (err) {
     await trx.rollback()
     next(err)
@@ -244,8 +291,12 @@ router.get('/', requireLoggedInCustomer, async (req, res, next) => {
     const total = Number((await q.clone().count('id as c').first())?.c || 0)
     const orders = await q.clone().orderBy('created_at', 'desc').limit(lim).offset(offset)
 
+    // The list never carries a code, even for an out-for-delivery order —
+    // customerView only reveals one when it is given the delivery-partner
+    // join, which only GET /:id performs. A code belongs on the one screen
+    // the customer opened deliberately, not in a scrollable history.
     res.json({
-      success: true, data: orders,
+      success: true, data: orders.map(o => { const v = customerView(o); delete v.delivery_otp; return v }),
       pagination: { total, page: Number(page), limit: lim, totalPages: Math.ceil(total / lim) },
     })
   } catch (err) { next(err) }
@@ -260,13 +311,15 @@ router.get('/', requireLoggedInCustomer, async (req, res, next) => {
  * for their own ownership checks). */
 router.get('/:id', requireLoggedInCustomer, async (req, res, next) => {
   try {
-    const order = await db('customer_orders')
-      .where({ id: req.params.id, customer_account_id: req.customer.accountId })
+    const order = await db('customer_orders as co')
+      .leftJoin('users as dp', 'dp.id', 'co.assigned_delivery_partner_id')
+      .where({ 'co.id': req.params.id, 'co.customer_account_id': req.customer.accountId })
+      .select('co.*', 'dp.name as delivery_partner_name', 'dp.phone as delivery_partner_phone')
       .first()
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' })
 
     const items = await db('customer_order_items').where({ order_id: order.id }).orderBy('created_at')
-    res.json({ success: true, data: { ...order, items } })
+    res.json({ success: true, data: { ...customerView(order), items } })
   } catch (err) { next(err) }
 })
 

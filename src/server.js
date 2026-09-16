@@ -68,6 +68,7 @@ const customerProductsRouter = require('./routes/customerProducts')
 const customerCartRouter     = require('./routes/customerCart')
 const customerOrdersRouter   = require('./routes/customerOrders')
 const adminCustomerOrdersRouter = require('./routes/adminCustomerOrders')
+const deliveryPartnerRouter     = require('./routes/deliveryPartner')
 const adminCustomerRegistrationsRouter = require('./routes/adminCustomerRegistrations')
 const scannerRouter    = require('./scanner/scannerRoutes')
 
@@ -278,6 +279,9 @@ app.use(`${API}/customer-products`, customerProductsRouter)
 app.use(`${API}/customer-cart`,      customerCartRouter)
 app.use(`${API}/customer-orders`,    customerOrdersRouter)
 app.use(`${API}/admin/customer-orders`, adminCustomerOrdersRouter)
+// Delivery partner app (migration 038). Staff-authenticated, but every
+// route inside is scoped to the caller's own assigned orders.
+app.use(`${API}/delivery`,            deliveryPartnerRouter)
 app.use(`${API}/admin/customer-registrations`, adminCustomerRegistrationsRouter)
 app.use(`${API}/stock`,      stockRouter)
 app.use(`${API}/returns`,    returnsRouter)

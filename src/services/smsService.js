@@ -53,6 +53,52 @@ class SMSService {
     }
   }
 
+  /**
+   * Send an arbitrary transactional message.
+   *
+   * sendOTP() above hardcodes the login-flow wording ("valid for 5
+   * minutes"), which is wrong for anything that isn't a login OTP — the
+   * delivery-verification code, for instance, is valid for 30 minutes
+   * and needs the order number in the text. Every provider method below
+   * already takes a fully-formed `message`, so this is just the missing
+   * entry point to them; sendOTP is untouched and still the right call
+   * for auth flows.
+   *
+   * @param {string} phone    — E.164 or local format
+   * @param {string} message  — the exact text to send
+   * @param {string} [logLabel] — what to call this in console-mode output
+   */
+  async sendMessage(phone, message, logLabel = 'Message') {
+    try {
+      switch (this.provider) {
+        case 'sparrow': return await this._sendSparrow(phone, message)
+        case 'aakash':  return await this._sendAakash(phone, message)
+        case 'twilio':  return await this._sendTwilio(phone, message)
+        case 'console':
+        default:        return this._consoleSendMessage(phone, message, logLabel)
+      }
+    } catch (err) {
+      console.error('[SMS] Send error:', err.message)
+      return { success: false, error: err.message }
+    }
+  }
+
+  /** Development: log a generic message to console. Unlike _consoleSend
+   *  below, this never assumes the payload is an OTP, and never prints
+   *  the body in production — a delivery code must not land in server
+   *  logs (spec §18). */
+  _consoleSendMessage(phone, message, logLabel = 'Message') {
+    if (process.env.NODE_ENV === 'production') {
+      console.warn(`[SMS] console-mode delivery is configured in production — no SMS is actually being sent (${logLabel} → ${phone}). Set SMS_PROVIDER to a real provider.`)
+      return { success: true, messageId: `console-${Date.now()}` }
+    }
+    console.log('\n' + '═'.repeat(50))
+    console.log(`📱 SMS (console mode) → ${phone}`)
+    console.log(`   ${logLabel}: ${message}`)
+    console.log('═'.repeat(50) + '\n')
+    return { success: true, messageId: `console-${Date.now()}` }
+  }
+
   /** Development: log to console */
   _consoleSend(phone, otp, message) {
     const shown = process.env.NODE_ENV === 'production' ? `***${otp.slice(-2)}` : otp
