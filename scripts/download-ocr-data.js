@@ -42,15 +42,20 @@ function download(url, destPath, redirectsLeft = 5) {
   })
 }
 
-async function main() {
+/**
+ * ensureTessdata() — download if missing, no-op if already present.
+ * Exported so ocrEngine.js can call this as a runtime fallback: if a
+ * deploy's build step never ran this script (e.g. a Docker image built
+ * from a cached node_modules that skipped postinstall, or `npm ci
+ * --ignore-scripts`), the first scan request triggers the download
+ * itself instead of failing forever until someone notices and redeploys.
+ */
+async function ensureTessdata() {
   if (fs.existsSync(DEST_FILE) && fs.statSync(DEST_FILE).size > 0) {
-    console.log(`[setup:ocr] Already present at ${DEST_FILE} — nothing to do.`)
-    return
+    return { downloaded: false, path: DEST_FILE }
   }
 
   await fs.promises.mkdir(DEST_DIR, { recursive: true })
-  console.log(`[setup:ocr] Downloading English OCR data to ${DEST_FILE} ...`)
-
   const tmpFile = DEST_FILE + '.download'
   try {
     await download(URL, tmpFile)
@@ -59,9 +64,23 @@ async function main() {
       throw new Error(`Downloaded file is suspiciously small (${size} bytes) — likely not the real trained-data file.`)
     }
     await fs.promises.rename(tmpFile, DEST_FILE)
-    console.log(`[setup:ocr] Done (${(size / 1_000_000).toFixed(1)} MB).`)
+    return { downloaded: true, path: DEST_FILE, sizeBytes: size }
   } catch (err) {
     await fs.promises.unlink(tmpFile).catch(() => {})
+    throw err
+  }
+}
+
+async function main() {
+  console.log(`[setup:ocr] Ensuring OCR data is present at ${DEST_FILE} ...`)
+  try {
+    const result = await ensureTessdata()
+    if (!result.downloaded) {
+      console.log(`[setup:ocr] Already present at ${DEST_FILE} — nothing to do.`)
+    } else {
+      console.log(`[setup:ocr] Done (${(result.sizeBytes / 1_000_000).toFixed(1)} MB).`)
+    }
+  } catch (err) {
     console.error(`[setup:ocr] Failed: ${err.message}`)
     console.error('[setup:ocr] Scan Purchase Bill will not work until this succeeds. You can also')
     console.error(`[setup:ocr] place a valid eng.traineddata.gz at ${DEST_FILE} manually.`)
@@ -69,4 +88,6 @@ async function main() {
   }
 }
 
-main()
+if (require.main === module) main()
+
+module.exports = { ensureTessdata, DEST_FILE, DEST_DIR }

@@ -25,6 +25,7 @@
 const fs = require('fs')
 const path = require('path')
 const { createWorker } = require('tesseract.js')
+const { ensureTessdata } = require('../../../scripts/download-ocr-data')
 
 const LANG = 'eng'
 const TESSDATA_DIR = path.join(__dirname, '..', '..', '..', 'data', 'tessdata')
@@ -41,25 +42,41 @@ function tessdataReady() {
  *  since recognize() is already safe to call repeatedly on one worker. */
 function getWorker() {
   if (!workerPromise) {
-    if (!tessdataReady()) {
-      const err = new Error(
-        `OCR language data not found at ${TESSDATA_DIR}. Run \`npm run setup:ocr\` once ` +
-        `(from erp-unified-backend) to download it, then restart the server.`
-      )
-      err.code = 'OCR_DATA_MISSING'
-      return Promise.reject(err)
-    }
-    // gzip: true — the setup script stores the trained-data file exactly
-    // as downloaded (.traineddata.gz); tesseract.js decompresses it
-    // in-process. This is the exact shape verified working end-to-end
-    // while building this feature — don't "simplify" this away without
-    // re-testing, tesseract.js is picky about this option matching the
-    // file it finds.
-    workerPromise = createWorker(LANG, 1, {
-      langPath: TESSDATA_DIR,
-      cachePath: TESSDATA_DIR,
-      gzip: true,
-    })
+    workerPromise = (async () => {
+      if (!tessdataReady()) {
+        // `npm run setup:ocr` / postinstall is the intended way this gets
+        // here, but a build that skipped it (a Docker image built from a
+        // cached node_modules, `npm ci --ignore-scripts`, a platform that
+        // doesn't persist the build step's filesystem into the runtime
+        // container) shouldn't mean Scan Purchase Bill is broken until
+        // someone notices and redeploys. Try once, in-process, on first
+        // real use.
+        console.warn(`[OCR] Trained data not found at ${TESSDATA_DIR} — attempting to download it now (first use only; consider running \`npm run setup:ocr\` in your build step so this doesn't happen on a live request).`)
+        try {
+          await ensureTessdata()
+        } catch (err) {
+          workerPromise = null // let the NEXT request retry rather than caching this failure forever
+          const wrapped = new Error(
+            `OCR language data could not be found or downloaded (${err.message}). If this server has no ` +
+            `outbound internet access, download it elsewhere and place it at ${TESSDATA_DIR}/${LANG}.traineddata.gz, ` +
+            `or run \`npm run setup:ocr\` where it does have access, then redeploy with that file included.`
+          )
+          wrapped.code = 'OCR_DATA_MISSING'
+          throw wrapped
+        }
+      }
+      // gzip: true — the setup script stores the trained-data file exactly
+      // as downloaded (.traineddata.gz); tesseract.js decompresses it
+      // in-process. This is the exact shape verified working end-to-end
+      // while building this feature — don't "simplify" this away without
+      // re-testing, tesseract.js is picky about this option matching the
+      // file it finds.
+      return createWorker(LANG, 1, {
+        langPath: TESSDATA_DIR,
+        cachePath: TESSDATA_DIR,
+        gzip: true,
+      })
+    })()
   }
   return workerPromise
 }

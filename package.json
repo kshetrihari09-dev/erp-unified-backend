@@ -19,7 +19,8 @@
     "gen-certs": "bash scripts/gen-certs.sh",
     "backfill:discount-accounts": "node scripts/backfill_discount_accounts.js --all",
     "check-env": "node -e \"require('./src/config/index.js'); console.log('\u2705 Config OK')\"",
-    "setup:ocr": "node scripts/download-ocr-data.js"
+    "setup:ocr": "node scripts/download-ocr-data.js",
+    "postinstall": "node scripts/download-ocr-data.js || echo '[postinstall] OCR data download failed or was skipped — Scan Purchase Bill will attempt to fetch it again on first use.'"
   },
   "dependencies": {
     "nepali-date-converter": "^3.4.0",
