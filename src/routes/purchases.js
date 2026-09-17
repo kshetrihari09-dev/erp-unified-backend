@@ -22,6 +22,7 @@ const { authenticate, identifyDevice, requireSensitiveConfirm }  = require('../m
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { nextBillNo, adToBS, todayBS, auditLog, clampExpiry, isValidUUID } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
+const { calcRowAmount } = require('../utils/purchaseCalc')
 
 router.use(authenticate)
 router.use(identifyDevice)
@@ -69,8 +70,26 @@ router.get('/:id', async (req, res, next) => {
 router.post('/', async (req, res, next) => {
   const trx = await db.transaction()
   try {
-    const { party_id, date_ad, payment_mode, supplier_bill_no, items, notes, client_txn_id, purchase_order_id } = req.body
+    const { party_id, date_ad, payment_mode, supplier_bill_no, items, notes, client_txn_id, purchase_order_id, source_scan_id } = req.body
     if (!items?.length) { await trx.rollback(); return res.status(400).json({ success: false, message: 'At least one item required' }) }
+
+    // ── Optional: this purchase originated from Scan Purchase Bill
+    // (see routes/purchaseScans.js). Additive — omitting source_scan_id
+    // behaves exactly as manual entry always has. Validated up front,
+    // same pattern as purchase_order_id just below: a bad/foreign/
+    // already-used scan id fails fast rather than silently orphaning it.
+    let linkedScan = null
+    if (source_scan_id) {
+      linkedScan = await trx('purchase_scans').where({ id: source_scan_id, company_id: req.companyId }).first()
+      if (!linkedScan) {
+        await trx.rollback()
+        return res.status(404).json({ success: false, message: 'Scanned bill not found' })
+      }
+      if (linkedScan.status === 'confirmed') {
+        await trx.rollback()
+        return res.status(400).json({ success: false, message: 'This scanned bill has already been used to create a purchase' })
+      }
+    }
 
     // ── Optional: this bill fulfils a Purchase Order (see migration 031 /
     // routes/purchaseOrders.js). Additive — omitting purchase_order_id
@@ -110,15 +129,16 @@ router.post('/', async (req, res, next) => {
 
     let net_total = 0
     const purchaseItems = items.map(item => {
-      const qty     = Number(item.qty)    || 0
-      const rate    = Number(item.rate)   || 0
-      const bonus   = Number(item.bonus)  || 0
-      // purchase_items schema has cc_pct + cc_amount, NOT vat_pct
-      // VAT is baked into the rate on purchase bills in Nepal pharma
-      const cc_pct   = Number(item.cc_pct)  || 0
-      const cc_amount = Math.round(qty * rate * (cc_pct / 100) * 100) / 100
-      const amount   = Math.round(((qty * rate) + cc_amount) * 100) / 100
-      net_total     += amount
+      const qty   = Number(item.qty)   || 0
+      const rate  = Number(item.rate)  || 0
+      const bonus = Number(item.bonus) || 0
+      const cc_pct = Number(item.cc_pct) || 0
+      // Was computed inline here with a different (qty-based) formula
+      // that both disagreed with the Purchase screen's live preview and
+      // was fed cc_pct=0 anyway, since the old save payload never sent
+      // it. See utils/purchaseCalc.js for the full history.
+      const { amount, cc_amount } = calcRowAmount({ qty, rate, bonus, cc_pct })
+      net_total += amount
       // Only spread columns that exist in purchase_items (migration 002):
       // id, purchase_id, product_id, product_name, batch_no, expiry_date, expiry,
       // qty, bonus, rate, cc_pct, cc_amount, amount
@@ -156,6 +176,8 @@ router.post('/', async (req, res, next) => {
       notes: notes || null, status: 'active',
       client_txn_id: client_txn_id || null, device_id: req.deviceId || null,
       purchase_order_id: linkedOrder?.id || null,
+      source: linkedScan ? 'scanned' : 'manual',
+      source_scan_id: linkedScan?.id || null,
     }).returning('*')
 
     for (const item of purchaseItems) {
@@ -183,6 +205,15 @@ router.post('/', async (req, res, next) => {
           total_cost:    Math.round(totalQty * unitCost * 100) / 100,
         })
       }
+    }
+
+    // ── Close out the source scan (additive; see routes/purchaseScans.js) ───
+    // Same transaction as the purchase itself: a scan can never end up
+    // 'confirmed' while the purchase it's supposedly linked to doesn't
+    // exist (or vice versa) — either both commit or neither does.
+    if (linkedScan) {
+      await trx('purchase_scans').where({ id: linkedScan.id })
+        .update({ status: 'confirmed', purchase_id: purchase.id, updated_at: new Date() })
     }
 
     // ── Fulfil linked Purchase Order (additive; see migration 031) ──────────

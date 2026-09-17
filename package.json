@@ -1,7 +1,7 @@
 {
   "name": "erp-unified-backend",
   "version": "2.2.0",
-  "description": "Byapar — Unified Node.js + PostgreSQL backend: Pharma ERP + Bank-Grade Accounting Engine",
+  "description": "Byapar \u2014 Unified Node.js + PostgreSQL backend: Pharma ERP + Bank-Grade Accounting Engine",
   "main": "src/server.js",
   "scripts": {
     "start": "cross-env NODE_ENV=development node src/server.js",
@@ -18,7 +18,8 @@
     "setup:prod": "npm run migrate:prod && npm run seed:prod",
     "gen-certs": "bash scripts/gen-certs.sh",
     "backfill:discount-accounts": "node scripts/backfill_discount_accounts.js --all",
-    "check-env": "node -e \"require('./src/config/index.js'); console.log('✅ Config OK')\""
+    "check-env": "node -e \"require('./src/config/index.js'); console.log('\u2705 Config OK')\"",
+    "setup:ocr": "node scripts/download-ocr-data.js"
   },
   "dependencies": {
     "nepali-date-converter": "^3.4.0",
@@ -34,7 +35,9 @@
     "morgan": "^1.10.0",
     "multer": "^1.4.5-lts.1",
     "pg": "^8.12.0",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "tesseract.js": "^5.1.1",
+    "sharp": "^0.33.5"
   },
   "devDependencies": {
     "cross-env": "^7.0.3",

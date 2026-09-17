@@ -69,6 +69,7 @@ const customerCartRouter     = require('./routes/customerCart')
 const customerOrdersRouter   = require('./routes/customerOrders')
 const adminCustomerOrdersRouter = require('./routes/adminCustomerOrders')
 const deliveryPartnerRouter     = require('./routes/deliveryPartner')
+const purchaseScansRouter       = require('./routes/purchaseScans')
 const adminCustomerRegistrationsRouter = require('./routes/adminCustomerRegistrations')
 const scannerRouter    = require('./scanner/scannerRoutes')
 
@@ -282,6 +283,10 @@ app.use(`${API}/admin/customer-orders`, adminCustomerOrdersRouter)
 // Delivery partner app (migration 038). Staff-authenticated, but every
 // route inside is scoped to the caller's own assigned orders.
 app.use(`${API}/delivery`,            deliveryPartnerRouter)
+// Scan Purchase Bill / Invoice OCR (migration 039). Purchases themselves
+// still go exclusively through app.use(`${API}/purchases`, ...) below —
+// this router only turns an uploaded bill into a reviewable draft.
+app.use(`${API}/purchase-scans`,      purchaseScansRouter)
 app.use(`${API}/admin/customer-registrations`, adminCustomerRegistrationsRouter)
 app.use(`${API}/stock`,      stockRouter)
 app.use(`${API}/returns`,    returnsRouter)
