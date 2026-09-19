@@ -12,6 +12,8 @@
  *  5. No-cache middleware — still present, prevents 304 on scanner poll
  *  6. Auth routes get a tighter rate limiter (authLimiter)
  *  7. Scanner routes get a dedicated rate limiter (scannerLimiter)
+ *  7a. Reports and Purchase-Scan (OCR) routes each get their own dedicated
+ *      rate limiter (reportsLimiter, ocrLimiter) — see middleware/security.js
  *  8. Graceful shutdown — SIGTERM/SIGINT handlers close DB pool cleanly
  *
  * Everything else (routes, DB, CORS logic, scanner) is unchanged.
@@ -38,6 +40,8 @@ const {
   generalLimiter,
   authLimiter,
   scannerLimiter,
+  reportsLimiter,
+  ocrLimiter,
   httpsRedirect,
   helmetConfig,
   extraSecurityHeaders,
@@ -286,7 +290,7 @@ app.use(`${API}/delivery`,            deliveryPartnerRouter)
 // Scan Purchase Bill / Invoice OCR (migration 039). Purchases themselves
 // still go exclusively through app.use(`${API}/purchases`, ...) below —
 // this router only turns an uploaded bill into a reviewable draft.
-app.use(`${API}/purchase-scans`,      purchaseScansRouter)
+app.use(`${API}/purchase-scans`,      ocrLimiter, purchaseScansRouter)
 app.use(`${API}/admin/customer-registrations`, adminCustomerRegistrationsRouter)
 app.use(`${API}/stock`,      stockRouter)
 app.use(`${API}/returns`,    returnsRouter)
@@ -295,8 +299,8 @@ app.use(`${API}/settings`,   settingsRouter)
 // Accounting Engine (UNCHANGED)
 app.use(`${API}/accounting`, accountingRouter)
 
-// Reports (UNCHANGED)
-app.use(`${API}/reports`,    reportsRouter)
+// Reports — dedicated (tighter) rate limit for heavy aggregate queries
+app.use(`${API}/reports`,    reportsLimiter, reportsRouter)
 
 // Scanner — dedicated rate limit for polling
 app.use(`${API}/scanner`,    scannerLimiter, scannerRouter)

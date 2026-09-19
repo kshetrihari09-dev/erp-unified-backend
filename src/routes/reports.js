@@ -345,37 +345,51 @@ async function dashboardHandler(req, res, next) {
     const today      = new Date().toISOString().split('T')[0]
     const monthStart = today.slice(0, 8) + '01'
 
-    const [todayStats]   = await db('sales').where({ company_id: req.companyId, status: 'active' }).where('date_ad', today).sum({ total: 'net_total' }).count({ count: 'id' })
-    const [monthStats]   = await db('sales').where({ company_id: req.companyId, status: 'active' }).where('date_ad', '>=', monthStart).sum({ revenue: 'net_total' })
-    const [receivable]   = await db('sales').where({ company_id: req.companyId, status: 'active' }).where('due_amount', '>', 0).sum({ total: 'due_amount' })
-
-    const stockValResult = await db.raw(
-      `SELECT COALESCE(SUM(ib.qty_remaining * ib.unit_cost),0) as val FROM inventory_batches ib WHERE ib.company_id = ?`,
-      [req.companyId]
-    )
-    const lowStockResult = await db.raw(
-      `SELECT COUNT(*) as cnt FROM (
-         SELECT p.id FROM products p
-         LEFT JOIN (SELECT product_id, SUM(qty_remaining) as stock FROM inventory_batches WHERE company_id=? GROUP BY product_id) sb ON p.id=sb.product_id
-         WHERE p.company_id=? AND p.is_active=true AND COALESCE(sb.stock,0)<p.min_stock
-       ) t`,
-      [req.companyId, req.companyId]
-    )
-    const [expiryAlerts] = await db('inventory_batches')
-      .where({ company_id: req.companyId })
-      .where('qty_remaining', '>', 0)
-      .where('expiry_date', '<=', new Date(Date.now() + 30*86400000).toISOString().split('T')[0])
-      .whereNotNull('expiry_date')
-      .count({ count: 'id' })
-
-    // Payment-mode breakdown for today's sales (drives the dashboard donut chart)
-    const paymentModeRows = await db('sales')
-      .where({ company_id: req.companyId, status: 'active' })
-      .where('date_ad', today)
-      .groupBy('payment_mode')
-      .select('payment_mode')
-      .sum({ total: 'net_total' })
-      .count({ count: 'id' })
+    // Every query below reads a different slice of data and none depends
+    // on another's result, so they're fired together instead of one
+    // after another — 7 sequential round trips to the DB (each paying
+    // its own network/connection-acquisition latency) becomes 1 round
+    // trip's worth of wall-clock time. This is the same data, computed
+    // the same way; nothing about what the dashboard shows changes.
+    const [
+      [todayStats],
+      [monthStats],
+      [receivable],
+      stockValResult,
+      lowStockResult,
+      [expiryAlerts],
+      paymentModeRows,
+    ] = await Promise.all([
+      db('sales').where({ company_id: req.companyId, status: 'active' }).where('date_ad', today).sum({ total: 'net_total' }).count({ count: 'id' }),
+      db('sales').where({ company_id: req.companyId, status: 'active' }).where('date_ad', '>=', monthStart).sum({ revenue: 'net_total' }),
+      db('sales').where({ company_id: req.companyId, status: 'active' }).where('due_amount', '>', 0).sum({ total: 'due_amount' }),
+      db.raw(
+        `SELECT COALESCE(SUM(ib.qty_remaining * ib.unit_cost),0) as val FROM inventory_batches ib WHERE ib.company_id = ?`,
+        [req.companyId]
+      ),
+      db.raw(
+        `SELECT COUNT(*) as cnt FROM (
+           SELECT p.id FROM products p
+           LEFT JOIN (SELECT product_id, SUM(qty_remaining) as stock FROM inventory_batches WHERE company_id=? GROUP BY product_id) sb ON p.id=sb.product_id
+           WHERE p.company_id=? AND p.is_active=true AND COALESCE(sb.stock,0)<p.min_stock
+         ) t`,
+        [req.companyId, req.companyId]
+      ),
+      db('inventory_batches')
+        .where({ company_id: req.companyId })
+        .where('qty_remaining', '>', 0)
+        .where('expiry_date', '<=', new Date(Date.now() + 30*86400000).toISOString().split('T')[0])
+        .whereNotNull('expiry_date')
+        .count({ count: 'id' }),
+      // Payment-mode breakdown for today's sales (drives the dashboard donut chart)
+      db('sales')
+        .where({ company_id: req.companyId, status: 'active' })
+        .where('date_ad', today)
+        .groupBy('payment_mode')
+        .select('payment_mode')
+        .sum({ total: 'net_total' })
+        .count({ count: 'id' }),
+    ])
 
     const pmTotalSum = paymentModeRows.reduce((s, r) => s + (Number(r.total) || 0), 0)
     const payment_modes = paymentModeRows

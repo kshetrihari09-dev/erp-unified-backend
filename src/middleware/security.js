@@ -77,6 +77,42 @@ const scannerLimiter = rateLimit({
   }),
 })
 
+/**
+ * reportsLimiter — profit/loss, stock valuation, dashboard, etc.
+ * These run heavier aggregate SQL than a typical GET, so they get their
+ * own (tighter than general) ceiling instead of sharing the generous
+ * general limit with every other route.
+ */
+const reportsLimiter = rateLimit({
+  windowMs:        config.security.rateLimitWindowMs,
+  max:             config.security.reportsRateLimitMax,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator:    (req) => req.ip || 'unknown',
+  handler: (_req, res) => res.status(429).json({
+    success: false,
+    message: 'Too many report requests. Please wait and try again.',
+  }),
+})
+
+/**
+ * ocrLimiter — Scan Purchase Bill uploads + their status poll.
+ * Upload is CPU/memory expensive (Sharp rasterization + Tesseract OCR);
+ * capped independently so it can't be used to exhaust server resources
+ * or the DB connection pool via a burst of uploads.
+ */
+const ocrLimiter = rateLimit({
+  windowMs:        config.security.rateLimitWindowMs,
+  max:             config.security.ocrRateLimitMax,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator:    (req) => req.ip || 'unknown',
+  handler: (_req, res) => res.status(429).json({
+    success: false,
+    message: 'Too many bill-scan requests. Please wait and try again.',
+  }),
+})
+
 // ── 2. HTTPS redirect ─────────────────────────────────────────────────────────
 
 /**
@@ -207,6 +243,8 @@ module.exports = {
   generalLimiter,
   authLimiter,
   scannerLimiter,
+  reportsLimiter,
+  ocrLimiter,
   httpsRedirect,
   helmetConfig,
   extraSecurityHeaders,

@@ -133,6 +133,20 @@ const config = {
     rateLimitMax:          optionalInt('RATE_LIMIT_MAX',         isDev ? 500 : 100),
     authRateLimitMax:      optionalInt('AUTH_RATE_LIMIT_MAX',    isDev ?  50 :  10),
     scannerRateLimitMax:   optionalInt('SCANNER_RATE_LIMIT_MAX', isDev ? 300 : 100),
+    // Reports run heavier aggregate SQL (profit/loss, stock valuation,
+    // dashboard) than a typical GET — generous enough for a dashboard
+    // that auto-refreshes plus a person clicking between report tabs,
+    // but tighter than the general limit so a runaway frontend loop or
+    // a scripted export can't hammer the reporting queries.
+    reportsRateLimitMax:   optionalInt('REPORTS_RATE_LIMIT_MAX', isDev ? 300 :  60),
+    // Purchase-scan (invoice OCR) covers both the upload itself (Sharp +
+    // Tesseract — CPU/memory heavy) and the short-lived 2s poll a client
+    // runs while OCR is processing (see useQuery.ts's usePurchaseScan).
+    // The poll is naturally self-limiting (it only runs per in-progress
+    // scan and stops itself once status leaves uploaded/processing), but
+    // this still caps how many *uploads* can be kicked off per window,
+    // independent of how many ordinary GETs the rest of the app makes.
+    ocrRateLimitMax:       optionalInt('OCR_RATE_LIMIT_MAX',     isDev ? 200 :  30),
     sessionTtlMinutes:     optionalInt('SESSION_TTL_MINUTES', 10),
   },
 

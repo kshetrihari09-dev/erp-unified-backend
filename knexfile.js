@@ -21,7 +21,23 @@ function parseConnectionString(url) {
     user:     decodeURIComponent(parsed.username),
     password: decodeURIComponent(parsed.password),
     ssl:      { rejectUnauthorized: false },
+    ...pgConnectionTimeouts,
   }
+}
+
+// Applied to every connection (dev + prod) at the `pg` client level —
+// distinct from knex's own `acquireConnectionTimeout` below, which only
+// bounds how long a request waits for a connection to become free.
+// These bound how long an already-acquired connection is allowed to sit
+// on a single query/transaction before Postgres itself kills it, so one
+// slow/runaway report or a stuck transaction can't hold a pool slot
+// (and, transitively, everyone waiting behind it) indefinitely. Override
+// per-environment via env vars if a specific report genuinely needs
+// longer than the default.
+const pgConnectionTimeouts = {
+  statement_timeout:                  parseInt(process.env.DB_STATEMENT_TIMEOUT_MS,   10) || 30000,
+  query_timeout:                      parseInt(process.env.DB_QUERY_TIMEOUT_MS,        10) || 30000,
+  idle_in_transaction_session_timeout: parseInt(process.env.DB_IDLE_TXN_TIMEOUT_MS,    10) || 30000,
 }
 
 module.exports = {
@@ -33,6 +49,7 @@ module.exports = {
       database:         process.env.DB_NAME     || 'erp_unified',
       user:             process.env.DB_USER     || 'postgres',
       password:         process.env.DB_PASSWORD || 'password',
+      ...pgConnectionTimeouts,
     },
     // Ensure all queries run in the public schema — prevents
     // "relation does not exist" when search_path is misconfigured
@@ -60,9 +77,26 @@ module.exports = {
           user:     process.env.DB_USER,
           password: process.env.DB_PASSWORD,
           ssl:      { rejectUnauthorized: false },
+          ...pgConnectionTimeouts,
         },
     migrations: { directory: './migrations', tableName: 'knex_migrations' },
     seeds:      { directory: './seeds' },
-    pool:       { min: 2, max: 20 },
+    pool: {
+      // Pool size intentionally left unchanged — a bigger pool doesn't
+      // fix an overload problem, it just moves it to Postgres' own
+      // max_connections. What was actually missing here (vs. the
+      // `development` block above, which already had these) is bounding
+      // how long a request waits for a connection and how long an idle
+      // one is kept open — without them this fell back to knex/pg's own
+      // defaults (60s+ acquisition wait), which under real load makes
+      // pool exhaustion look like the app hanging instead of failing
+      // fast with a clear error.
+      min: 2, max: 20,
+      idleTimeoutMillis: 30000,
+      afterCreate: (conn, done) => {
+        conn.query('SET search_path TO public', (err) => done(err, conn))
+      },
+    },
+    acquireConnectionTimeout: 10000,
   },
 }
