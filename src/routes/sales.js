@@ -30,11 +30,12 @@
  */
 const router = require('express').Router()
 const db     = require('../db/knex')
-const { authenticate, identifyDevice, requireSensitiveConfirm } = require('../middleware/index')
+const { authenticate, identifyDevice, requireSensitiveConfirm, requirePermission } = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { nextInvoiceNo, adToBS, todayBS, auditLog, clampExpiry, isValidUUID } = require('../utils/helpers')
 const AccountingIntegration = require('../services/accountingIntegration')
 const VoucherEditService    = require('../services/voucherEditService')
+const VoucherBuilder         = require('../services/voucherBuilder')
 
 router.use(authenticate)
 router.use(identifyDevice)
@@ -739,6 +740,146 @@ router.put('/:id/date', requireSensitiveConfirm('saleDateEdit'), async (req, res
       req.ip,
     )
     return successResponse(res, updated, 'Invoice date updated')
+  } catch (err) { next(err) }
+})
+
+/* ── PUT /sales/:id/party ───────────────────────────────────────────────────
+ * Sale List "Update Party" — reassigns the Party/Customer on an existing
+ * sale WITHOUT touching the invoice itself:
+ *   - Never touches product lines, qty, rate, discount, bonus, tax,
+ *     subtotal, net_total, paid_amount, due_amount, invoice_no, or date_ad.
+ *   - Same "isolated column edit" shape as /payment-mode and /date above:
+ *     restricted to 'active' sales, gated by requireSensitiveConfirm
+ *     (opt-in per company), audited via the existing auditLog() helper.
+ *
+ * Unlike payment-mode, this DOES need to touch the ledger: parties.js's
+ * GET /:id/ledger reads a customer's Sales/Receipt rows straight off
+ * `sales.party_id` (not off voucher_lines — see that route), so updating
+ * the sales row alone already moves the customer-facing ledger. But
+ * services/creditRiskEngine.js aggregates a customer's exposure from
+ * `vouchers.party_id`/voucher_lines, so the accounting side must move too
+ * or the two would silently disagree — exactly the class of bug the /date
+ * route's docblock above describes for the ledger date.
+ *
+ * `journal_entries` is append-only, so — same as /date — the correct way
+ * to move the accounting-side party is VoucherEditService.edit(): reverse
+ * the voucher's current entry and repost an identical one (same lines,
+ * same amounts) under the new party, in place, same voucher_id/voucher_no.
+ * Only the Cash/Bank/Receivable debit line and the Discount Allowed line
+ * (if present) move to the new party — the Sales Revenue / VAT lines never
+ * carry a party and are left untouched (see the account-role resolution
+ * below, which mirrors voucherBuilder.js's buildSaleVoucher exactly).
+ *
+ * If the sale was saved before a Chart of Accounts existed (sale.voucher_id
+ * is null — "pending_coa"), there is no ledger to move; only the sales row
+ * itself is updated, same as before COA was ever configured.
+ */
+router.put('/:id/party', requirePermission('edit_posted_vouchers'), requireSensitiveConfirm('salePartyEdit'), async (req, res, next) => {
+  try {
+    const { new_party_id } = req.body
+    if (!new_party_id || !isValidUUID(new_party_id)) {
+      return res.status(400).json({ success: false, message: 'A valid new party is required' })
+    }
+
+    const sale = await db('sales').where({ id: req.params.id, company_id: req.companyId }).first()
+    if (!sale) return res.status(404).json({ success: false, message: 'Sale not found' })
+    if (sale.status !== 'active') {
+      return res.status(400).json({ success: false, message: `Cannot change the party on a ${sale.status} invoice.` })
+    }
+
+    const oldPartyId = sale.party_id
+
+    // No-op guard — nothing to update or audit, and no unnecessary request
+    // should even reach here from a well-behaved client, but this is the
+    // authoritative check.
+    if (oldPartyId && oldPartyId === new_party_id) {
+      return res.status(400).json({ success: false, message: 'This party is already assigned to this sale.' })
+    }
+
+    const newParty = await db('parties').where({ id: new_party_id, company_id: req.companyId }).first()
+    if (!newParty) return res.status(404).json({ success: false, message: 'Selected party not found' })
+    if (newParty.type !== 'customer') {
+      return res.status(400).json({ success: false, message: 'Only a customer party can be assigned to a sale.' })
+    }
+    if (newParty.is_active === false) {
+      return res.status(400).json({ success: false, message: 'Cannot assign an inactive party to a sale.' })
+    }
+
+    const oldParty = oldPartyId ? await db('parties').where({ id: oldPartyId, company_id: req.companyId }).first() : null
+
+    // ── Move the ledger impact, if this sale was actually posted ───────────
+    if (sale.voucher_id) {
+      const currentLines = await db('voucher_lines')
+        .where({ voucher_id: sale.voucher_id })
+        .orderBy('line_no')
+        .select('account_id', 'party_id', 'description', 'debit', 'credit', 'tax_rate', 'tax_amount')
+
+      // Which lines should carry a party at all: everything buildSaleVoucher
+      // posts EXCEPT the Sales Revenue and (if present) VAT Payable lines —
+      // those two are always party_id: null by design (see voucherBuilder.js),
+      // never the customer's own line. Resolved the same way the voucher was
+      // originally built (same account_defaults/sub_type lookup), rather than
+      // matching against the line's CURRENT party_id — a walk-in sale
+      // (oldPartyId === null) has every line sitting at party_id: null too,
+      // so comparing against oldPartyId directly would have wrongly pulled
+      // the new party onto the Revenue/VAT lines as well.
+      const revenueAccount = await VoucherBuilder.resolveAccount(db, req.companyId, 'sales_revenue')
+      let vatAccount = null
+      try { vatAccount = await VoucherBuilder.resolveAccount(db, req.companyId, 'tax_payable') }
+      catch { /* no VAT role configured — fine, there's then no VAT line to protect either */ }
+      const noPartyAccountIds = new Set([revenueAccount.id, vatAccount?.id].filter(Boolean))
+
+      const correctedLines = currentLines.map(l => (
+        noPartyAccountIds.has(l.account_id) ? l : { ...l, party_id: new_party_id }
+      ))
+
+      try {
+        await VoucherEditService.edit({
+          voucherId:   sale.voucher_id,
+          companyId:   req.companyId,
+          userId:      req.user.id,
+          reason:      `Invoice ${sale.invoice_no} party changed from ${oldParty?.name || 'Unknown'} to ${newParty.name}`,
+          partyId:     new_party_id,
+          lines:       correctedLines,
+        }, req.ip)
+      } catch (editErr) {
+        return res.status(editErr.status || 400).json({
+          success: false,
+          message: `Could not update the ledger for this party change: ${editErr.message}`,
+        })
+      }
+    }
+
+    const [updated] = await db('sales')
+      .where({ id: req.params.id, company_id: req.companyId })
+      .update({ party_id: new_party_id, updated_at: new Date() })
+      .returning('*')
+
+    auditLog(
+      req.companyId, req.user.id, 'UPDATE', 'sales', req.params.id,
+      {
+        field: 'party_id', from: oldPartyId, to: new_party_id,
+        from_name: oldParty?.name || null, to_name: newParty.name,
+      },
+      req.ip,
+    )
+
+    // Event-based credit-risk recalculation for BOTH parties — the old
+    // party's exposure just dropped, the new party's just grew. Same
+    // fire-and-forget pattern already used on sale create/cancel above.
+    if (sale.payment_mode === 'credit') {
+      const { recalcCustomerAsync } = require('../services/creditRiskRecalc')
+      if (oldPartyId) recalcCustomerAsync(req.companyId, oldPartyId, { trigger: 'sale_party_changed', userId: req.user.id })
+      recalcCustomerAsync(req.companyId, new_party_id, { trigger: 'sale_party_changed', userId: req.user.id })
+    }
+
+    const withParty = await db('sales as s')
+      .leftJoin('parties as p', 's.party_id', 'p.id')
+      .where('s.id', req.params.id)
+      .select('s.*', 'p.name as party_name', 'p.phone as party_phone')
+      .first()
+
+    return successResponse(res, withParty || updated, 'Party updated successfully')
   } catch (err) { next(err) }
 })
 

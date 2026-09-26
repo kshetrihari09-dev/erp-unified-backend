@@ -59,6 +59,7 @@ const DEFAULT_SETTINGS = {
     // it can't be weakened from here.
     paymentModeEdit:   false,
     saleDateEdit:      false,
+    salePartyEdit:     false,
     invoiceCancel:     false,
     fiscalYearChange:  false,
     companySettings:   false,
