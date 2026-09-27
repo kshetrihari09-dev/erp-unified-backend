@@ -259,7 +259,10 @@ router.get('/:id/ledger', async (req, res, next) => {
     // ── 3. VOUCHER rows (posted accounting entries, if postingEngine is active) ─
     let voucherRows = []
     try {
-      // Probe minimum required columns once — cached for this request
+      // Probe minimum required columns once — cached for this request.
+      // This only gates whether postingEngine/double-entry is active on this
+      // DB at all; the actual amount/date/narration below are read from
+      // `vouchers`, not `journal_entries` — see the note just below.
       const [hasEntryDate, hasTotalDebit, hasTotalCredit] = await Promise.all([
         db.schema.hasColumn('journal_entries', 'entry_date'),
         db.schema.hasColumn('journal_entries', 'total_debit'),
@@ -267,21 +270,25 @@ router.get('/:id/ledger', async (req, res, next) => {
       ])
 
       if (hasEntryDate && hasTotalDebit && hasTotalCredit) {
-        const [hasNarration, hasCreatedAt] = await Promise.all([
-          db.schema.hasColumn('journal_entries', 'narration'),
-          db.schema.hasColumn('journal_entries', 'created_at'),
-        ])
-
-        // For party ledger, show only ONE side of each voucher entry:
-        //   RECEIPT      → Credit only  (customer paid us — reduces receivable)
-        //   PAYMENT      → Debit  only  (we paid supplier — reduces payable)
-        //   DEBIT_NOTE   → Debit  only  (customer owes more)
-        //   CREDIT_NOTE  → Credit only  (customer owes less)
-        //   JOURNAL/CONTRA → use net: if net debit > 0 show debit, else credit
-        // total_debit and total_credit from journal_entries are BOTH sides of
-        // the double-entry — we must not show both or balance never changes.
-        const debitExpr  = hasTotalDebit  ? '"je"."total_debit"'  : '0'
-        const creditExpr = hasTotalCredit ? '"je"."total_credit"' : '0'
+        // ── Read the amount/date/narration off `vouchers`, not `journal_entries` ──
+        // `journal_entries` is append-only (see voucherEditService.js) — its
+        // entry_date/total_debit/total_credit/narration are a permanent
+        // snapshot of the voucher AT THE TIME IT WAS FIRST POSTED and never
+        // change again, even after an edit. `vouchers.voucher_date` /
+        // `total_amount` / `narration` / `party_id`, by contrast, ARE kept
+        // live in place by VoucherEditService.edit()'s Step 3 — "same id,
+        // same voucher_no, same row" is exactly so callers like this one can
+        // treat the voucher row as the current source of truth. Reading from
+        // `v.*` here means a Receipt edit (amount, date, narration, or which
+        // party it's even attached to — that's `v.party_id`, in the WHERE
+        // above) is reflected immediately, with no extra patching needed.
+        //
+        // `v.total_amount` doubles for both total_debit and total_credit
+        // because every posted voucher is balanced by construction (debit
+        // total == credit total) — that's true whether it was ever edited
+        // or not, so this is not an approximation.
+        const debitExpr  = '"v"."total_amount"'
+        const creditExpr = '"v"."total_amount"'
 
         const partyDebit = `
           CASE v.voucher_type
@@ -320,20 +327,23 @@ router.get('/:id/ledger', async (req, res, next) => {
             db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
           ))
           .select(
-            'je.entry_date                                   as date',
+            'v.voucher_date                                  as date',
             db.raw('NULL::text                              as date_bs'),
             'v.voucher_no                                    as reference',
             'v.voucher_type                                  as type',
-            db.raw(hasNarration ? '"je"."narration" as description' : "NULL::text as description"),
+            'v.narration                                     as description',
             db.raw('NULL::text                              as payment_mode'),
             db.raw(`(${partyDebit})  as debit`),
             db.raw(`(${partyCredit}) as credit`),
           )
 
-        if (date_from) q = q.where('je.entry_date', '>=', date_from)
-        if (date_to)   q = q.where('je.entry_date', '<=', date_to)
-        if (hasCreatedAt) q = q.orderBy('je.entry_date', 'asc').orderBy('je.created_at', 'asc')
-        else              q = q.orderBy('je.entry_date', 'asc')
+        // Current voucher_date (kept live by edits), not the immutable
+        // journal_entries.entry_date — so an edited Receipt correctly moves
+        // between date-range windows (e.g. Sept → Oct) instead of staying
+        // pinned to whatever date it was first posted on.
+        if (date_from) q = q.where('v.voucher_date', '>=', date_from)
+        if (date_to)   q = q.where('v.voucher_date', '<=', date_to)
+        q = q.orderBy('v.voucher_date', 'asc').orderBy('je.created_at', 'asc')
 
         voucherRows = await q
       }

@@ -249,30 +249,49 @@ router.get('/party-balance', async (req, res, next) => {
     try {
       const hasJE = await db.schema.hasTable('journal_entries')
       if (hasJE) {
-        const buildVoucherSum = async (voucherTypes, sumCol) => {
+        const buildVoucherSum = async (voucherTypes) => {
           let vq = db('journal_entries as je')
             .join('vouchers as v', 'je.voucher_id', 'v.id')
             .where('v.company_id', req.companyId)
             .whereIn('v.party_id', ids)
             .whereIn('v.voucher_type', voucherTypes)
             .where('v.status', 'POSTED')
-          if (date_from) vq = vq.where('je.entry_date', '>=', date_from)
-          if (date_to)   vq = vq.where('je.entry_date', '<=', date_to)
+            // Exclude internal system-generated correction/reversal vouchers
+            // (see voucherEditService.js). Without this, editing a posted
+            // Receipt/Payment/etc. double-counts it here: the correction
+            // anchor VoucherEditService posts is the SAME voucher_type as
+            // the original (e.g. still 'RECEIPT'), still POSTED, and would
+            // otherwise sum in on top of the (already-current) original row.
+            .andWhere(b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`))
+            .andWhere(b => b.whereNull('v.reversal_of').orWhereNotExists(
+              db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
+            ))
+          // `v.voucher_date`, not `je.entry_date` — journal_entries is
+          // append-only (frozen at first-post time); vouchers.voucher_date
+          // is kept live by VoucherEditService, so an edited voucher's
+          // date-range membership here matches the Ledger's.
+          if (date_from) vq = vq.where('v.voucher_date', '>=', date_from)
+          if (date_to)   vq = vq.where('v.voucher_date', '<=', date_to)
           const rows = await vq
             .groupBy('v.party_id')
             .select('v.party_id')
-            .sum({ total: sumCol })
+            // v.total_amount, not je.total_debit/total_credit — see above:
+            // it's the one figure VoucherEditService keeps current on edit,
+            // and it equals both sides of a balanced entry either way, so
+            // this is exact, not an approximation, for a never-edited
+            // voucher too.
+            .sum({ total: 'v.total_amount' })
           return Object.fromEntries(rows.map(r => [r.party_id, Number(r.total) || 0]))
         }
 
-        // RECEIPT: total_credit reduces customer receivable
-        // PAYMENT: total_debit  reduces supplier payable
+        // RECEIPT: reduces customer receivable
+        // PAYMENT: reduces supplier payable
         // DEBIT_NOTE / CREDIT_NOTE: adjust respective balances
         ;[receiptMap, paymentMap, dnMap, cnMap] = await Promise.all([
-          buildVoucherSum(['RECEIPT'],     'je.total_credit'),
-          buildVoucherSum(['PAYMENT'],     'je.total_debit'),
-          buildVoucherSum(['DEBIT_NOTE'],  'je.total_debit'),
-          buildVoucherSum(['CREDIT_NOTE'], 'je.total_credit'),
+          buildVoucherSum(['RECEIPT']),
+          buildVoucherSum(['PAYMENT']),
+          buildVoucherSum(['DEBIT_NOTE']),
+          buildVoucherSum(['CREDIT_NOTE']),
         ])
       }
     } catch (e) {

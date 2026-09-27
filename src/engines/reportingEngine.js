@@ -12,6 +12,96 @@
 const db = require('../db/knex')
 const config = require('../config')
 
+/**
+ * Pure merge/patch/paginate step for ReportingEngine.ledger() — deliberately
+ * factored out of the DB-querying method above so the actual bug-fix logic
+ * (an edited voucher's CURRENT figures replacing its frozen original
+ * journal_lines row; an account change dropping the old row and picking up
+ * the new one; date-range membership following the corrected date) can be
+ * unit-tested against plain fixtures, with no database involved. See
+ * test/reporting-engine-ledger.test.js.
+ *
+ * `originalRows` / `movedIn` are exactly what the two queries in ledger()
+ * select (see there for shape). `currentByVoucher` / `voucherPartyIdById` /
+ * `partyNameById` are the Maps built from voucher_lines/vouchers/parties for
+ * whichever voucher ids came back `is_edited`.
+ */
+function mergeAndPaginateLedgerRows({
+  originalRows, movedIn, currentByVoucher, voucherPartyIdById, partyNameById,
+  dateFrom, dateTo, page = 1, limit = 100,
+}) {
+  // Patch each originally-posted row with the voucher's CURRENT figures;
+  // drop rows whose account changed away from this one (no current line
+  // for this account means the edit moved it elsewhere).
+  const patched = []
+  for (const r of originalRows) {
+    if (!r.is_edited) { patched.push(r); continue }
+    const current = currentByVoucher.get(r.voucher_id)
+    if (!current) continue // account changed away — no longer belongs on this ledger
+    const effectivePartyId = current.party_id || voucherPartyIdById.get(r.voucher_id) || null
+    patched.push({
+      ...r,
+      debit: current.debit,
+      credit: current.credit,
+      description: current.description ?? r.description,
+      party_name: effectivePartyId ? (partyNameById.get(effectivePartyId) ?? null) : null,
+    })
+  }
+
+  for (const r of movedIn) {
+    const effectivePartyId = r.line_party_id || r.voucher_party_id || null
+    const partyName = effectivePartyId ? (partyNameById.get(effectivePartyId) ?? r.line_party_name ?? null) : null
+    patched.push({
+      event_type: 'POSTED', period_ref: null,
+      voucher_id: r.voucher_id, voucher_no: r.voucher_no, voucher_type: r.voucher_type, reference_no: r.reference_no,
+      voucher_date: r.voucher_date, sort_key: r.sort_key,
+      account_id: r.account_id, debit: r.debit, credit: r.credit, description: r.description,
+      party_name: partyName, is_edited: true,
+    })
+  }
+
+  // ── Split into "before the window" (opening balance) vs "in the window"
+  //    (displayed rows), using each row's CURRENT voucher_date — this is
+  //    what makes an edited date correctly move a transaction between
+  //    date-range windows instead of staying pinned to its original date. ──
+  const beforeWindow = dateFrom ? patched.filter(r => String(r.voucher_date) < dateFrom) : []
+  const inWindow = patched.filter(r =>
+    (!dateFrom || String(r.voucher_date) >= dateFrom) &&
+    (!dateTo   || String(r.voucher_date) <= dateTo),
+  )
+  inWindow.sort((a, b) => {
+    const d = String(a.voucher_date).localeCompare(String(b.voucher_date))
+    if (d !== 0) return d
+    // sort_key (vouchers.created_at) is a timestamp — compare as Date, not
+    // as a locale string (Date#toString() month names don't sort
+    // chronologically, e.g. "Apr" < "Jan" alphabetically).
+    return new Date(a.sort_key || 0) - new Date(b.sort_key || 0)
+  })
+
+  const openingDr = beforeWindow.reduce((s, r) => s + Number(r.debit  || 0), 0)
+  const openingCr = beforeWindow.reduce((s, r) => s + Number(r.credit || 0), 0)
+  const openingBalance = openingDr - openingCr
+
+  const count = inWindow.length
+  const rows  = inWindow.slice((page - 1) * limit, (page - 1) * limit + limit)
+    .map(r => ({ ...r, entry_date: r.voucher_date }))
+
+  let runningBalance = openingBalance
+  const ledgerRows = rows.map(r => {
+    runningBalance += Number(r.debit) - Number(r.credit)
+    return { ...r, running_balance: runningBalance }
+  })
+
+  return {
+    opening_balance: openingBalance,
+    closing_balance: runningBalance,
+    total_debit:  rows.reduce((s, r) => s + Number(r.debit),  0),
+    total_credit: rows.reduce((s, r) => s + Number(r.credit), 0),
+    rows: ledgerRows,
+    total: Number(count), page, limit,
+  }
+}
+
 class ReportingEngine {
 
   /**
@@ -35,124 +125,145 @@ class ReportingEngine {
   /**
    * General Ledger — full transaction history for an account.
    * Returns running balance after each entry.
+   *
+   * `journal_lines`/`journal_entries` are append-only (see
+   * voucherEditService.js) — once a voucher is edited, its ORIGINAL entry
+   * there stays frozen at whatever it looked like the moment it was first
+   * posted, forever. `vouchers.voucher_date` / `total_amount` / `narration`
+   * / `party_id` and `voucher_lines`, by contrast, ARE kept live in place by
+   * VoucherEditService.edit() — "same id, same voucher_no, same row" is
+   * exactly so a query like this one can treat them as the current source
+   * of truth. So for any voucher that's been edited (`is_edited`, detected
+   * the same way the voucher lists already do — an EXISTS against
+   * audit_log), this method re-derives that voucher's line from CURRENT
+   * `voucher_lines` rather than trusting the frozen `journal_lines` row:
+   *   - amount/narration/party changed → the current line's values are used
+   *   - date changed → `v.voucher_date` is used for both display and
+   *     date-range filtering, not `je.entry_date`
+   *   - the account itself changed (e.g. Cash → Bank) → the old account no
+   *     longer has a current line for this voucher, so it's dropped from
+   *     THIS account's ledger; the new account picks it up via the
+   *     "moved-in" query below, since its original posting never touched
+   *     this account at all and the main query would otherwise never see it
    */
   static async ledger(accountId, companyId, { dateFrom, dateTo, page = 1, limit = 100 } = {}) {
     const account = await db('accounts').where({ id: accountId, company_id: companyId }).first()
     if (!account) throw new Error('Account not found')
 
-    // Opening balance (all entries before dateFrom)
-    let openingDr = 0, openingCr = 0
-    if (dateFrom) {
-      const [ob] = await db('journal_lines as jl')
-        .join('journal_entries as je', 'jl.journal_entry_id', 'je.id')
-        .where('je.company_id', companyId)
-        .where('jl.account_id', accountId)
-        .where('je.entry_date', '<', dateFrom)
-        .sum({ dr: 'jl.debit', cr: 'jl.credit' })
-      openingDr = Number(ob?.dr || 0)
-      openingCr = Number(ob?.cr || 0)
-    }
-    const openingBalance = openingDr - openingCr
+    const notSystemCorrection = b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`)
+    const notStaleReversal    = b => b.whereNull('v.reversal_of').orWhereNotExists(
+      db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
+    )
 
-    // Transactions in range
-    let q = db('journal_lines as jl')
+    // ── A) Every line ever originally posted to this account — unfiltered by
+    //    date here; the corrected (current) date decides range membership
+    //    below, and that's only known after the is_edited patch. ───────────
+    const originalRows = await db('journal_lines as jl')
       .join('journal_entries as je', 'jl.journal_entry_id', 'je.id')
       .leftJoin('vouchers as v', 'je.voucher_id', 'v.id')
       .leftJoin('parties as p', 'jl.party_id', 'p.id')
       .where('je.company_id', companyId)
       .where('jl.account_id', accountId)
-      // A voucher edit is a correction, not a new transaction: hide the
-      // internal system-generated reversal/correction entries it writes
-      // (see VoucherEditService) so the ledger shows one line per voucher,
-      // same as the voucher lists — not the raw reverse-then-repost pair.
-      .andWhere(b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`))
-      .andWhere(b => b.whereNull('v.reversal_of').orWhereNotExists(
-        db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
-      ))
+      .andWhere(notSystemCorrection)
+      .andWhere(notStaleReversal)
       .select(
-        'je.entry_date', 'je.event_type', 'je.period_ref',
+        'je.event_type', 'je.period_ref',
         'v.id as voucher_id', 'v.voucher_no', 'v.voucher_type', 'v.reference_no',
+        'v.voucher_date', 'v.created_at as sort_key',
         'jl.account_id', 'jl.debit', 'jl.credit', 'jl.description',
         'p.name as party_name',
       )
       .select(db.raw(`EXISTS (SELECT 1 FROM audit_log al WHERE al.entity_id = v.id AND al.action = 'EDIT_VOUCHER') AS is_edited`))
 
-    if (dateFrom) q = q.where('je.entry_date', '>=', dateFrom)
-    if (dateTo)   q = q.where('je.entry_date', '<=', dateTo)
+    const editedVoucherIds = [...new Set(originalRows.filter(r => r.is_edited && r.voucher_id).map(r => r.voucher_id))]
 
-    const [{ count }] = await q.clone().clearSelect().count('jl.id as count')
-    let rows = await q.orderBy('je.entry_date').orderBy('je.created_at').limit(limit).offset((page-1)*limit)
-
-    // For a voucher that's been edited, the entry still on this row is the
-    // *original* immutable journal line (append-only ledger — it can never
-    // be rewritten), which no longer matches what the voucher shows today.
-    // Swap in the voucher's current line for this account so the ledger
-    // reads the same as the voucher itself: same voucher_no, current value.
-    const editedVoucherIds = [...new Set(rows.filter(r => r.is_edited && r.voucher_id).map(r => r.voucher_id))]
+    let currentByVoucher   = new Map()
+    let voucherPartyIdById = new Map()
+    let partyNameById      = new Map()
     if (editedVoucherIds.length) {
       const currentLines = await db('voucher_lines')
         .whereIn('voucher_id', editedVoucherIds)
         .andWhere('account_id', accountId)
         .select('voucher_id', 'debit', 'credit', 'description', 'party_id')
-      const currentByVoucher = new Map(currentLines.map(l => [l.voucher_id, l]))
+      currentByVoucher = new Map(currentLines.map(l => [l.voucher_id, l]))
+
+      const currentVouchers = await db('vouchers').whereIn('id', editedVoucherIds).select('id', 'party_id')
+      voucherPartyIdById = new Map(currentVouchers.map(v => [v.id, v.party_id]))
 
       // For Receipt/Payment (and similar) vouchers, the cash/bank line itself
       // never carries a party_id — the party sits on the contra (AR/AP) line.
       // The original posting strategy handles this with `line.party_id ||
       // voucher.party_id`; replicate that same fallback here so an edited
-      // voucher's cash/bank row still resolves to the voucher's current party
-      // instead of going blank.
-      const currentVouchers = await db('vouchers').whereIn('id', editedVoucherIds).select('id', 'party_id')
-      const voucherPartyIdById = new Map(currentVouchers.map(v => [v.id, v.party_id]))
-
-      // The party may also have changed on edit (e.g. re-billed to a
-      // different customer/supplier) — re-resolve names for any current
-      // party_id not already covered by the original join above.
+      // voucher's cash/bank row still resolves to the voucher's current
+      // party instead of going blank. The party may also have changed on
+      // edit — re-resolve names for any current party_id.
       const currentPartyIds = [...new Set([
         ...currentLines.map(l => l.party_id),
         ...currentVouchers.map(v => v.party_id),
       ].filter(Boolean))]
-      const partyNameById = currentPartyIds.length
+      partyNameById = currentPartyIds.length
         ? new Map((await db('parties').whereIn('id', currentPartyIds).select('id', 'name')).map(p => [p.id, p.name]))
         : new Map()
-
-      rows = rows.map(r => {
-        const current = r.is_edited ? currentByVoucher.get(r.voucher_id) : null
-        if (!current) return r
-        const effectivePartyId = current.party_id || voucherPartyIdById.get(r.voucher_id) || null
-        return {
-          ...r,
-          debit: current.debit,
-          credit: current.credit,
-          description: current.description ?? r.description,
-          party_name: effectivePartyId ? (partyNameById.get(effectivePartyId) ?? null) : null,
-        }
-      })
     }
 
-    // Compute running balance
-    let runningBalance = openingBalance
-    const ledgerRows = rows.map(r => {
-      runningBalance += Number(r.debit) - Number(r.credit)
-      return { ...r, running_balance: runningBalance }
+    // ── B) Vouchers now pointing at this account BECAUSE of an edit, whose
+    //    original posting never touched this account at all — e.g. an
+    //    edited Receipt that moved from Cash to Bank. Query (A) above can
+    //    never find these on its own since it starts from the OLD posting. ─
+    const movedIn = await db('voucher_lines as vl')
+      .join('vouchers as v', 'vl.voucher_id', 'v.id')
+      .leftJoin('parties as p', 'vl.party_id', 'p.id')
+      .where('v.company_id', companyId)
+      .where('vl.account_id', accountId)
+      .where('v.status', 'POSTED')
+      .andWhere(notSystemCorrection)
+      .andWhere(notStaleReversal)
+      .whereExists(
+        db('audit_log as al').whereRaw('al.entity_id = v.id').andWhere('al.action', 'EDIT_VOUCHER'),
+      )
+      .whereNotExists(
+        db('journal_lines as jl2')
+          .join('journal_entries as je2', 'jl2.journal_entry_id', 'je2.id')
+          .whereRaw('je2.voucher_id = v.id')
+          .andWhere('jl2.account_id', accountId),
+      )
+      .select(
+        'v.id as voucher_id', 'v.voucher_no', 'v.voucher_type', 'v.reference_no',
+        'v.voucher_date', 'v.created_at as sort_key', 'v.party_id as voucher_party_id',
+        'vl.account_id', 'vl.debit', 'vl.credit', 'vl.description', 'vl.party_id as line_party_id',
+        'p.name as line_party_name',
+      )
+
+    // "moved in" party names not already covered by partyNameById above (an
+    // edit that both changed the account AND is the first time we're
+    // resolving that particular party name in this request).
+    const unresolvedPartyIds = [...new Set(
+      movedIn.map(r => r.line_party_id || r.voucher_party_id).filter(Boolean),
+    )].filter(id => !partyNameById.has(id))
+    if (unresolvedPartyIds.length) {
+      for (const p of await db('parties').whereIn('id', unresolvedPartyIds).select('id', 'name')) {
+        partyNameById.set(p.id, p.name)
+      }
+    }
+
+    const result = mergeAndPaginateLedgerRows({
+      originalRows, movedIn, currentByVoucher, voucherPartyIdById, partyNameById,
+      dateFrom, dateTo, page, limit,
     })
-
-    const closingBalance = runningBalance
-    return {
-      account,
-      opening_balance: openingBalance,
-      closing_balance: closingBalance,
-      total_debit:  rows.reduce((s, r) => s + Number(r.debit),  0),
-      total_credit: rows.reduce((s, r) => s + Number(r.credit), 0),
-      rows: ledgerRows,
-      total: Number(count), page, limit,
-    }
+    return { account, ...result }
   }
 
   /**
    * Party Balance — outstanding balance per customer/supplier, derived the
    * same way every other report here is: from journal_lines, never a
    * stored counter.
+   *
+   * Note: no route currently calls this static method — GET
+   * /reports/party-balance (routes/reports.js) has its own, near-identical
+   * implementation instead, kept in sync with the same edited-voucher fix
+   * applied here (amount/party re-derived from current voucher_lines) but
+   * using `vouchers.voucher_date` for date-range filtering rather than
+   * `journal_entries.entry_date` — see that file for why.
    *
    *   customer (AR control account): balance = opening + invoiced(debit) − collected(credit)
    *   supplier (AP control account): balance = opening + invoiced(credit) − paid(debit)
@@ -185,14 +296,65 @@ class ReportingEngine {
 
     let linesQuery = conn('journal_lines as jl')
       .join('journal_entries as je', 'jl.journal_entry_id', 'je.id')
+      .leftJoin('vouchers as v', 'je.voucher_id', 'v.id')
       .where('je.company_id', companyId)
       .whereIn('jl.account_id', controlAccountIds)
       .whereIn('jl.party_id', partyIds)
+      // Exclude internal system-generated correction/reversal vouchers (see
+      // voucherEditService.js) — same filter used by ReportingEngine.ledger()
+      // and the party/account ledger routes, for the same reason: without
+      // it, editing a posted Receipt/Payment/etc. shows up here as an extra,
+      // duplicate-looking line.
+      .andWhere(b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`))
+      .andWhere(b => b.whereNull('v.reversal_of').orWhereNotExists(
+        conn('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
+      ))
 
+    // Date-range filter stays on `je.entry_date` here (this function has no
+    // live caller currently — see partyBalance()'s docblock; the real,
+    // traffic-serving fix for this same bug is GET /reports/party-balance
+    // in routes/reports.js, which uses `v.voucher_date` as ledger() does).
     if (dateFrom) linesQuery = linesQuery.where('je.entry_date', '>=', dateFrom)
     if (dateTo)   linesQuery = linesQuery.where('je.entry_date', '<=', dateTo)
 
-    const lines = await linesQuery.select('jl.party_id', 'jl.account_id', 'jl.debit', 'jl.credit')
+    let lines = await linesQuery
+      .select('jl.party_id', 'jl.account_id', 'jl.debit', 'jl.credit', 'v.id as voucher_id')
+
+    // Which of these vouchers have ever been edited — a separate query
+    // (rather than an inline EXISTS subquery in the SELECT above) so this
+    // works against any plain query-builder-style connection, not just a
+    // full Postgres one.
+    const voucherIdsOnLines = [...new Set(lines.map(l => l.voucher_id).filter(Boolean))]
+    const editedVoucherIdSet = voucherIdsOnLines.length
+      ? new Set(await conn('audit_log').where('action', 'EDIT_VOUCHER').whereIn('entity_id', voucherIdsOnLines).pluck('entity_id'))
+      : new Set()
+    lines = lines.map(l => ({ ...l, is_edited: editedVoucherIdSet.has(l.voucher_id) }))
+
+    // For an edited voucher, the journal_lines row just fetched is frozen at
+    // whatever it looked like the moment it was FIRST posted (append-only
+    // ledger). Re-derive party/account/amount from the voucher's CURRENT
+    // voucher_lines so a Receipt edit (amount, or a re-bill to a different
+    // party — which can also move the contra line onto a different party's
+    // own control account) is reflected here immediately, same as the
+    // account/party ledgers above.
+    const editedVoucherIds = [...editedVoucherIdSet]
+    if (editedVoucherIds.length) {
+      const currentLines = await conn('voucher_lines')
+        .whereIn('voucher_id', editedVoucherIds)
+        .whereIn('account_id', controlAccountIds)
+        .select('voucher_id', 'account_id', 'party_id', 'debit', 'credit')
+      const currentByVoucher = new Map(currentLines.map(l => [l.voucher_id, l]))
+      lines = lines
+        // No current line on ANY control account means the edit moved this
+        // voucher's contra entry off AR/AP entirely — it no longer belongs
+        // in anyone's party balance.
+        .filter(l => !l.is_edited || currentByVoucher.has(l.voucher_id))
+        .map(l => {
+          if (!l.is_edited) return l
+          const current = currentByVoucher.get(l.voucher_id)
+          return { ...l, account_id: current.account_id, party_id: current.party_id, debit: current.debit, credit: current.credit }
+        })
+    }
 
     return parties.map(party => {
       const isCustomer = party.type === 'customer'
@@ -606,3 +768,4 @@ class ReportingEngine {
 }
 
 module.exports = ReportingEngine
+module.exports.mergeAndPaginateLedgerRows = mergeAndPaginateLedgerRows

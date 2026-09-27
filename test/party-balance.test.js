@@ -329,3 +329,72 @@ describe('Combined and edge cases', () => {
   })
 
 })
+
+// ─── Regression: editing a posted Receipt must be reflected here ──────────────
+// journal_lines/journal_entries are append-only — once a Receipt is edited,
+// the row here stays frozen at whatever it looked like when first posted.
+// partyBalance() must re-derive the current amount from voucher_lines for any
+// voucher audit_log shows as edited, rather than trusting the frozen row.
+
+describe('Receipt edit is reflected in party balance', () => {
+
+  test('Amount edited 5,000 → 7,000: balance uses 7,000, not 5,000 and not 12,000 (no duplicate)', async () => {
+    const state = buildState()
+    state.journal_entries.find(je => je.id === 'je-receipt').voucher_id = 'v-receipt'
+    state.journal_lines.find(jl => jl.id === 'jl-4').credit = 5000 // frozen original posting
+    state.voucher_lines = [
+      { voucher_id: 'v-receipt', account_id: AR_ACC_ID, party_id: CUSTOMER_ID, debit: 0, credit: 7000 }, // current
+    ]
+    state.audit_log = [{ entity_id: 'v-receipt', action: 'EDIT_VOUCHER' }]
+
+    const results = await ReportingEngine.partyBalance(CID, {
+      partyType: 'customer', db: makeMockDb(state),
+    })
+    expect(results[0].total_collected).toBe(7000)
+    expect(results[0].balance).toBe(13000) // 20,000 invoiced - 7,000 collected
+  })
+
+  test('Multiple edits (5,000 → 7,000 → 9,000): balance uses the final 9,000', async () => {
+    const state = buildState()
+    state.journal_entries.find(je => je.id === 'je-receipt').voucher_id = 'v-receipt'
+    state.journal_lines.find(jl => jl.id === 'jl-4').credit = 5000
+    // voucher_lines only ever holds the CURRENT state — by definition there's
+    // nothing left in the DB reflecting the 7,000 intermediate value.
+    state.voucher_lines = [
+      { voucher_id: 'v-receipt', account_id: AR_ACC_ID, party_id: CUSTOMER_ID, debit: 0, credit: 9000 },
+    ]
+    state.audit_log = [{ entity_id: 'v-receipt', action: 'EDIT_VOUCHER' }]
+
+    const results = await ReportingEngine.partyBalance(CID, {
+      partyType: 'customer', db: makeMockDb(state),
+    })
+    expect(results[0].total_collected).toBe(9000)
+  })
+
+  test('Party reassigned on edit: balance moves from old party to new party', async () => {
+    const state = buildState()
+    state.parties.push({ id: 'party-customer-2', company_id: CID, type: 'customer', name: 'New Customer', code: 'C002', opening_balance: 0, is_active: true })
+    state.journal_entries.find(je => je.id === 'je-receipt').voucher_id = 'v-receipt'
+    state.journal_lines.find(jl => jl.id === 'jl-4').credit = 7000 // still tagged to the OLD party in the frozen row
+    state.voucher_lines = [
+      { voucher_id: 'v-receipt', account_id: AR_ACC_ID, party_id: 'party-customer-2', debit: 0, credit: 7000 }, // now the NEW party
+    ]
+    state.audit_log = [{ entity_id: 'v-receipt', action: 'EDIT_VOUCHER' }]
+
+    const results = await ReportingEngine.partyBalance(CID, {
+      partyType: 'customer', db: makeMockDb(state),
+    })
+    const oldParty = results.find(r => r.id === CUSTOMER_ID)
+    const newParty = results.find(r => r.id === 'party-customer-2')
+    expect(oldParty.total_collected).toBe(0)   // old party — effect removed
+    expect(newParty.total_collected).toBe(7000) // new party — effect added
+  })
+
+  test('Un-edited receipts are unaffected by the audit_log lookup', async () => {
+    const results = await ReportingEngine.partyBalance(CID, {
+      partyType: 'customer', db: makeMockDb(buildState()),
+    })
+    expect(results[0].total_collected).toBe(7000)
+  })
+
+})
