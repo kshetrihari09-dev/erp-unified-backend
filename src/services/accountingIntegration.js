@@ -39,6 +39,7 @@
  */
 
 const VoucherService  = require('./voucherService')
+const { currentEntryVoucherIdSql } = require('./currentEntry')
 const PostingEngine   = require('../engines/postingEngine')
 const VoucherBuilder  = require('./voucherBuilder')
 const AuditLogger     = require('../utils/auditLogger')
@@ -314,7 +315,9 @@ const AccountingIntegration = {
   async getAccountingRecord(db, companyId, sourceType, sourceId) {
     const posting = await db('voucher_postings as vp')
       .join('vouchers as v', 'vp.voucher_id', 'v.id')
-      .leftJoin('journal_entries as je', 'v.id', 'je.voucher_id')
+      // CURRENT journal entry (through the active correction anchor) — an
+      // edited voucher's own original entry is superseded.
+      .joinRaw(`LEFT JOIN journal_entries je ON je.voucher_id = ${currentEntryVoucherIdSql('v')}`)
       .where('vp.company_id', companyId)
       .where('vp.source_type', sourceType)
       .where(function () {

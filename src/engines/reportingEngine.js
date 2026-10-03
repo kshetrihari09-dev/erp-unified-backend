@@ -11,6 +11,7 @@
 
 const db = require('../db/knex')
 const config = require('../config')
+const { scopeToCurrentEntries } = require('../services/currentEntry')
 
 /**
  * Pure merge/patch/paginate step for ReportingEngine.ledger() — deliberately
@@ -123,133 +124,61 @@ class ReportingEngine {
   }
 
   /**
-   * General Ledger — full transaction history for an account.
-   * Returns running balance after each entry.
+   * General Ledger — full transaction history for an account, with running
+   * balance after each entry.
    *
-   * `journal_lines`/`journal_entries` are append-only (see
-   * voucherEditService.js) — once a voucher is edited, its ORIGINAL entry
-   * there stays frozen at whatever it looked like the moment it was first
-   * posted, forever. `vouchers.voucher_date` / `total_amount` / `narration`
-   * / `party_id` and `voucher_lines`, by contrast, ARE kept live in place by
-   * VoucherEditService.edit() — "same id, same voucher_no, same row" is
-   * exactly so a query like this one can treat them as the current source
-   * of truth. So for any voucher that's been edited (`is_edited`, detected
-   * the same way the voucher lists already do — an EXISTS against
-   * audit_log), this method re-derives that voucher's line from CURRENT
-   * `voucher_lines` rather than trusting the frozen `journal_lines` row:
-   *   - amount/narration/party changed → the current line's values are used
-   *   - date changed → `v.voucher_date` is used for both display and
-   *     date-range filtering, not `je.entry_date`
-   *   - the account itself changed (e.g. Cash → Bank) → the old account no
-   *     longer has a current line for this voucher, so it's dropped from
-   *     THIS account's ledger; the new account picks it up via the
-   *     "moved-in" query below, since its original posting never touched
-   *     this account at all and the main query would otherwise never see it
+   * Source of truth: the journal, restricted to CURRENT entries.
+   *
+   * `journal_entries` is append-only, so an edited voucher leaves behind its
+   * superseded original entry, an internal reversal, and finally the
+   * corrected entry (owned by a hidden anchor voucher — see
+   * services/currentEntry.js). This ledger shows exactly ONE row per voucher
+   * per account: the corrected entry's line, attributed to the *visible*
+   * voucher (its number, type and reference), dated by the corrected entry.
+   * Consequently, after any number of edits:
+   *   - amount edit  → the single row carries the new amount (never old+new)
+   *   - account edit → the old account's ledger has no row for the voucher,
+   *                    the new account's ledger has exactly one
+   *   - party edit   → the row carries the new party (journal lines get the
+   *                    voucher's party from the posting strategy)
+   *   - date edit    → entry_date is the new date, so date-range membership
+   *                    and the opening balance move with it
+   * and it can never disagree with Trial Balance / P&L / Balance Sheet, which
+   * sum the same journal (superseded entries net to zero against their
+   * reversals, which are dated at the entry they cancel).
+   *
+   * Output shape is unchanged; windowing/pagination/running balance still
+   * go through mergeAndPaginateLedgerRows().
    */
   static async ledger(accountId, companyId, { dateFrom, dateTo, page = 1, limit = 100 } = {}) {
     const account = await db('accounts').where({ id: accountId, company_id: companyId }).first()
     if (!account) throw new Error('Account not found')
 
-    const notSystemCorrection = b => b.whereNull('v.metadata').orWhereRaw(`v.metadata->>'system_correction' IS DISTINCT FROM 'true'`)
-    const notStaleReversal    = b => b.whereNull('v.reversal_of').orWhereNotExists(
-      db('vouchers as orig').whereRaw('orig.id = v.reversal_of').andWhere('orig.status', 'POSTED')
-    )
-
-    // ── A) Every line ever originally posted to this account — unfiltered by
-    //    date here; the corrected (current) date decides range membership
-    //    below, and that's only known after the is_edited patch. ───────────
-    const originalRows = await db('journal_lines as jl')
+    const q = db('journal_lines as jl')
       .join('journal_entries as je', 'jl.journal_entry_id', 'je.id')
-      .leftJoin('vouchers as v', 'je.voucher_id', 'v.id')
+    const rows = await scopeToCurrentEntries(q, db)
       .leftJoin('parties as p', 'jl.party_id', 'p.id')
       .where('je.company_id', companyId)
       .where('jl.account_id', accountId)
-      .andWhere(notSystemCorrection)
-      .andWhere(notStaleReversal)
       .select(
         'je.event_type', 'je.period_ref',
-        'v.id as voucher_id', 'v.voucher_no', 'v.voucher_type', 'v.reference_no',
-        'v.voucher_date', 'v.created_at as sort_key',
+        'ov.id as voucher_id', 'ov.voucher_no', 'ov.voucher_type', 'ov.reference_no',
+        'je.entry_date as voucher_date', 'ov.created_at as sort_key',
         'jl.account_id', 'jl.debit', 'jl.credit', 'jl.description',
         'p.name as party_name',
       )
-      .select(db.raw(`EXISTS (SELECT 1 FROM audit_log al WHERE al.entity_id = v.id AND al.action = 'EDIT_VOUCHER') AS is_edited`))
+      .select(db.raw(`(ov.metadata->'ledger_correction'->>'active_entry_voucher_id') IS NOT NULL AS was_edited`))
 
-    const editedVoucherIds = [...new Set(originalRows.filter(r => r.is_edited && r.voucher_id).map(r => r.voucher_id))]
-
-    let currentByVoucher   = new Map()
-    let voucherPartyIdById = new Map()
-    let partyNameById      = new Map()
-    if (editedVoucherIds.length) {
-      const currentLines = await db('voucher_lines')
-        .whereIn('voucher_id', editedVoucherIds)
-        .andWhere('account_id', accountId)
-        .select('voucher_id', 'debit', 'credit', 'description', 'party_id')
-      currentByVoucher = new Map(currentLines.map(l => [l.voucher_id, l]))
-
-      const currentVouchers = await db('vouchers').whereIn('id', editedVoucherIds).select('id', 'party_id')
-      voucherPartyIdById = new Map(currentVouchers.map(v => [v.id, v.party_id]))
-
-      // For Receipt/Payment (and similar) vouchers, the cash/bank line itself
-      // never carries a party_id — the party sits on the contra (AR/AP) line.
-      // The original posting strategy handles this with `line.party_id ||
-      // voucher.party_id`; replicate that same fallback here so an edited
-      // voucher's cash/bank row still resolves to the voucher's current
-      // party instead of going blank. The party may also have changed on
-      // edit — re-resolve names for any current party_id.
-      const currentPartyIds = [...new Set([
-        ...currentLines.map(l => l.party_id),
-        ...currentVouchers.map(v => v.party_id),
-      ].filter(Boolean))]
-      partyNameById = currentPartyIds.length
-        ? new Map((await db('parties').whereIn('id', currentPartyIds).select('id', 'name')).map(p => [p.id, p.name]))
-        : new Map()
-    }
-
-    // ── B) Vouchers now pointing at this account BECAUSE of an edit, whose
-    //    original posting never touched this account at all — e.g. an
-    //    edited Receipt that moved from Cash to Bank. Query (A) above can
-    //    never find these on its own since it starts from the OLD posting. ─
-    const movedIn = await db('voucher_lines as vl')
-      .join('vouchers as v', 'vl.voucher_id', 'v.id')
-      .leftJoin('parties as p', 'vl.party_id', 'p.id')
-      .where('v.company_id', companyId)
-      .where('vl.account_id', accountId)
-      .where('v.status', 'POSTED')
-      .andWhere(notSystemCorrection)
-      .andWhere(notStaleReversal)
-      .whereExists(
-        db('audit_log as al').whereRaw('al.entity_id = v.id').andWhere('al.action', 'EDIT_VOUCHER'),
-      )
-      .whereNotExists(
-        db('journal_lines as jl2')
-          .join('journal_entries as je2', 'jl2.journal_entry_id', 'je2.id')
-          .whereRaw('je2.voucher_id = v.id')
-          .andWhere('jl2.account_id', accountId),
-      )
-      .select(
-        'v.id as voucher_id', 'v.voucher_no', 'v.voucher_type', 'v.reference_no',
-        'v.voucher_date', 'v.created_at as sort_key', 'v.party_id as voucher_party_id',
-        'vl.account_id', 'vl.debit', 'vl.credit', 'vl.description', 'vl.party_id as line_party_id',
-        'p.name as line_party_name',
-      )
-
-    // "moved in" party names not already covered by partyNameById above (an
-    // edit that both changed the account AND is the first time we're
-    // resolving that particular party name in this request).
-    const unresolvedPartyIds = [...new Set(
-      movedIn.map(r => r.line_party_id || r.voucher_party_id).filter(Boolean),
-    )].filter(id => !partyNameById.has(id))
-    if (unresolvedPartyIds.length) {
-      for (const p of await db('parties').whereIn('id', unresolvedPartyIds).select('id', 'name')) {
-        partyNameById.set(p.id, p.name)
-      }
-    }
-
+    // `is_edited: false` → mergeAndPaginateLedgerRows() takes rows as-is (they
+    // are already the current figures); `was_edited` carries the "Edited"
+    // badge through to the response.
+    const originalRows = rows.map(r => ({ ...r, is_edited: false }))
     const result = mergeAndPaginateLedgerRows({
-      originalRows, movedIn, currentByVoucher, voucherPartyIdById, partyNameById,
+      originalRows, movedIn: [],
+      currentByVoucher: new Map(), voucherPartyIdById: new Map(), partyNameById: new Map(),
       dateFrom, dateTo, page, limit,
     })
+    result.rows = result.rows.map(({ was_edited, ...r }) => ({ ...r, is_edited: !!was_edited }))
     return { account, ...result }
   }
 
@@ -541,6 +470,13 @@ class ReportingEngine {
 
     const rows = result.rows
 
+    // Totals are part of the RESPONSE, so they must be computed unconditionally.
+    // (They used to be declared inside the dev-only diagnostic block below but
+    // read by the `return` outside it → ReferenceError on every call.)
+    const nonZero      = rows.filter(r => Number(r.closing_debit) + Number(r.closing_credit) > 0)
+    const grandTotalDr = nonZero.reduce((s, r) => s + Number(r.closing_debit),  0)
+    const grandTotalCr = nonZero.reduce((s, r) => s + Number(r.closing_credit), 0)
+
     // ── Diagnostic log — dev/staging only. Skipped entirely in production so
     // every Trial Balance request doesn't pay for extra regex filtering,
     // array reduces, and console output it never uses. Purely diagnostic;
@@ -548,9 +484,6 @@ class ReportingEngine {
     if (!config.isProd) {
       const arRows      = rows.filter(r => /receivable|debtor/i.test(r.name + r.sub_type))
       const apRows      = rows.filter(r => /payable|creditor/i.test(r.name + r.sub_type))
-      const nonZero     = rows.filter(r => Number(r.closing_debit) + Number(r.closing_credit) > 0)
-      const grandTotalDr = nonZero.reduce((s, r) => s + Number(r.closing_debit),  0)
-      const grandTotalCr = nonZero.reduce((s, r) => s + Number(r.closing_credit), 0)
 
       console.log('[TrialBalance] ── Diagnostic ──────────────────────────────')
       console.log(`  Total accounts loaded   : ${rows.length}`)

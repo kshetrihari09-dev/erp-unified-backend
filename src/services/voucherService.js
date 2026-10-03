@@ -6,6 +6,7 @@ const db = require('../db/knex')
 const AuditLogger = require('../utils/auditLogger')
 const { AppError } = require('../engines/postingEngine')
 const { isValidDateOnly, yearOf } = require('../utils/dateOnly')
+const { resolveCurrentEntry } = require('./currentEntry')
 
 class VoucherService {
 
@@ -168,10 +169,18 @@ class VoucherService {
   }
 
   /**
-   * Get a voucher with its lines and journal entry.
+   * Get a voucher with its lines and its CURRENT journal entry.
+   *
+   * `voucher` / `lines` are the visible voucher's own (always-current) rows.
+   * `journal_entry` is resolved through the active correction anchor
+   * (see services/currentEntry.js) — for an edited voucher that is the
+   * corrected entry, NOT the superseded original that still sits on the
+   * voucher's own id. `accounting` says which anchor that is.
+   *
+   * @param {import('knex').Knex|import('knex').Knex.Transaction} [conn] pass a trx to read inside it
    */
-  static async get(voucherId, companyId) {
-    const voucher = await db('vouchers as v')
+  static async get(voucherId, companyId, conn = db) {
+    const voucher = await conn('vouchers as v')
       .leftJoin('parties as p', 'v.party_id', 'p.id')
       .leftJoin('users as uc', 'v.created_by', 'uc.id')
       .leftJoin('users as up', 'v.posted_by', 'up.id')
@@ -184,20 +193,31 @@ class VoucherService {
       )
       // "Edited" indicator — computed from the append-only audit log rather
       // than a new column, so no schema change is needed.
-      .select(db.raw(`EXISTS (SELECT 1 FROM audit_log al WHERE al.entity_id = v.id AND al.action = 'EDIT_VOUCHER') AS is_edited`))
+      .select(conn.raw(`EXISTS (SELECT 1 FROM audit_log al WHERE al.entity_id = v.id AND al.action = 'EDIT_VOUCHER') AS is_edited`))
       .first()
     if (!voucher) throw new AppError('Voucher not found', 404)
 
-    const lines = await db('voucher_lines as vl')
+    const lines = await conn('voucher_lines as vl')
       .leftJoin('accounts as a', 'vl.account_id', 'a.id')
       .leftJoin('parties as p', 'vl.party_id', 'p.id')
       .where('vl.voucher_id', voucherId)
       .select('vl.*', 'a.name as account_name', 'a.code as account_code', 'p.name as party_name')
       .orderBy('vl.line_no')
 
-    const journalEntry = await db('journal_entries').where({ voucher_id: voucherId }).first()
+    const current = await resolveCurrentEntry(conn, voucher)
 
-    return { voucher, lines, journal_entry: journalEntry || null }
+    return {
+      voucher,
+      lines,
+      journal_entry: current.entry,
+      journal_lines: current.lines,
+      accounting: {
+        active_entry_voucher_id: current.anchor_voucher_id,
+        is_corrected:            current.is_corrected,
+        correction_count:        current.correction_count,
+        journal_entry_id:        current.entry?.id || null,
+      },
+    }
   }
 
   /**

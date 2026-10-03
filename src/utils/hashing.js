@@ -58,11 +58,13 @@ async function getLastAuditHash(db, companyId) {
  * Verify the hash chain integrity for a company's journal.
  * Returns { valid: true } or { valid: false, brokenAt: entryId }
  */
+// NOTE: `company_id` must be selected — hashJournalEntry() covers it, so omitting it
+// made every recomputed hash differ and the check could never pass.
 async function verifyJournalChain(db, companyId) {
   const entries = await db('journal_entries')
     .where({ company_id: companyId })
     .orderBy('created_at', 'asc')
-    .select('id', 'entry_hash', 'prev_hash', 'voucher_id', 'event_type', 'entry_date', 'total_debit', 'total_credit', 'narration')
+    .select('id', 'company_id', 'entry_hash', 'prev_hash', 'voucher_id', 'event_type', 'entry_date', 'total_debit', 'total_credit', 'narration')
 
   let prevHash = 'GENESIS'
   for (const entry of entries) {

@@ -13,6 +13,7 @@ const AuditLogger     = require('../utils/auditLogger')
 const { authenticate, requireRole, requirePermission, requireSensitiveConfirm, requireStepUp, ok, paginated } = require('../middleware/index')
 const { AppError } = require('../engines/postingEngine')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
+const { currentEntryVoucherIdSql } = require('../services/currentEntry')
 
 router.use(authenticate)
 
@@ -99,6 +100,8 @@ router.put('/vouchers/:id/edit', requirePermission('edit_posted_vouchers'), requ
       voucherId: req.params.id, companyId: req.companyId, userId: req.user.id,
       reason, voucherDate: voucher_date, partyId: party_id, narration, lines,
     }, req.ip)
+    // Same payload shape as GET /vouchers/:id: current voucher, current
+    // lines, CURRENT journal entry (via the active correction anchor).
     return ok(res, result, 'Voucher updated — journal entries recalculated')
   } catch (err) { next(err) }
 })
@@ -364,12 +367,9 @@ function voucherTypeRouter(voucherType) {
         if (date_from) q = q.where('v.voucher_date', '>=', date_from)
         if (date_to)   q = q.where('v.voucher_date', '<=', date_to)
 
-        const [{ count }] = await db('vouchers')
-          .where({ company_id: req.companyId, voucher_type: voucherType })
-          .andWhere(b => b.whereNull('metadata').orWhereRaw(`metadata->>'system_correction' IS DISTINCT FROM 'true'`))
-          .count('id as count')
+        const [{ count }] = await q.clone().clearSelect().clearOrder().count('v.id as count')
 
-        const data = await q.orderBy('v.voucher_date', 'asc').limit(limit).offset(offset)
+        const data = await q.orderBy('v.voucher_date', 'asc').orderBy('v.created_at', 'asc').limit(limit).offset(offset)
         return paginatedResponse(res, { data, total: Number(count), page, limit })
       } catch (err) { next(err) }
     },
@@ -455,18 +455,26 @@ function voucherTypeRouter(voucherType) {
 
     // Edit a POSTED receipt/payment — rebuilds the same two-line double
     // entry .create() uses (Dr/Cr cash-or-bank vs. the party's control
-    // account), then hands off to VoucherEditService for the actual
-    // reverse + recalculate + in-place update.
+    // account), then hands off to VoucherEditService, which performs the
+    // whole reverse + repost + in-place update as ONE transaction.
+    //
+    // Responds with the same shape as GET /accounting/vouchers/:id — the
+    // updated voucher, its current lines, and the CURRENT journal entry
+    // (resolved through the active correction anchor, never the stale
+    // original) — so the client never has to guess or patch local state.
     edit: async (req, res, next) => {
       try {
         const { reason, party_id, date, amount, account_id, narration } = req.body
         if (!amount || Number(amount) <= 0) throw new AppError('Valid amount required', 400)
         if (!account_id)                    throw new AppError('account_id is required', 400)
 
-        const subType  = voucherType === 'RECEIPT' ? 'receivable' : 'payable'
-        const ctrlAcct = party_id
-          ? (await db('parties').where({ id: party_id, company_id: req.companyId }).first())?.control_account_id
-          : null
+        const subType = voucherType === 'RECEIPT' ? 'receivable' : 'payable'
+        let ctrlAcct = null
+        if (party_id) {
+          const party = await db('parties').where({ id: party_id, company_id: req.companyId }).first()
+          if (!party) throw new AppError('Party not found', 404)
+          ctrlAcct = party.control_account_id
+        }
         const contraAcct = ctrlAcct ||
           (await db('accounts').where({ company_id: req.companyId, sub_type: subType }).first())?.id
         if (!contraAcct) throw new AppError(`No ${subType} account configured`, 400)
@@ -484,7 +492,19 @@ function voucherTypeRouter(voucherType) {
         const result = await VoucherEditService.edit({
           voucherId: req.params.id, companyId: req.companyId, userId: req.user.id,
           reason, voucherDate: date, partyId: party_id || null, narration, lines,
+          expectedType: voucherType,
         }, req.ip)
+
+        // Credit-risk scores depend on receipts: refresh the new party and,
+        // if the receipt moved, the previous one as well.
+        if (voucherType === 'RECEIPT') {
+          const recalc = require('../services/creditRiskRecalc')
+          const touched = new Set([result.voucher.party_id, result.previous_party_id].filter(Boolean))
+          for (const pid of touched) {
+            recalc.recalcCustomerAsync(req.companyId, pid, { trigger: 'payment_edited', userId: req.user.id })
+          }
+        }
+
         return ok(res, result, `${voucherType === 'RECEIPT' ? 'Receipt' : 'Payment'} updated — journal entries recalculated`)
       } catch (err) { next(err) }
     },
@@ -496,11 +516,11 @@ const paymentHandler = voucherTypeRouter('PAYMENT')
 
 router.get('/receipts',  receiptHandler.list)
 router.post('/receipts', requirePermission('post_vouchers'), receiptHandler.create)
-router.put('/receipts/:id/edit', requirePermission('edit_posted_vouchers'), receiptHandler.edit)
+router.put('/receipts/:id/edit', requirePermission('edit_posted_vouchers'), requireStepUp('voucherEdit'), receiptHandler.edit)
 
 router.get('/payments',  paymentHandler.list)
 router.post('/payments', requirePermission('post_vouchers'), paymentHandler.create)
-router.put('/payments/:id/edit', requirePermission('edit_posted_vouchers'), paymentHandler.edit)
+router.put('/payments/:id/edit', requirePermission('edit_posted_vouchers'), requireStepUp('voucherEdit'), paymentHandler.edit)
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -697,7 +717,9 @@ router.get('/voucher-postings', async (req, res, next) => {
 
     let q = db('voucher_postings as vp')
       .join('vouchers as v', 'vp.voucher_id', 'v.id')
-      .leftJoin('journal_entries as je', 'v.id', 'je.voucher_id')
+      // CURRENT entry (through the active correction anchor), not the
+      // original one that an edit superseded.
+      .joinRaw(`LEFT JOIN journal_entries je ON je.voucher_id = ${currentEntryVoucherIdSql('v')}`)
       .where('vp.company_id', req.companyId)
       .select(
         'vp.id', 'vp.source_type', 'vp.source_ref', 'vp.posted_at',

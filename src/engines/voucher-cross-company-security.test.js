@@ -73,6 +73,7 @@ function makeQB(rowsRef) {
     leftJoin:  ()          => qb,
     clearSelect: ()        => qb,
     clone:     ()          => makeQB({ rows: _filtered }),
+    forUpdate: ()          => qb,   // row lock is a no-op for the in-memory fake
     first:     async ()    => _filtered[0],
     count:     async (col) => {
       const alias = (col || 'count as count').split(' as ')[1] || 'count'

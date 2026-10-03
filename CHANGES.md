@@ -1,3 +1,37 @@
+# Posted Receipt/Payment edit — full synchronization fix
+
+Root cause: an edit reversed the live entry, posted a correction onto a hidden
+`SYS-CORR-*` anchor, then rewrote `voucher_lines`/`vouchers` — as three separate
+transactions — while readers either looked at the *original* journal entry
+(`VoucherService.get`, voucher-postings, posting-status) or re-derived "current"
+figures by patching frozen journal rows. Any failure between steps left the
+voucher and ledger disagreeing, and a failed repost bricked the voucher.
+
+* `VoucherEditService.edit()` is now ONE transaction (row-locked voucher):
+  reverse live entry + post correction + rewrite lines + update voucher/metadata
+  + audit row. Any failure rolls everything back.
+* `PostingEngine.reverseForCorrection()` (in-trx) reverses
+  `metadata.ledger_correction.active_entry_voucher_id`, dated at the entry it
+  cancels (so period reports move with the edit); the visible voucher is never
+  flipped to REVERSED. Public `reverse()` now also reverses the LIVE entry.
+* `services/currentEntry.js` is the single definition of "current accounting
+  entry". `GET /accounting/vouchers/:id` returns it (`journal_entry`,
+  `journal_lines`, `accounting.active_entry_voucher_id`).
+* `ReportingEngine.ledger()` reads only current journal entries (same basis as
+  Trial Balance), attributed to the visible voucher.
+* `PUT /accounting/{receipts,payments}/:id/edit` now enforce
+  `requireStepUp('voucherEdit')` server-side (previously only the generic
+  `/vouchers/:id/edit` did), reject wrong voucher type, and return the standard
+  voucher-detail shape.
+* Also fixed (pre-existing, found while testing): `trialBalance()` threw
+  ReferenceError on every call; reversal journal hash did not match stored
+  narration; `verifyJournalChain()` omitted `company_id` so it could never pass;
+  receipts/payments list count ignored its own filters.
+* Frontend: edit form derives Received Into / Paid From from current lines,
+  refreshes balances after save, invalidates react-query caches, ignores stale
+  list responses.
+* Tests: `test/voucher-edit.integration.test.js` (real Postgres, throwaway DB).
+
 # Changed files only — drop these into your existing project at the same paths
 
 ## New files

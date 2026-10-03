@@ -19,11 +19,13 @@
  *   - Debit must equal Credit (DB CHECK constraint enforces this)
  */
 
+const crypto = require('crypto')
 const db = require('../db/knex')
 const { hashJournalEntry, getLastJournalHash } = require('../utils/hashing')
 const AuditLogger = require('../utils/auditLogger')
 const PostingStrategies = require('./postingStrategies')
 const { todayDateOnly, yearOf } = require('../utils/dateOnly')
+const { activeEntryVoucherId } = require('../services/currentEntry')
 
 class PostingEngine {
 
@@ -163,6 +165,7 @@ class PostingEngine {
           total_credit:  totalCredit,
           narration:     voucher.narration,
           created_by:    userId,
+          created_at:    trx.raw('clock_timestamp()'),
         }).returning('*')
 
         // ── Step 13: Write immutable journal lines ─────────────────────
@@ -218,8 +221,15 @@ class PostingEngine {
   }
 
   /**
-   * Reverse a posted journal entry.
-   * Creates an equal-and-opposite journal entry. Never modifies original.
+   * Reverse a posted voucher's CURRENT accounting effect.
+   * Creates an equal-and-opposite journal entry. Never modifies the original.
+   *
+   * If the voucher has been edited (see VoucherEditService) its live journal
+   * entry is the one on the active correction anchor, NOT the original
+   * entry — that one was already neutralised by the edit. Resolving through
+   * `activeEntryVoucherId()` makes sure we reverse what is actually live
+   * instead of re-reversing the superseded original (which would corrupt
+   * the ledger).
    */
   static async reverse(voucherId, userId, reason, ipAddress = null) {
     const voucher = await db('vouchers').where({ id: voucherId }).first()
@@ -231,6 +241,11 @@ class PostingEngine {
 
     return db.transaction(async trx => {
       await db.setRLSContext(trx, companyId)
+
+      // Serialise against concurrent edits/reversals of the same voucher and
+      // re-read it under the lock (its active anchor may have just changed).
+      const locked = await trx('vouchers').where({ id: voucherId }).forUpdate().first()
+      if (!locked || locked.status !== 'POSTED') throw new AppError('Only POSTED vouchers can be reversed', 400)
 
       // Idempotency check for reversal
       const existing = await trx('processing_log')
@@ -255,97 +270,13 @@ class PostingEngine {
       }).onConflict(['company_id', 'idempotency_key']).merge({ status: 'PROCESSING' })
 
       try {
-        // Get the original journal entry
-        const originalEntry = await trx('journal_entries').where({ voucher_id: voucherId }).first()
-        if (!originalEntry) throw new AppError('No journal entry found for this voucher', 404)
-
-        // Get the original lines
-        const originalLines = await trx('journal_lines').where({ journal_entry_id: originalEntry.id })
-
-        // Create a reversal voucher
-        const reversalVoucherNo = await trx.raw(
-          `SELECT next_voucher_number(?, ?, ?, ?) AS voucher_no`,
-          [companyId, 'REVERSAL', yearOf(reversalDate), 'REV']
-        )
-        const [reversalVoucher] = await trx('vouchers').insert({
-          company_id:   companyId,
-          voucher_no:   reversalVoucherNo.rows[0].voucher_no,
-          voucher_type: 'JOURNAL',
-          status:       'POSTED',
-          voucher_date: reversalDate,
-          narration:    `REVERSAL of ${voucher.voucher_no}: ${reason}`,
-          total_amount: originalEntry.total_debit,
-          reversal_of:  voucherId,
-          created_by:   userId,
-          posted_by:    userId,
-          posted_at:    new Date(),
-          currency:     voucher.currency || 'NPR',
-          exchange_rate: 1,
-        }).returning('*')
-
-        // Build reversal lines (swap debit and credit)
-        const reversalLines = originalLines.map((l, i) => ({
-          voucher_id:  reversalVoucher.id,
-          account_id:  l.account_id,
-          party_id:    l.party_id,
-          line_no:     i + 1,
-          description: `Reversal: ${l.description || ''}`,
-          debit:       l.credit,  // SWAPPED
-          credit:      l.debit,   // SWAPPED
-        }))
-
-        // Insert reversal voucher lines
-        for (const rl of reversalLines) {
-          await trx('voucher_lines').insert(rl)
-        }
-
-        // Hash chain for reversal journal entry
-        const prevHash = await getLastJournalHash(trx, companyId)
-        const reversalHash = hashJournalEntry({
-          company_id:   companyId,
-          voucher_id:   reversalVoucher.id,
-          event_type:   'REVERSED',
-          entry_date:   reversalDate,
-          total_debit:  originalEntry.total_credit,  // swapped
-          total_credit: originalEntry.total_debit,   // swapped
-          narration:    `REVERSAL of ${voucher.voucher_no}`,
-          prev_hash:    prevHash,
-        })
-
-        // Write the reversal journal entry
-        const [reversalJE] = await trx('journal_entries').insert({
-          company_id:        companyId,
-          voucher_id:        reversalVoucher.id,
-          reversed_entry_id: originalEntry.id,
-          event_type:        'REVERSED',
-          entry_date:        reversalDate,
-          period_ref:        reversalDate.slice(0, 7),
-          entry_hash:        reversalHash,
-          prev_hash:         prevHash,
-          total_debit:       originalEntry.total_credit,
-          total_credit:      originalEntry.total_debit,
-          narration:         `REVERSAL of ${voucher.voucher_no}: ${reason}`,
-          created_by:        userId,
-        }).returning('*')
-
-        // Write the reversal journal lines
-        for (const [i, l] of reversalLines.entries()) {
-          await trx('journal_lines').insert({
-            journal_entry_id: reversalJE.id,
-            account_id:  l.account_id,
-            party_id:    l.party_id,
-            line_no:     i + 1,
-            description: l.description,
-            debit:       l.debit,
-            credit:      l.credit,
-            debit_base:  l.debit,
-            credit_base: l.credit,
-          })
-        }
-
-        // Mark original voucher as REVERSED
-        await trx('vouchers').where({ id: voucherId }).update({
-          status: 'REVERSED', reversed_by: userId,
+        const entryVoucherId = activeEntryVoucherId(locked)
+        const { reversalVoucher, reversalJE } = await PostingEngine._reverseEntry(trx, {
+          companyId, userId, reason, ipAddress,
+          visibleVoucher: locked, entryVoucherId, reversalDate,
+          reversalNo: null,          // normal REV-… number — this IS a user-visible reversal
+          internal: false,
+          markReversed: true,        // visible voucher (and its anchor, if any) become REVERSED
         })
 
         await trx('processing_log')
@@ -355,7 +286,7 @@ class PostingEngine {
         await AuditLogger.log(trx, {
           companyId, userId, action: 'REVERSE_VOUCHER',
           entityType: 'voucher', entityId: voucherId,
-          voucherNo: voucher.voucher_no,
+          voucherNo: locked.voucher_no,
           payloadBefore: { status: 'POSTED' },
           payloadAfter:  { status: 'REVERSED', reversal_voucher_no: reversalVoucher.voucher_no, reason },
           ipAddress,
@@ -370,6 +301,154 @@ class PostingEngine {
         throw err
       }
     })
+  }
+
+  /**
+   * Reverse the LIVE accounting entry of a POSTED voucher as one step of an
+   * edit, INSIDE the caller's transaction (VoucherEditService.edit()).
+   *
+   * Differences from reverse():
+   *   - runs in the caller's trx → rolls back with the rest of the edit
+   *   - reverses the *active* entry (original, or the previous edit's anchor)
+   *   - dated at the entry being cancelled, not "today": the old amount and
+   *     its reversal then net to zero in the OLD period, so period-bucketed
+   *     reports (trial balance, P&L, cash flow…) move with the edit
+   *   - uses an internal `SYS-CORR-…` label — no REV-… number is burned
+   *   - the visible voucher stays POSTED (it is never flipped to REVERSED,
+   *     not even transiently); only a superseded internal anchor is marked
+   *
+   * Caller must already hold a row lock on the visible voucher.
+   */
+  static async reverseForCorrection({ trx, voucher, userId, reason, ipAddress = null }) {
+    const entryVoucherId = activeEntryVoucherId(voucher)
+    const live = await trx('journal_entries').where({ voucher_id: entryVoucherId }).first()
+    if (!live) throw new AppError('No journal entry found for this voucher', 404)
+
+    const { reversalVoucher, reversalJE } = await PostingEngine._reverseEntry(trx, {
+      companyId: voucher.company_id, userId, reason, ipAddress,
+      visibleVoucher: voucher, entryVoucherId,
+      reversalDate: String(live.entry_date).slice(0, 10),
+      reversalNo: `SYS-CORR-${crypto.randomUUID()}`,
+      internal: true,
+      markReversed: entryVoucherId !== voucher.id,
+    })
+    return { reversal_voucher: reversalVoucher, reversal_journal_entry: reversalJE, reversed_entry_voucher_id: entryVoucherId }
+  }
+
+  /**
+   * Shared core: write an equal-and-opposite entry for the LIVE entry owned
+   * by `entryVoucherId`. Always runs inside a caller-supplied transaction.
+   * @private
+   */
+  static async _reverseEntry(trx, { companyId, userId, reason, visibleVoucher, entryVoucherId, reversalDate, reversalNo, internal, markReversed }) {
+    const originalEntry = await trx('journal_entries').where({ voucher_id: entryVoucherId }).first()
+    if (!originalEntry) throw new AppError('No journal entry found for this voucher', 404)
+
+    // One entry can only ever be neutralised once.
+    const alreadyReversed = await trx('journal_entries').where({ reversed_entry_id: originalEntry.id }).first()
+    if (alreadyReversed) throw new AppError('This voucher has already been reversed', 409)
+
+    const originalLines = await trx('journal_lines').where({ journal_entry_id: originalEntry.id }).orderBy('line_no')
+
+    let voucherNo = reversalNo
+    if (!voucherNo) {
+      const r = await trx.raw(`SELECT next_voucher_number(?, ?, ?, ?) AS voucher_no`, [companyId, 'REVERSAL', yearOf(reversalDate), 'REV'])
+      voucherNo = r.rows[0].voucher_no
+    }
+
+    const [reversalVoucher] = await trx('vouchers').insert({
+      company_id:   companyId,
+      voucher_no:   voucherNo,
+      voucher_type: 'JOURNAL',
+      status:       'POSTED',
+      voucher_date: reversalDate,
+      narration:    `REVERSAL of ${visibleVoucher.voucher_no}: ${reason}`,
+      total_amount: originalEntry.total_debit,
+      // Public reversals point at the visible voucher (list filters rely on
+      // it); internal edit reversals point at the entry owner they cancel.
+      reversal_of:  internal ? entryVoucherId : visibleVoucher.id,
+      created_by:   userId,
+      posted_by:    userId,
+      posted_at:    new Date(),
+      currency:     visibleVoucher.currency || 'NPR',
+      exchange_rate: 1,
+      // Tagged at INSERT time (same statement) so an internal reversal can
+      // never exist, even for an instant, without its system_correction flag.
+      metadata:     internal
+        ? JSON.stringify({ system_correction: true, corrects_voucher_id: visibleVoucher.id, internal_only: true, kind: 'edit_reversal' })
+        : null,
+    }).returning('*')
+
+    // Build reversal lines (swap debit and credit)
+    const reversalLines = originalLines.map((l, i) => ({
+      voucher_id:  reversalVoucher.id,
+      account_id:  l.account_id,
+      party_id:    l.party_id,
+      line_no:     i + 1,
+      description: `Reversal: ${l.description || ''}`,
+      debit:       l.credit,  // SWAPPED
+      credit:      l.debit,   // SWAPPED
+    }))
+    for (const rl of reversalLines) await trx('voucher_lines').insert(rl)
+
+    // Hash chain for reversal journal entry.
+    // The hash MUST cover exactly the narration that is stored on the entry
+    // (verifyJournalChain recomputes it from the stored row). It used to hash
+    // `REVERSAL of X` while storing `REVERSAL of X: <reason>`, so every
+    // reversal failed chain verification with hash_mismatch.
+    const prevHash = await getLastJournalHash(trx, companyId)
+    const reversalNarration = `REVERSAL of ${visibleVoucher.voucher_no}: ${reason}`
+    const reversalHash = hashJournalEntry({
+      company_id:   companyId,
+      voucher_id:   reversalVoucher.id,
+      event_type:   'REVERSED',
+      entry_date:   reversalDate,
+      total_debit:  originalEntry.total_credit,  // swapped
+      total_credit: originalEntry.total_debit,   // swapped
+      narration:    reversalNarration,
+      prev_hash:    prevHash,
+    })
+
+    const [reversalJE] = await trx('journal_entries').insert({
+      company_id:        companyId,
+      voucher_id:        reversalVoucher.id,
+      reversed_entry_id: originalEntry.id,
+      event_type:        'REVERSED',
+      entry_date:        reversalDate,
+      period_ref:        reversalDate.slice(0, 7),
+      entry_hash:        reversalHash,
+      prev_hash:         prevHash,
+      total_debit:       originalEntry.total_credit,
+      total_credit:      originalEntry.total_debit,
+      narration:         reversalNarration,
+      created_by:        userId,
+      created_at:        trx.raw('clock_timestamp()'),
+    }).returning('*')
+
+    for (const [i, l] of reversalLines.entries()) {
+      await trx('journal_lines').insert({
+        journal_entry_id: reversalJE.id,
+        account_id:  l.account_id,
+        party_id:    l.party_id,
+        line_no:     i + 1,
+        description: l.description,
+        debit:       l.debit,
+        credit:      l.credit,
+        debit_base:  l.debit,
+        credit_base: l.credit,
+      })
+    }
+
+    if (markReversed) {
+      // Entry owner (visible voucher or its anchor) is now neutralised.
+      await trx('vouchers').where({ id: entryVoucherId }).update({ status: 'REVERSED', reversed_by: userId })
+      // Public reversal of an edited voucher: the visible voucher is reversed too.
+      if (!internal && entryVoucherId !== visibleVoucher.id) {
+        await trx('vouchers').where({ id: visibleVoucher.id }).update({ status: 'REVERSED', reversed_by: userId })
+      }
+    }
+
+    return { reversalVoucher, reversalJE }
   }
 
   /**
@@ -481,6 +560,7 @@ class PostingEngine {
       total_credit: totalCredit,
       narration:    voucher.narration,
       created_by:   userId,
+      created_at:   trx.raw('clock_timestamp()'),
     }).returning('*')
 
     // Write journal lines

@@ -1,60 +1,61 @@
 /**
  * voucherEditService.js — Password-protected editing of POSTED vouchers.
  *
- * Design note — why this doesn't touch postingEngine.js's core mechanics:
- * `journal_entries` is append-only (trigger-enforced: no UPDATE/DELETE) and has
- * a UNIQUE constraint on `voucher_id` (one ledger entry per voucher, forever).
- * That means the one and only accounting-correct way to change a POSTED
- * voucher's *financial* impact — without touching the schema or the posting
- * engine — is the standard immutable-ledger pattern: reverse the old entry,
- * then post a corrected one. This service does exactly that using the
- * EXISTING, unmodified `PostingEngine.reverse()` and `PostingEngine.postInTransaction()`
- * — nothing about how journal entries are built, balanced, hashed or chained
- * is changed here.
+ * Why this is "reverse + repost" and not an UPDATE
+ * ------------------------------------------------
+ * `journal_entries` is append-only (trigger-enforced: no UPDATE/DELETE) and
+ * has a UNIQUE constraint on `voucher_id` (one ledger entry per voucher,
+ * forever). The only accounting-correct way to change a POSTED voucher's
+ * financial impact without touching the schema is the standard
+ * immutable-ledger pattern:
  *
- * IMPORTANT — this does NOT call `VoucherService.create()`:
- * That path is the normal user-facing "create a new voucher" flow — it pulls
- * a real, user-visible voucher number from `next_voucher_number()` under the
- * voucher type's real sequence (the same counter real JV/SI/PI/... vouchers
- * use). Calling it from an edit is what made an edit look like "Reverse →
- * Create JV-0002": a second real voucher silently entered the numbering
- * sequence and had to be filtered back out of every list.
+ *     reverse the LIVE entry   +   post the corrected entry
  *
- * Instead, the corrected journal effect is posted against a bare internal
- * "ledger anchor" row that this service inserts directly:
- *   - its `voucher_no` is never drawn from `next_voucher_number()` — it's a
- *     `SYS-CORR-…` label that never touches the real sequence, so no
- *     user-facing voucher number is ever generated or burned by an edit,
- *   - `metadata.system_correction = true` marks it as internal ledger
- *     plumbing (not a voucher), and every list/report query that shows
- *     vouchers to the user already filters this flag out,
- *   - the actual journal entry for it is still written by the existing,
- *     unmodified `PostingEngine.postInTransaction()`, so balance validation,
- *     period-lock validation, account validation, and hash chaining are all
- *     exactly the same as for any other post.
+ * The corrected entry is posted against a bare internal "ledger anchor"
+ * voucher (`SYS-CORR-…`, metadata.system_correction = true) because the
+ * visible voucher's own journal slot is already taken. The anchor never
+ * draws from next_voucher_number(), is excluded from every user-facing
+ * list/report, and is posted by the existing PostingEngine.postInTransaction()
+ * (balance, period-lock, account validation and hash chaining unchanged).
  *
- * From the user's point of view the voucher they opened is the one that gets
- * updated: same `id`, same `voucher_no`, same row — its date/party/narration/
- * lines are updated in place and it stays `POSTED`. Nothing new ever appears
- * in the voucher list.
+ * The visible voucher keeps its id, voucher_no and POSTED status; its
+ * header, lines and metadata are updated in place.
  *
- * Repeated edits: the voucher's own `metadata.ledger_correction.active_entry_voucher_id`
- * tracks which internal anchor currently holds the *live* journal entry, so a
- * second (or third, ...) edit reverses the most recent corrected entry rather
- * than re-reversing the original, stale, already-superseded one. Without this,
- * editing the same voucher twice would silently corrupt the ledger even though
- * the voucher itself kept displaying correctly — exactly the failure mode this
- * service exists to avoid.
+ * Which table is the source of truth after an edit?
+ *   - vouchers / voucher_lines  → the CURRENT visible voucher (always in step)
+ *   - vouchers.metadata.ledger_correction.active_entry_voucher_id
+ *                               → which anchor owns the CURRENT journal entry
+ *   - journal_entries/lines     → immutable history; only the entry owned by
+ *                                 the active anchor (or the voucher itself,
+ *                                 if never edited) is "current". Everything
+ *                                 else is superseded and nets to zero with
+ *                                 its reversal. See services/currentEntry.js.
  *
- * Audit trail uses the existing append-only `audit_log` table (via
- * AuditLogger — untouched), so no new tables/columns are needed. The
- * "Edited" badge is a computed `is_edited` flag (EXISTS against audit_log),
- * unchanged from before.
+ * Atomicity
+ * ---------
+ * The ENTIRE edit — reverse live entry, create anchor, post correction,
+ * rewrite voucher_lines, update the voucher + metadata, write the audit row
+ * — runs in ONE database transaction, with the voucher row locked
+ * (SELECT … FOR UPDATE) so concurrent edits/reversals of the same voucher
+ * serialise. Any failure rolls all of it back: you can never end up with
+ * "voucher = new amount, ledger = old amount" (or the reverse).
+ *
+ * Repeated edits: each edit reverses `active_entry_voucher_id` (the previous
+ * edit's anchor), never blindly the original entry, so corrections never
+ * accumulate.
+ *
+ * Audit trail: the existing append-only `audit_log` (EDIT_VOUCHER), written
+ * with AuditLogger.logStrict() INSIDE the transaction — no audit row, no
+ * edit. A failed attempt additionally records EDIT_VOUCHER_FAILED after the
+ * rollback. The "Edited" badge remains a computed EXISTS against audit_log.
  */
 const crypto         = require('crypto')
 const db             = require('../db/knex')
 const AuditLogger    = require('../utils/auditLogger')
 const PostingEngine  = require('../engines/postingEngine')
+const VoucherService = require('./voucherService')
+const { activeEntryVoucherId, parseMeta } = require('./currentEntry')
+const { isValidDateOnly } = require('../utils/dateOnly')
 const { AppError }   = require('../engines/postingEngine')
 
 class VoucherEditService {
@@ -62,21 +63,24 @@ class VoucherEditService {
    * @param {object} params
    * @param {string} params.voucherId
    * @param {string} params.companyId
-   * @param {string} params.userId      - editor (already password-confirmed by the route)
+   * @param {string} params.userId      - editor (already step-up confirmed by the route)
    * @param {string} params.reason      - mandatory edit reason, goes into the audit trail
-   * @param {string} [params.voucherDate]
+   * @param {string} [params.voucherDate]  'YYYY-MM-DD'
    * @param {string|null} [params.partyId]
    * @param {string} [params.narration]
    * @param {Array}  params.lines       - corrected lines, same shape as VoucherService.create()
+   * @param {string} [params.expectedType] - e.g. 'RECEIPT'; rejects editing a voucher of another type
    * @param {string} [ipAddress]
+   * @returns {Promise<{voucher, lines, journal_entry, journal_lines, accounting, correction_voucher_id, previous_party_id}>}
    */
-  static async edit({ voucherId, companyId, userId, reason, voucherDate, partyId, narration, lines }, ipAddress = null) {
+  static async edit({ voucherId, companyId, userId, reason, voucherDate, partyId, narration, lines, expectedType }, ipAddress = null) {
     if (!reason?.trim()) throw new AppError('An edit reason is required', 400)
     if (!Array.isArray(lines) || lines.length < 2) throw new AppError('A voucher requires at least 2 lines', 400)
+    if (voucherDate !== undefined && voucherDate !== null && !isValidDateOnly(voucherDate)) {
+      throw new AppError('Invalid voucher date', 400)
+    }
 
     // ── Double-entry validation on the corrected lines ──────────────────────
-    // Previously delegated to VoucherService.create(); now enforced directly
-    // here since the correction no longer goes through that path.
     const totalDebit  = lines.reduce((s, l) => s + Number(l.debit  || 0), 0)
     const totalCredit = lines.reduce((s, l) => s + Number(l.credit || 0), 0)
     if (Math.abs(totalDebit - totalCredit) > 0.005) {
@@ -91,71 +95,70 @@ class VoucherEditService {
       if (dr < 0 || cr < 0)  throw new AppError(`Line ${i + 1}: negative amounts not allowed`, 400)
     }
 
-    const voucher = await db('vouchers').where({ id: voucherId, company_id: companyId }).first()
-    if (!voucher) throw new AppError('Voucher not found', 404)
-    if (voucher.status !== 'POSTED') {
-      throw new AppError('Only posted vouchers go through this edit workflow (drafts can be edited directly)', 400)
-    }
+    // Captured for the failure audit entry written after a rollback.
+    let before = null
+    let voucherNoForAudit = null
+    let financialPhase = false
 
-    const newDate = voucherDate || voucher.voucher_date
-
-    // Respect existing period locks — same DB function the rest of the
-    // engine already uses, checked for both the original and new date.
-    const datesToCheck = new Set([
-      String(voucher.voucher_date).slice(0, 10),
-      String(newDate).slice(0, 10),
-    ])
-    for (const d of datesToCheck) {
-      const { rows } = await db.raw(`SELECT is_period_locked(?, ?::date) AS locked`, [companyId, d])
-      if (rows[0].locked) throw new AppError(`Cannot edit — the accounting period containing ${d} is locked`, 400)
-    }
-
-    // Snapshot BEFORE state for the audit trail.
-    const originalLines = await db('voucher_lines').where({ voucher_id: voucherId }).orderBy('line_no')
-    const before = {
-      voucher_date: voucher.voucher_date,
-      party_id:     voucher.party_id,
-      narration:    voucher.narration,
-      total_amount: voucher.total_amount,
-      lines: originalLines.map(l => ({
-        account_id: l.account_id, debit: Number(l.debit), credit: Number(l.credit), description: l.description,
-      })),
-    }
-
-    // The voucher's own metadata (jsonb, parsed to an object by pg) may
-    // already carry unrelated business data (e.g. SALES/PURCHASE `items`) —
-    // preserve it, only reading/writing the `ledger_correction` sub-key.
-    const existingMeta = voucher.metadata || {}
-
-    // Which internal ledger anchor currently holds the *live* journal entry
-    // for this voucher? First-ever edit: the voucher's own original entry.
-    // Subsequent edits: the anchor created by the previous edit.
-    const activeEntryVoucherId = existingMeta.ledger_correction?.active_entry_voucher_id || voucherId
-
-    // ── Step 1 — reverse the currently-live ledger impact (existing,
-    //    unmodified engine method). ──────────────────────────────────────────
-    const reversal = await PostingEngine.reverse(activeEntryVoucherId, userId, `Correction (edit): ${reason}`, ipAddress)
-
-    // Tag the reversal artifact as internal ledger plumbing so it can never
-    // surface as a user-facing voucher — independent of the reversal_of/status
-    // heuristic the voucher list also happens to use, so this stays hidden
-    // even across several chained edits.
-    await db('vouchers').where({ id: reversal.reversal_voucher.id }).update({
-      metadata: JSON.stringify({ system_correction: true, corrects_voucher_id: voucherId, internal_only: true, kind: 'edit_reversal' }),
-    })
-
-    // ── Step 2 — post the corrected figures to a NEW internal ledger anchor.
-    //    This is deliberately NOT VoucherService.create(): no call to
-    //    next_voucher_number(), no real user-facing voucher number, and the
-    //    row is tagged system_correction so it's excluded from every voucher
-    //    list/report query up front. The actual posting — balance check,
-    //    period-lock check, account validation, hash chaining — still goes
-    //    through the existing, unmodified PostingEngine.postInTransaction(). ──
-    let correctionAnchorId
     try {
-      correctionAnchorId = await db.transaction(async trx => {
+      return await db.transaction(async trx => {
         await db.setRLSContext(trx, companyId)
 
+        // Lock the visible voucher row: concurrent edits / reversals of the
+        // SAME voucher queue up here, so each one sees the previous one's
+        // result (and its active_entry_voucher_id) instead of racing it.
+        const voucher = await trx('vouchers').where({ id: voucherId, company_id: companyId }).forUpdate().first()
+        if (!voucher) throw new AppError('Voucher not found', 404)
+        if (expectedType && voucher.voucher_type !== expectedType) {
+          throw new AppError(`This voucher is a ${voucher.voucher_type}, not a ${expectedType}`, 400)
+        }
+        if (voucher.status !== 'POSTED') {
+          throw new AppError('Only posted vouchers go through this edit workflow (drafts can be edited directly)', 400)
+        }
+        if (partyId) {
+          const party = await trx('parties').where({ id: partyId, company_id: companyId }).first('id')
+          if (!party) throw new AppError('Party not found', 404)
+        }
+        voucherNoForAudit = voucher.voucher_no
+
+        const newDate = voucherDate || String(voucher.voucher_date).slice(0, 10)
+        const newPartyId = partyId !== undefined ? (partyId || null) : voucher.party_id
+        const newNarration = narration !== undefined ? narration : voucher.narration
+
+        // Respect period locks for both the original and the new date.
+        for (const d of new Set([String(voucher.voucher_date).slice(0, 10), newDate])) {
+          const { rows } = await trx.raw(`SELECT is_period_locked(?, ?::date) AS locked`, [companyId, d])
+          if (rows[0].locked) throw new AppError(`Cannot edit — the accounting period containing ${d} is locked`, 400)
+        }
+
+        // Validate every account up-front, before anything is written.
+        for (const line of lines) {
+          const account = await trx('accounts').where({ id: line.account_id, company_id: companyId }).first('id')
+          if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
+        }
+
+        // Snapshot BEFORE state for the audit trail.
+        const originalLines = await trx('voucher_lines').where({ voucher_id: voucherId }).orderBy('line_no')
+        before = {
+          voucher_date: voucher.voucher_date,
+          party_id:     voucher.party_id,
+          narration:    voucher.narration,
+          total_amount: voucher.total_amount,
+          lines: originalLines.map(l => ({
+            account_id: l.account_id, debit: Number(l.debit), credit: Number(l.credit), description: l.description,
+          })),
+        }
+
+        const existingMeta = parseMeta(voucher.metadata)
+        const activeBefore = activeEntryVoucherId(voucher)
+        financialPhase = true
+
+        // ── 1. Reverse the LIVE entry (original, or previous edit's anchor). ──
+        const reversal = await PostingEngine.reverseForCorrection({
+          trx, voucher, userId, reason: `Correction (edit): ${reason}`, ipAddress,
+        })
+
+        // ── 2. Post the corrected figures to a NEW internal anchor. ──────────
         const period = await trx('accounting_periods')
           .where({ company_id: companyId })
           .where('start_date', '<=', newDate)
@@ -166,13 +169,9 @@ class VoucherEditService {
         const [anchor] = await trx('vouchers').insert({
           company_id:    companyId,
           period_id:     period?.id || null,
-          party_id:      partyId !== undefined ? (partyId || null) : voucher.party_id,
+          party_id:      newPartyId,
           created_by:    userId,
-          // Short, internal-only label — never drawn from next_voucher_number(),
-          // so it never collides with or consumes a real user-facing sequence
-          // number. Traceability back to the edited voucher is via
-          // metadata.corrects_voucher_id, not this string, so it only needs
-          // to fit the column (`voucher_no` varchar(50)) and stay unique.
+          // Internal label only — never drawn from next_voucher_number().
           voucher_no:    `SYS-CORR-${crypto.randomUUID()}`,
           voucher_type:  voucher.voucher_type,
           status:        'DRAFT',
@@ -181,57 +180,16 @@ class VoucherEditService {
           exchange_rate: voucher.exchange_rate || 1,
           total_amount:  totalDebit,
           reference_no:  voucher.reference_no,
-          narration:     narration !== undefined ? narration : voucher.narration,
+          narration:     newNarration,
           notes:         voucher.notes,
-          // Deliberately no `items` carried over here — SALES/PURCHASE
-          // strategies only run FIFO/inventory-batch side effects when
-          // metadata.items is present, and those already ran once when the
-          // voucher was first posted. An edit corrects the accounting entry,
-          // it does not re-run inventory movements.
+          // No `items` carried over: SALES/PURCHASE strategies would re-run
+          // inventory side effects. An edit corrects the accounting entry
+          // only; it never re-runs stock movements.
           metadata: JSON.stringify({ system_correction: true, corrects_voucher_id: voucherId, internal_only: true, kind: 'edit_correction' }),
         }).returning('*')
 
-        for (const [i, line] of lines.entries()) {
-          const account = await trx('accounts').where({ id: line.account_id, company_id: companyId }).first()
-          if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
-          await trx('voucher_lines').insert({
-            voucher_id:  anchor.id,
-            account_id:  line.account_id,
-            party_id:    line.party_id    || null,
-            line_no:     i + 1,
-            description: line.description || null,
-            debit:       Number(line.debit  || 0),
-            credit:      Number(line.credit || 0),
-            tax_rate:    Number(line.tax_rate   || 0),
-            tax_amount:  Number(line.tax_amount || 0),
-          })
-        }
-
-        await PostingEngine.postInTransaction({ trx, voucherId: anchor.id, userId, ipAddress, companyId })
-        return anchor.id
-      })
-    } catch (err) {
-      // The old entry has already been reversed but the corrected one failed
-      // to post — flag this loudly in the audit trail for manual follow-up
-      // rather than silently leaving the voucher in an inconsistent state.
-      await AuditLogger.log(db, {
-        companyId, userId, action: 'EDIT_VOUCHER_FAILED',
-        entityType: 'voucher', entityId: voucherId, voucherNo: voucher.voucher_no,
-        payloadBefore: before, payloadAfter: { error: err.message, reason },
-        ipAddress, isSuspicious: true,
-      })
-      throw err
-    }
-
-    // ── Step 3 — update the SAME voucher row in place: same id, same
-    //    voucher_no, still POSTED — this is the voucher the user keeps using. ──
-    const updated = await db.transaction(async trx => {
-      await trx('voucher_lines').where({ voucher_id: voucherId }).del()
-      for (const [i, line] of lines.entries()) {
-        const account = await trx('accounts').where({ id: line.account_id, company_id: companyId }).first()
-        if (!account) throw new AppError(`Account not found: ${line.account_id}`, 404)
-        await trx('voucher_lines').insert({
-          voucher_id:  voucherId,
+        const lineRows = (ownerId) => lines.map((line, i) => ({
+          voucher_id:  ownerId,
           account_id:  line.account_id,
           party_id:    line.party_id    || null,
           line_no:     i + 1,
@@ -240,43 +198,74 @@ class VoucherEditService {
           credit:      Number(line.credit || 0),
           tax_rate:    Number(line.tax_rate   || 0),
           tax_amount:  Number(line.tax_amount || 0),
+        }))
+        await trx('voucher_lines').insert(lineRows(anchor.id))
+
+        await PostingEngine.postInTransaction({ trx, voucherId: anchor.id, userId, ipAddress, companyId })
+
+        // ── 3. Update the SAME visible voucher in place. ─────────────────────
+        await trx('voucher_lines').where({ voucher_id: voucherId }).del()
+        await trx('voucher_lines').insert(lineRows(voucherId))
+
+        const priorSuperseded = existingMeta.ledger_correction?.superseded_entry_voucher_ids || []
+        const [updated] = await trx('vouchers').where({ id: voucherId }).update({
+          voucher_date: newDate,
+          party_id:     newPartyId,
+          narration:    newNarration,
+          total_amount: totalDebit,
+          status:       'POSTED',
+          period_ref:   newDate.slice(0, 7),
+          period_id:    period?.id || null,
+          metadata: JSON.stringify({
+            ...existingMeta,
+            ledger_correction: {
+              active_entry_voucher_id: anchor.id,
+              correction_count: (existingMeta.ledger_correction?.correction_count || 0) + 1,
+              last_edited_at: new Date().toISOString(),
+              superseded_entry_voucher_ids: [...priorSuperseded, activeBefore],
+            },
+          }),
+          updated_at:   new Date(),
+        }).returning('*')
+
+        // ── 4. Audit row — part of the transaction: no audit row, no edit. ───
+        await AuditLogger.logStrict(trx, {
+          companyId, userId, action: 'EDIT_VOUCHER',
+          entityType: 'voucher', entityId: voucherId, voucherNo: voucher.voucher_no,
+          payloadBefore: before,
+          payloadAfter: {
+            voucher_date: newDate, party_id: updated.party_id, narration: updated.narration,
+            total_amount: updated.total_amount,
+            lines: lines.map(l => ({ account_id: l.account_id, debit: Number(l.debit || 0), credit: Number(l.credit || 0), description: l.description })),
+            reason,
+            reversed_entry_voucher_id: reversal.reversed_entry_voucher_id,
+            active_entry_voucher_id: anchor.id,
+          },
+          ipAddress,
+        })
+
+        // Read the result back INSIDE the transaction: what the caller gets
+        // is exactly what was committed, including the CURRENT journal entry.
+        const fresh = await VoucherService.get(voucherId, companyId, trx)
+        return {
+          ...fresh,
+          correction_voucher_id: anchor.id,
+          previous_party_id: before.party_id,
+        }
+      })
+    } catch (err) {
+      // The transaction has rolled back — nothing financial changed. Leave a
+      // forensic trace of the failed attempt (outside the rolled-back trx).
+      if (financialPhase) {
+        await AuditLogger.log(db, {
+          companyId, userId, action: 'EDIT_VOUCHER_FAILED',
+          entityType: 'voucher', entityId: voucherId, voucherNo: voucherNoForAudit,
+          payloadBefore: before, payloadAfter: { error: err.message, reason, rolled_back: true },
+          ipAddress, isSuspicious: true,
         })
       }
-
-      const [row] = await trx('vouchers').where({ id: voucherId }).update({
-        voucher_date: newDate,
-        party_id:     partyId !== undefined ? (partyId || null) : voucher.party_id,
-        narration:    narration !== undefined ? narration : voucher.narration,
-        total_amount: totalDebit,
-        status:       'POSTED',
-        metadata: JSON.stringify({
-          ...existingMeta,
-          ledger_correction: {
-            active_entry_voucher_id: correctionAnchorId,
-            correction_count: (existingMeta.ledger_correction?.correction_count || 0) + 1,
-            last_edited_at: new Date().toISOString(),
-          },
-        }),
-        updated_at:   new Date(),
-      }).returning('*')
-      return row
-    })
-
-    // ── Audit trail — original values, new values, editor, timestamp, reason. ──
-    await AuditLogger.log(db, {
-      companyId, userId, action: 'EDIT_VOUCHER',
-      entityType: 'voucher', entityId: voucherId, voucherNo: voucher.voucher_no,
-      payloadBefore: before,
-      payloadAfter: {
-        voucher_date: newDate, party_id: updated.party_id, narration: updated.narration,
-        total_amount: updated.total_amount,
-        lines: lines.map(l => ({ account_id: l.account_id, debit: Number(l.debit || 0), credit: Number(l.credit || 0), description: l.description })),
-        reason,
-      },
-      ipAddress,
-    })
-
-    return { voucher: updated, correction_voucher_id: correctionAnchorId }
+      throw err
+    }
   }
 
   /** Full edit history for one voucher, read from the append-only audit log. */
