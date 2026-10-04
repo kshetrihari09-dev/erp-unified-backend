@@ -168,6 +168,8 @@ function requirePermission(permission) {
     // entry under the hood, so it demands the same trust level as reversing
     // one outright — reuse the existing can_reverse_entries flag.
     edit_posted_vouchers: u => u.can_reverse_entries,
+    // Deleting (= reversing) a posted voucher is the same trust level as reversing/editing one.
+    delete_posted_vouchers: u => u.can_reverse_entries,
     // Smart Purchase Suggestions (migration 031) — see routes/purchaseSuggestions.js
     view_purchase_suggestions:              u => u.can_view_purchase_suggestions,
     manage_purchase_suggestions:            u => u.can_manage_purchase_suggestions,

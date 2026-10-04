@@ -1,3 +1,25 @@
+# Delete (= reverse) a POSTED Receipt / Payment
+
+* `DELETE /accounting/receipts/:id` and `DELETE /accounting/payments/:id` with `{ reason }`.
+  Never a physical delete (the journal is append-only): the voucher keeps its number
+  and becomes REVERSED, a `REV-…` entry cancels its CURRENT accounting effect (for a
+  previously edited voucher that is the active correction anchor, not the original),
+  and a `DELETE_VOUCHER` audit row records who/why — all in ONE transaction
+  (`services/voucherDeleteService.js`, built on `PostingEngine.reverseInTransaction`).
+* Guarded by `delete_posted_vouchers` (same trust level as edit: `can_reverse_entries`),
+  a mandatory reason, voucher type check, company scoping, and
+  `requireStepUp('voucherDelete')` — an edit-scoped password confirmation does NOT
+  authorise a delete.
+* Row lock + processing_log make a double-click / concurrent delete succeed once
+  (others get 409/400). Deleting twice, or editing a deleted voucher, is rejected.
+* Afterwards: voucher shows as Reversed in the list, party ledger/balance exclude it,
+  account ledger shows the original and its reversal netting to zero, books return to
+  their pre-voucher state.
+* Frontend: Delete button on posted rows (Receipts/Payments tab) → password + reason
+  dialog (`VoucherEditPasswordDialog action="voucherDelete"`) → refetch list, balances
+  and cached queries.
+* Tests: 7 new cases in `test/voucher-edit.integration.test.js`.
+
 # Posted Receipt/Payment edit — full synchronization fix
 
 Root cause: an edit reversed the live entry, posted a correction onto a hidden

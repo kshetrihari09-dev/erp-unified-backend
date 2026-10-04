@@ -574,4 +574,160 @@ maybeDescribe('POSTED Receipt/Payment edit — everything stays in sync', () => 
     })).rejects.toMatchObject({ status: 404 })
     expect(Number((await dbVoucher(id)).total_amount)).toBe(5000)
   })
+
+  // ════════════════════ DELETE (= reverse) a POSTED voucher ═══════════════════
+  describe('DELETE /accounting/{receipts,payments}/:id — reverses the voucher', () => {
+    const del = (kind, id, { reason = 'entered by mistake', stepUp = true, action = 'voucherDelete' } = {}) => {
+      const r = request(app).delete(`/accounting/${kind}/${id}`).set('Authorization', `Bearer ${token}`)
+      if (stepUp) r.set('X-Step-Up-Token', signStepUpToken({ userId, companyId, action }))
+      return r.send(reason === null ? {} : { reason })   // null = send NO reason at all
+    }
+    const books = async () => ({
+      cash: await cashBankNet(CASH, '2026-12-31'),
+      bank: await cashBankNet(BANK, '2026-12-31'),
+      ar:   await cashBankNet(AR,   '2026-12-31'),
+      ap:   await cashBankNet(AP,   '2026-12-31'),
+    })
+    const netRows = (ledger, ...ids) => ledger.rows.filter(r => ids.includes(r.voucher_id))
+      .reduce((n, r) => n + Number(r.debit) - Number(r.credit), 0)
+
+    test('receipt: voucher is reversed, books + party return to where they were, history is kept', async () => {
+      const b0 = await books(); const bal0 = (await partyBalance(ABC)).balance
+      const id = await createReceipt({ amount: 5000, account: CASH })
+      const no = (await dbVoucher(id)).voucher_no
+      expect((await partyBalance(ABC)).balance).toBe(bal0 - 5000)
+
+      const res = await del('receipts', id)
+      expect(res.status).toBe(200)
+      // response: standard detail shape, voucher now REVERSED, plus the reversal
+      expect(res.body.data.voucher.status).toBe('REVERSED')
+      expect(res.body.data.voucher.voucher_no).toBe(no)             // same number, nothing new burned
+      expect(res.body.data.reversal_voucher.voucher_no).toMatch(/^REV-/)
+      expect(Number(res.body.data.reversal_journal_entry.total_credit)).toBe(5000)
+
+      expect((await dbVoucher(id)).status).toBe('REVERSED')
+      expect(await books()).toEqual(b0)                              // cash / AR exactly as before
+      expect((await partyBalance(ABC)).balance).toBe(bal0)           // party balance restored
+      expect((await partyLedgerRows(ABC)).filter(r => r.reference === no)).toHaveLength(0)
+      // account ledger: original row + reversal row net to zero (full audit view)
+      const rev = await db('vouchers').where({ reversal_of: id }).first()
+      expect(netRows(await accountLedger(CASH), id, rev.id)).toBe(0)
+      // receipts list: still ONE row for it, now flagged REVERSED (not a duplicate, not POSTED)
+      const list = (await get('/accounting/receipts')).data.filter(v => v.id === id)
+      expect(list).toHaveLength(1)
+      expect(list[0].status).toBe('REVERSED')
+      // audit trail: exactly one DELETE_VOUCHER row with the reason
+      const audit = await db('audit_log').where({ entity_id: id, action: 'DELETE_VOUCHER' })
+      expect(audit).toHaveLength(1)
+      expect(audit[0].payload_after.reason).toMatch(/entered by mistake/)
+      expect(Number(audit[0].payload_before.total_amount)).toBe(5000)
+      await expectJournalBalanced()
+      expect((await verifyJournalChain(db, companyId)).valid).toBe(true)
+    })
+
+    test('voucher EDITED several times, then deleted: the LIVE entry is reversed — nothing left on Cash or Bank', async () => {
+      const b0 = await books(); const bal0 = (await partyBalance(ABC)).balance
+      const id = await createReceipt({ amount: 5000, account: CASH })
+      await editReceipt(id, { amount: 7000, account: BANK })
+      await editReceipt(id, { amount: 9000, account: CASH })
+      await editReceipt(id, { amount: 12000, account: BANK, date: '2026-10-02' })
+      const live = (await dbVoucher(id)).metadata.ledger_correction.active_entry_voucher_id
+
+      const res = await del('receipts', id)
+      expect(res.status).toBe(200)
+      expect(await books()).toEqual(b0)                              // not 5,000 / 12,000 left behind
+      expect((await partyBalance(ABC)).balance).toBe(bal0)
+      // the reversal cancelled the active anchor's 12,000 Bank entry, not the original 5,000 Cash one
+      const rev = await db('vouchers').where({ reversal_of: id }).where('voucher_no', 'like', 'REV-%').first()
+      expect(Number(rev.total_amount)).toBe(12000)
+      expect((await db('journal_entries').where({ id: res.body.data.reversal_journal_entry.id }).first()).reversed_entry_id)
+        .toBe((await db('journal_entries').where({ voucher_id: live }).first()).id)
+      expect(netRows(await accountLedger(BANK), id, rev.id)).toBe(0)
+      expect(rowsFor(await accountLedger(CASH), id)).toHaveLength(0)
+      expect((await db('vouchers').where({ id: live }).first()).status).toBe('REVERSED')  // anchor neutralised too
+      await expectJournalBalanced()
+      expect((await verifyJournalChain(db, companyId)).valid).toBe(true)
+    })
+
+    test('payment: same behaviour', async () => {
+      const b0 = await books(); const bal0 = (await partyBalance(SUP)).balance
+      const id = await createPayment({ amount: 3000, account: BANK })
+      const res = await del('payments', id)
+      expect(res.status).toBe(200)
+      expect(res.body.data.voucher.status).toBe('REVERSED')
+      expect(await books()).toEqual(b0)
+      expect((await partyBalance(SUP)).balance).toBe(bal0)
+      expect((await db('audit_log').where({ entity_id: id, action: 'DELETE_VOUCHER' }))).toHaveLength(1)
+    })
+
+    test('security: needs password step-up FOR DELETE, permission, a reason, the right type and the right company', async () => {
+      const id = await createReceipt({ amount: 5000 })
+      const pid = await createPayment({ amount: 100 })
+      const untouched = async () => expect((await dbVoucher(id)).status).toBe('POSTED')
+
+      const none = await del('receipts', id, { stepUp: false })
+      expect(none.status).toBe(400); expect(none.body.code).toBe('STEP_UP_REQUIRED'); await untouched()
+      // a token for EDITING must not authorise DELETING (strict, action-scoped)
+      const edTok = await del('receipts', id, { action: 'voucherEdit' })
+      expect(edTok.status).toBe(400); expect(edTok.body.code).toBe('STEP_UP_REQUIRED'); await untouched()
+      // missing reason
+      expect((await del('receipts', id, { reason: null })).status).toBe(400)
+      expect((await del('receipts', id, { reason: '   ' })).status).toBe(400); await untouched()
+      // receipt via payment route (and vice versa)
+      expect((await del('payments', id)).status).toBe(400); await untouched()
+      expect((await del('receipts', pid)).status).toBe(400)
+      expect((await dbVoucher(pid)).status).toBe('POSTED')
+      // no permission → 403 even with a valid token
+      await db('users').where({ id: userId }).update({ can_reverse_entries: false })
+      expect((await del('receipts', id)).status).toBe(403)
+      await db('users').where({ id: userId }).update({ can_reverse_entries: true }); await untouched()
+      // unknown id → 404 ; another company's voucher is "not found" for this company
+      expect((await del('receipts', '00000000-0000-4000-8000-000000000000')).status).toBe(404)
+      const VoucherDeleteService = require('../src/services/voucherDeleteService')
+      await expect(VoucherDeleteService.remove({ voucherId: id, companyId: otherCompanyId, userId, reason: 'x' }))
+        .rejects.toMatchObject({ status: 404 })
+      await untouched()
+    })
+
+    test('already-deleted voucher: second delete → 409, edit → 400, no extra reversal', async () => {
+      const id = await createReceipt({ amount: 5000 })
+      expect((await del('receipts', id)).status).toBe(200)
+      const n = await journalCount()
+      expect((await del('receipts', id)).status).toBe(409)
+      expect((await editReceipt(id, { amount: 6000 })).status).toBe(400)
+      expect(await journalCount()).toBe(n)
+    })
+
+    test('atomic: if the audit write fails, NOTHING is reversed; retry then succeeds', async () => {
+      const b0 = await books(); const bal0 = (await partyBalance(ABC)).balance
+      const id = await createReceipt({ amount: 5000 })
+      const before = { journal: await journalCount(), vouchers: Number((await db('vouchers').where({ company_id: companyId }).count('id as c'))[0].c), books: await books() }
+
+      jest.spyOn(AuditLogger, 'logStrict').mockRejectedValueOnce(new Error('boom: audit insert failed'))
+      const res = await del('receipts', id)
+      expect(res.status).toBeGreaterThanOrEqual(400)
+      expect((await dbVoucher(id)).status).toBe('POSTED')            // not left REVERSED
+      expect(await journalCount()).toBe(before.journal)              // no reversal entry
+      expect(Number((await db('vouchers').where({ company_id: companyId }).count('id as c'))[0].c)).toBe(before.vouchers)
+      expect(await books()).toEqual(before.books)
+      expect(rowsFor(await accountLedger(CASH), id).map(r => Number(r.debit))).toEqual([5000])
+
+      jest.restoreAllMocks(); jest.spyOn(console, 'error').mockImplementation(() => {})
+      expect((await del('receipts', id)).status).toBe(200)           // not bricked
+      expect(await books()).toEqual(b0)
+      expect((await partyBalance(ABC)).balance).toBe(bal0)
+    })
+
+    test('concurrent deletes (double-click): exactly one succeeds, one reversal entry', async () => {
+      const id = await createReceipt({ amount: 5000 })
+      const results = await Promise.all([del('receipts', id), del('receipts', id), del('receipts', id)])
+      const codes = results.map(r => r.status).sort()
+      expect(codes.filter(c => c === 200)).toHaveLength(1)
+      expect(codes.filter(c => c !== 200).every(c => c === 409 || c === 400)).toBe(true)
+      const orig = await db('journal_entries').where({ voucher_id: id }).first()
+      expect(await db('journal_entries').where({ reversed_entry_id: orig.id })).toHaveLength(1)
+      expect((await db('audit_log').where({ entity_id: id, action: 'DELETE_VOUCHER' }))).toHaveLength(1)
+      await expectJournalBalanced()
+    })
+  })
 })

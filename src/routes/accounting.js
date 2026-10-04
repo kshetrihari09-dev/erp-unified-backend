@@ -14,6 +14,7 @@ const { authenticate, requireRole, requirePermission, requireSensitiveConfirm, r
 const { AppError } = require('../engines/postingEngine')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { currentEntryVoucherIdSql } = require('../services/currentEntry')
+const VoucherDeleteService = require('../services/voucherDeleteService')
 
 router.use(authenticate)
 
@@ -508,6 +509,28 @@ function voucherTypeRouter(voucherType) {
         return ok(res, result, `${voucherType === 'RECEIPT' ? 'Receipt' : 'Payment'} updated — journal entries recalculated`)
       } catch (err) { next(err) }
     },
+
+    // "Delete" a POSTED receipt/payment = reverse it. Never a physical delete
+    // (the journal is append-only): the voucher is marked REVERSED, a REV-…
+    // reversal entry cancels its CURRENT accounting effect, and a
+    // DELETE_VOUCHER audit row records who/why — one transaction
+    // (VoucherDeleteService). Gated by edit-level permission + a
+    // delete-specific password confirmation (requireStepUp('voucherDelete')).
+    remove: async (req, res, next) => {
+      try {
+        const reason = req.body?.reason ?? req.query?.reason
+        const result = await VoucherDeleteService.remove({
+          voucherId: req.params.id, companyId: req.companyId, userId: req.user.id,
+          reason, expectedType: voucherType,
+        }, req.ip)
+
+        // Same credit-risk trigger the generic reverse route fires.
+        if (result.party_id) {
+          require('../services/creditRiskRecalc').recalcCustomerAsync(req.companyId, result.party_id, { trigger: 'voucher_reversed', userId: req.user.id })
+        }
+        return ok(res, result, `${voucherType === 'RECEIPT' ? 'Receipt' : 'Payment'} deleted — accounting entries reversed`)
+      } catch (err) { next(err) }
+    },
   }
 }
 
@@ -517,10 +540,12 @@ const paymentHandler = voucherTypeRouter('PAYMENT')
 router.get('/receipts',  receiptHandler.list)
 router.post('/receipts', requirePermission('post_vouchers'), receiptHandler.create)
 router.put('/receipts/:id/edit', requirePermission('edit_posted_vouchers'), requireStepUp('voucherEdit'), receiptHandler.edit)
+router.delete('/receipts/:id', requirePermission('delete_posted_vouchers'), requireStepUp('voucherDelete'), receiptHandler.remove)
 
 router.get('/payments',  paymentHandler.list)
 router.post('/payments', requirePermission('post_vouchers'), paymentHandler.create)
 router.put('/payments/:id/edit', requirePermission('edit_posted_vouchers'), requireStepUp('voucherEdit'), paymentHandler.edit)
+router.delete('/payments/:id', requirePermission('delete_posted_vouchers'), requireStepUp('voucherDelete'), paymentHandler.remove)
 
 
 // ═══════════════════════════════════════════════════════════════════════════

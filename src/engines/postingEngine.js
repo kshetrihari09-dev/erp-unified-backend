@@ -236,71 +236,94 @@ class PostingEngine {
     if (!voucher)                       throw new AppError('Voucher not found', 404)
     if (voucher.status !== 'POSTED')    throw new AppError('Only POSTED vouchers can be reversed', 400)
 
-    const companyId     = voucher.company_id
+    return db.transaction(async trx => {
+      await db.setRLSContext(trx, voucher.company_id)
+      return PostingEngine.reverseInTransaction(trx, {
+        voucherId, companyId: voucher.company_id, userId, reason, ipAddress,
+      })
+    })
+  }
+
+  /**
+   * The body of reverse(), run INSIDE a caller-supplied transaction so a
+   * caller (e.g. voucher delete) can make the reversal, extra bookkeeping
+   * and its own audit row one atomic unit.
+   *
+   * `companyId` is enforced: a voucher that belongs to another company is
+   * reported as "not found" — callers pass the authenticated company.
+   * `auditAction` / `auditExtra` let the caller label the audit row (default
+   * REVERSE_VOUCHER). With `strictAudit: true` the audit insert must succeed or
+   * the whole reversal rolls back (used by voucher delete); the default keeps
+   * the original best-effort AuditLogger.log() behaviour of reverse().
+   * Caller must already have set the RLS context on `trx`.
+   */
+  static async reverseInTransaction(trx, { voucherId, companyId, userId, reason, ipAddress = null, auditAction = 'REVERSE_VOUCHER', auditExtra = {}, strictAudit = false }) {
     const idempotencyKey = `reverse:${voucherId}`
 
-    return db.transaction(async trx => {
-      await db.setRLSContext(trx, companyId)
+    // Serialise against concurrent edits/reversals of the same voucher and
+    // re-read it under the lock (its active anchor may have just changed).
+    const locked = await trx('vouchers').where({ id: voucherId, company_id: companyId }).forUpdate().first()
+    if (!locked) throw new AppError('Voucher not found', 404)
+    if (locked.status !== 'POSTED') throw new AppError('Only POSTED vouchers can be reversed', 400)
 
-      // Serialise against concurrent edits/reversals of the same voucher and
-      // re-read it under the lock (its active anchor may have just changed).
-      const locked = await trx('vouchers').where({ id: voucherId }).forUpdate().first()
-      if (!locked || locked.status !== 'POSTED') throw new AppError('Only POSTED vouchers can be reversed', 400)
+    // Idempotency check for reversal
+    const existing = await trx('processing_log')
+      .where({ company_id: companyId, idempotency_key: idempotencyKey }).first()
+    if (existing?.status === 'COMPLETED') {
+      throw new AppError('This voucher has already been reversed', 409)
+    }
 
-      // Idempotency check for reversal
-      const existing = await trx('processing_log')
-        .where({ company_id: companyId, idempotency_key: idempotencyKey }).first()
-      if (existing?.status === 'COMPLETED') {
-        throw new AppError('This voucher has already been reversed', 409)
-      }
+    // Advisory lock
+    const lockId = await trx.raw(`SELECT ('x' || substr(md5(?), 1, 16))::bit(64)::bigint AS lock_id`, [`rev-${voucherId}`])
+    await trx.raw(`SELECT pg_advisory_xact_lock(?)`, [lockId.rows[0].lock_id])
 
-      // Advisory lock
-      const lockId = await trx.raw(`SELECT ('x' || substr(md5(?), 1, 16))::bit(64)::bigint AS lock_id`, [`rev-${voucherId}`])
-      await trx.raw(`SELECT pg_advisory_xact_lock(?)`, [lockId.rows[0].lock_id])
+    // Period lock check for reversal date (today)
+    const reversalDate = todayDateOnly()
+    const periodLocked = await trx.raw(`SELECT is_period_locked(?, ?::date) AS locked`, [companyId, reversalDate])
+    if (periodLocked.rows[0].locked) {
+      throw new AppError('Cannot reverse — current period is locked. Contact your accountant.', 400)
+    }
 
-      // Period lock check for reversal date (today)
-      const reversalDate = todayDateOnly()
-      const periodLocked = await trx.raw(`SELECT is_period_locked(?, ?::date) AS locked`, [companyId, reversalDate])
-      if (periodLocked.rows[0].locked) {
-        throw new AppError('Cannot reverse — current period is locked. Contact your accountant.', 400)
-      }
+    await trx('processing_log').insert({
+      company_id: companyId, idempotency_key: idempotencyKey, status: 'PROCESSING',
+    }).onConflict(['company_id', 'idempotency_key']).merge({ status: 'PROCESSING' })
 
-      await trx('processing_log').insert({
-        company_id: companyId, idempotency_key: idempotencyKey, status: 'PROCESSING',
-      }).onConflict(['company_id', 'idempotency_key']).merge({ status: 'PROCESSING' })
-
-      try {
-        const entryVoucherId = activeEntryVoucherId(locked)
-        const { reversalVoucher, reversalJE } = await PostingEngine._reverseEntry(trx, {
-          companyId, userId, reason, ipAddress,
-          visibleVoucher: locked, entryVoucherId, reversalDate,
-          reversalNo: null,          // normal REV-… number — this IS a user-visible reversal
-          internal: false,
-          markReversed: true,        // visible voucher (and its anchor, if any) become REVERSED
-        })
-
-        await trx('processing_log')
-          .where({ company_id: companyId, idempotency_key: idempotencyKey })
-          .update({ status: 'COMPLETED', result_id: reversalJE.id, completed_at: new Date() })
-
-        await AuditLogger.log(trx, {
-          companyId, userId, action: 'REVERSE_VOUCHER',
-          entityType: 'voucher', entityId: voucherId,
-          voucherNo: locked.voucher_no,
-          payloadBefore: { status: 'POSTED' },
-          payloadAfter:  { status: 'REVERSED', reversal_voucher_no: reversalVoucher.voucher_no, reason },
-          ipAddress,
-        })
-
-        return { reversal_voucher: reversalVoucher, reversal_journal_entry: reversalJE }
-
-      } catch (err) {
-        await trx('processing_log')
-          .where({ company_id: companyId, idempotency_key: idempotencyKey })
-          .update({ status: 'FAILED', error_message: err.message, completed_at: new Date() })
-        throw err
-      }
+    const entryVoucherId = activeEntryVoucherId(locked)
+    const { reversalVoucher, reversalJE } = await PostingEngine._reverseEntry(trx, {
+      companyId, userId, reason, ipAddress,
+      visibleVoucher: locked, entryVoucherId, reversalDate,
+      reversalNo: null,          // normal REV-… number — this IS a user-visible reversal
+      internal: false,
+      markReversed: true,        // visible voucher (and its anchor, if any) become REVERSED
     })
+
+    await trx('processing_log')
+      .where({ company_id: companyId, idempotency_key: idempotencyKey })
+      .update({ status: 'COMPLETED', result_id: reversalJE.id, completed_at: new Date() })
+
+    const writeAudit = strictAudit ? AuditLogger.logStrict : AuditLogger.log
+    await writeAudit.call(AuditLogger, trx, {
+      companyId, userId, action: auditAction,
+      entityType: 'voucher', entityId: voucherId,
+      voucherNo: locked.voucher_no,
+      payloadBefore: {
+        status: 'POSTED', voucher_date: locked.voucher_date, party_id: locked.party_id,
+        total_amount: locked.total_amount, narration: locked.narration,
+        ...(auditExtra.before || {}),
+      },
+      payloadAfter: {
+        status: 'REVERSED', reversal_voucher_no: reversalVoucher.voucher_no, reason,
+        reversed_entry_voucher_id: entryVoucherId,
+        ...(auditExtra.after || {}),
+      },
+      ipAddress,
+    })
+
+    return {
+      voucher: { ...locked, status: 'REVERSED' },
+      reversal_voucher: reversalVoucher,
+      reversal_journal_entry: reversalJE,
+    }
   }
 
   /**
