@@ -124,17 +124,7 @@ router.get('/:id', async (req, res, next) => {
 })
 
 /* ── POST /sales ───────────────────────────────────────────────────────────── */
-/**
- * Named (not inline) specifically so it can be invoked directly — not
- * just mounted as a route — by the Customer Ordering module's order-
- * confirmation endpoint (routes/adminCustomerOrders.js). That endpoint
- * builds a synthetic req/res and calls this function exactly as if the
- * request had come in over HTTP, so a confirmed customer order becomes a
- * real Sale through this exact same code path — same idempotency check,
- * same batched atomic stock deduction, same accounting posting — rather
- * than a second, competing implementation of "create a sale" existing
- * anywhere else in the codebase. See that file for how it's called.
- */
+/** POST /sales handler (named so it can also be exported for reuse/tests). */
 async function createSaleHandler(req, res, next) {
   const trx = await db.transaction()
   try {

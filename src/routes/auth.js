@@ -27,7 +27,6 @@ const smsService      = require('../services/smsService')
 const whatsappService = require('../services/whatsappService')
 const emailService    = require('../services/emailService')
 const { resolveActiveCompanyId } = require('../services/companyContext')
-const { generateStorefrontCode } = require('../utils/storefrontCode')
 const { signStepUpToken, STEP_UP_TTL_SECONDS } = require('../utils/stepUp')
 const { verifyStepUpCredential } = require('../utils/pinAuth')
 const { issueRefreshToken, rotateRefreshToken, revokeToken, revokeAllForUser } = require('../utils/refreshTokens')
@@ -342,7 +341,6 @@ router.post('/register', async (req, res, next) => {
 
       await db.transaction(async (trx) => {
         const companyId = uuid()
-        const storefrontCode = await generateStorefrontCode(trx, company_name.trim())
         await trx('companies').insert({
           id:              companyId,
           name:            company_name.trim(),
@@ -354,7 +352,6 @@ router.post('/register', async (req, res, next) => {
           invoice_prefix:  (invoice_prefix || 'INV').toUpperCase().slice(0, 6),
           currency:        currency || 'NPR',
           vat_percent:     13,
-          storefront_code: storefrontCode,
         })
 
         const seededAccountIds = await seedDefaultAccounts(trx, companyId)
@@ -453,7 +450,6 @@ router.post('/register', async (req, res, next) => {
 
     await db.transaction(async (trx) => {
       const companyId = uuid()
-      const storefrontCode = await generateStorefrontCode(trx, company_name.trim())
       await trx('companies').insert({
         id:              companyId,
         name:            company_name.trim(),
@@ -465,7 +461,6 @@ router.post('/register', async (req, res, next) => {
         invoice_prefix:  (invoice_prefix || 'INV').toUpperCase().slice(0, 6),
         currency:        currency || 'NPR',
         vat_percent:     13,
-        storefront_code: storefrontCode,
       })
 
       const seededAccountIds = await seedDefaultAccounts(trx, companyId)

@@ -13,7 +13,6 @@ const { validateRole, canAssignRole } = require('../utils/roles')
 const { revokeAllForUser } = require('../utils/refreshTokens')
 const { withDefaults, mergeSettings } = require('../utils/settingsDefaults')
 const backupService = require('../services/backupService')
-const { normalizeStorefrontCode, isValidStorefrontCode } = require('../utils/storefrontCode')
 
 router.use(authenticate)
 
@@ -32,24 +31,10 @@ router.put('/company', requireRole('admin', 'manager'), requireSensitiveConfirm(
     const updates = {}
     for (const k of allowed) { if (req.body[k] !== undefined) updates[k] = req.body[k] }
 
-    // storefront_code (migration 036) — the slug customers use instead of
-    // a UUID (spec §3/§4). Handled separately from `allowed` above so it
-    // gets its own validation, not a blind pass-through.
-    if (req.body.storefront_code !== undefined) {
-      const code = normalizeStorefrontCode(req.body.storefront_code)
-      if (!isValidStorefrontCode(code)) {
-        return res.status(400).json({ success: false, message: 'Storefront code must be 2-80 characters, lowercase letters/numbers/hyphens only.' })
-      }
-      updates.storefront_code = code
-    }
-
     const [updated] = await db('companies').where({ id: req.companyId }).update({ ...updates, updated_at: new Date() }).returning('*')
     await auditLog(req.companyId, req.user.id, 'UPDATE', 'company', req.companyId, updates, req.ip)
     return successResponse(res, updated)
   } catch (err) {
-    if (err?.code === '23505' && err?.constraint?.includes('storefront_code')) {
-      return res.status(400).json({ success: false, message: 'That storefront code is already taken. Please choose another.' })
-    }
     next(err)
   }
 })

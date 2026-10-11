@@ -18,14 +18,8 @@ async function authenticate(req, res, next) {
     const token   = auth.slice(7)
     const payload = jwt.verify(token, process.env.JWT_SECRET)
 
-    // Defense in depth: a customer-store JWT (see middleware/customerAuth.js)
-    // is signed with the same secret but carries `kind: 'customer'` and a
-    // customerAccountId instead of a userId. Nothing below this line would
-    // resolve a customer token to a real `users` row anyway (payload.userId
-    // wouldn't match one), but rejecting explicitly here — rather than
-    // relying on that lookup happening to fail — means a future change to
-    // either token shape can't accidentally let one type authenticate as
-    // the other.
+    // Defense in depth: tokens issued by the removed online-store login
+    // (they carry `kind: 'customer'`) must never authenticate as staff.
     if (payload.kind === 'customer') {
       return res.status(401).json({ success: false, code: 'WRONG_TOKEN_TYPE', message: 'Invalid token for this endpoint.' })
     }

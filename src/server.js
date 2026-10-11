@@ -66,15 +66,7 @@ const creditRiskRouter    = require('./routes/creditRisk')
 const approvalsRouter     = require('./routes/approvals')
 const notificationsRouter = require('./routes/notifications')
 const remindersRouter     = require('./routes/reminders')
-const storefrontRouter     = require('./routes/storefront')
-const customerAuthRouter  = require('./routes/customerAuth')
-const customerProductsRouter = require('./routes/customerProducts')
-const customerCartRouter     = require('./routes/customerCart')
-const customerOrdersRouter   = require('./routes/customerOrders')
-const adminCustomerOrdersRouter = require('./routes/adminCustomerOrders')
-const deliveryPartnerRouter     = require('./routes/deliveryPartner')
 const purchaseScansRouter       = require('./routes/purchaseScans')
-const adminCustomerRegistrationsRouter = require('./routes/adminCustomerRegistrations')
 const scannerRouter    = require('./scanner/scannerRoutes')
 
 // New: Cloud Storage integration (additive only — does not touch any
@@ -278,20 +270,10 @@ app.use(`${API}/credit-risk`,    creditRiskRouter)
 app.use(`${API}/approvals`,      approvalsRouter)
 app.use(`${API}/notifications`,  notificationsRouter)
 app.use(`${API}/reminders`,      remindersRouter)
-app.use(`${API}/storefront`,     storefrontRouter)
-app.use(`${API}/customer-auth`,  customerAuthRouter)
-app.use(`${API}/customer-products`, customerProductsRouter)
-app.use(`${API}/customer-cart`,      customerCartRouter)
-app.use(`${API}/customer-orders`,    customerOrdersRouter)
-app.use(`${API}/admin/customer-orders`, adminCustomerOrdersRouter)
-// Delivery partner app (migration 038). Staff-authenticated, but every
-// route inside is scoped to the caller's own assigned orders.
-app.use(`${API}/delivery`,            deliveryPartnerRouter)
 // Scan Purchase Bill / Invoice OCR (migration 039). Purchases themselves
 // still go exclusively through app.use(`${API}/purchases`, ...) below —
 // this router only turns an uploaded bill into a reviewable draft.
 app.use(`${API}/purchase-scans`,      ocrLimiter, purchaseScansRouter)
-app.use(`${API}/admin/customer-registrations`, adminCustomerRegistrationsRouter)
 app.use(`${API}/stock`,      stockRouter)
 app.use(`${API}/returns`,    returnsRouter)
 app.use(`${API}/settings`,   settingsRouter)
@@ -338,6 +320,24 @@ app.get(`${API}/date/bs-to-ad`, (req, res) => {
   const ad = bsToAD(Number(year), Number(month), Number(day))
   if (!ad) return res.status(400).json({ success: false, message: 'Invalid BS date' })
   res.json({ success: true, data: { bs: `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`, ad } })
+})
+
+// ── 10b. Removed online-shopping endpoints → 410 Gone ─────────────────────────
+// The online storefront / customer ordering / delivery-partner modules were
+// removed. Answer 410 (not a generic 404) so stale clients (old PWA caches,
+// old Android builds) get an unambiguous "this is gone for good" signal.
+// No handler behind these paths touches the database or checks any token.
+const REMOVED_PREFIXES = [
+  'storefront', 'customer-auth', 'customer-products', 'customer-cart',
+  'customer-orders', 'admin/customer-orders', 'admin/customer-registrations',
+  'delivery',
+]
+app.use(API, (req, res, next) => {
+  const p = req.path.replace(/^\/+/, '')
+  if (REMOVED_PREFIXES.some(x => p === x || p.startsWith(x + '/'))) {
+    return res.status(410).json({ success: false, code: 'FEATURE_REMOVED', message: 'This feature has been removed.' })
+  }
+  next()
 })
 
 // ── 11. 404 handler ───────────────────────────────────────────────────────────

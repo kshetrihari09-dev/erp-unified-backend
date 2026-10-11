@@ -5,19 +5,15 @@
  * IMPORTANT: this list must exactly match the Postgres enum on
  * users.role (see migrations/001_foundation.js:
  *   t.enum('role', ['owner','admin','accountant','cashier','auditor','viewer'])
- * ), as widened by migrations/038_delivery_otp.js to add
- * 'delivery_partner'.
- *
- * 'delivery_partner' is an ordinary assignable role: riders are created
- * through the existing Settings -> Users screen like any other staff
- * member. It carries no accounting or user-management capability
- * anywhere; what it grants is access to routes/deliveryPartner.js, and
- * even there only to orders assigned to that specific rider. There is no 'manager' role in this codebase's data model — some
+ * ). Migration 038 additionally widened the DB CHECK constraint to allow
+ * 'delivery_partner' (the removed rider app); that value is no longer
+ * assignable here, and migration 040 DEACTIVATES any existing rider
+ * accounts (never demotes them — 'viewer' would grant back-office read access). There is no 'manager' role in this codebase's data model — some
  * routes pass requireRole('admin','manager') defensively, which is
  * harmless (manager can never actually be assigned) but should not be
  * read as evidence that 'manager' is a real, assignable role.
  */
-const USER_ROLES = ['owner', 'admin', 'accountant', 'cashier', 'auditor', 'viewer', 'delivery_partner']
+const USER_ROLES = ['owner', 'admin', 'accountant', 'cashier', 'auditor', 'viewer']
 
 // Every role except 'owner' — 'owner' is a protected system role that
 // cannot be granted through normal user-management endpoints (see
