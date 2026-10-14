@@ -193,6 +193,14 @@ function toCSV(rep) {
   return '\uFEFF' + L.join('\r\n') + '\r\n'
 }
 
+let _partyCols
+async function hasPartyCols() {   // migration 042 may not be applied yet
+  if (_partyCols === undefined) {
+    try { _partyCols = await db.schema.hasColumn('stock_register_entries', 'party_id') } catch { _partyCols = false }
+  }
+  return _partyCols
+}
+
 let _hasEntries
 /**
  * Append one stock line to stock_register_entries INSIDE the caller's transaction.
@@ -206,6 +214,7 @@ async function recordEntry(trx, e) {
   if (!_hasEntries) return
   await trx('stock_register_entries').insert({
     company_id: e.companyId, product_id: e.productId, batch_id: e.batchId || null,
+    ...(await hasPartyCols() ? { party_id: e.partyId || null } : {}),
     entry_type: e.type, entry_date: e.date, ref_no: e.refNo || null,
     particular: e.particular || null, narration: e.narration || null,
     batch_no: e.batchNo || null, expiry: e.expiry || null, expiry_date: e.expiryDate || null,
@@ -214,4 +223,11 @@ async function recordEntry(trx, e) {
   }).onConflict(['company_id', 'source_key']).ignore()
 }
 
-module.exports = { getRegister, buildRegister, toCSV, recordEntry, STORES }
+/** After the accounting voucher exists, link the return's register lines to it. */
+async function linkEntriesToVoucher(trx, companyId, keyPrefix, voucherId) {
+  if (!voucherId || !(await hasPartyCols())) return
+  await trx('stock_register_entries').where({ company_id: companyId })
+    .where('source_key', 'like', `${keyPrefix}%`).update({ voucher_id: voucherId })
+}
+
+module.exports = { getRegister, buildRegister, toCSV, recordEntry, linkEntriesToVoucher, STORES }

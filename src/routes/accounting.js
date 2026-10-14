@@ -370,7 +370,7 @@ function voucherTypeRouter(voucherType) {
 
         const [{ count }] = await q.clone().clearSelect().clearOrder().count('v.id as count')
 
-        const data = await q.orderBy('v.voucher_date', 'asc').orderBy('v.created_at', 'asc').limit(limit).offset(offset)
+        const data = await q.orderBy('v.voucher_date', 'desc').orderBy('v.created_at', 'desc').limit(limit).offset(offset)
         return paginatedResponse(res, { data, total: Number(count), page, limit })
       } catch (err) { next(err) }
     },

@@ -58,6 +58,7 @@ const purchasesRouter  = require('./routes/purchases')
 const accountingRouter = require('./routes/accounting')
 const reportsRouter    = require('./routes/reports')
 const stockRegisterRouter = require('./routes/stockRegister')
+const companyCustomerRouter = require('./routes/companyCustomerReport')
 const settingsRouter   = require('./routes/settings')
 const stockRouter      = require('./routes/stock')
 const returnsRouter    = require('./routes/returns')
@@ -282,6 +283,9 @@ app.use(`${API}/settings`,   settingsRouter)
 
 // Accounting Engine (UNCHANGED)
 app.use(`${API}/accounting`, accountingRouter)
+
+// Company vs Customer report (mounted before the generic /reports router)
+app.use(`${API}/reports/company-vs-customer`, reportsLimiter, companyCustomerRouter)
 
 // Reports — dedicated (tighter) rate limit for heavy aggregate queries
 app.use(`${API}/reports`,    reportsLimiter, reportsRouter)

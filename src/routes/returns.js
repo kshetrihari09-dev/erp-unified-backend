@@ -12,7 +12,7 @@
  *   - GET /returns now includes voucher and journal_entry data in response
  *   - Added GET /returns/:id to fetch a single return with full accounting detail
  */
-const { recordEntry } = require('../services/stockRegisterService')
+const { recordEntry, linkEntriesToVoucher } = require('../services/stockRegisterService')
 const crypto = require('crypto')
 const router = require('express').Router()
 const db     = require('../db/knex')
@@ -159,6 +159,7 @@ router.post('/sales', async (req, res, next) => {
         await recordEntry(trx, {
           companyId: req.companyId, productId: item.product_id, type: 'SRN', date,
           refNo: originalSale?.invoice_no || null, particular: 'Sales Return',
+          partyId: originalSale?.party_id || party_id || null,
           narration: narration || null, batchNo: item.batch_no || 'RETURN',
           expiry: item.expiry || null, expiryDate: parseExpiryToDate(item.expiry),
           qtyIn: qty, rate, sourceKey: `SRN:${stockRef}:${returnItems.length - 1}`,
@@ -203,6 +204,9 @@ router.post('/sales', async (req, res, next) => {
         return res.status(acctErr.status || 400).json({ success: false, message: acctErr.message })
       }
     }
+
+    // Link this return's register lines to its credit note (used by Company vs Customer report)
+    await linkEntriesToVoucher(trx, req.companyId, `SRN:${stockRef}:`, accountingResult?.voucher?.id)
 
     await trx.commit()
 
