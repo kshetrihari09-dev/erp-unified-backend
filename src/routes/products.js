@@ -17,6 +17,7 @@
  */
 
 const router = require('express').Router()
+const { recordEntry } = require('../services/stockRegisterService')
 const db     = require('../db/knex')
 const { authenticate }  = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
@@ -438,7 +439,7 @@ router.post('/:id/adjust', async (req, res, next) => {
     // Immutable ledger entry for this batch, so opening inventory has the
     // same audit trail as purchase-created stock. Linked to the new batch
     // only — existing movements for other batches are never touched.
-    await trx('inventory_movements').insert({
+    const [mv] = await trx('inventory_movements').insert({
       company_id:    req.companyId,
       product_id:    req.params.id,
       batch_id:      batch.id,
@@ -448,6 +449,15 @@ router.post('/:id/adjust', async (req, res, next) => {
       total_cost:    totalCost,
       movement_date: receiptDate,
       description:   reason || 'Stock adjustment',
+    }).returning('id')
+
+    // Stock Register line (opening stock / adjustment → stock in). Same key the
+    // migration-041 backfill uses for historic rows, so nothing is ever doubled.
+    await recordEntry(trx, {
+      companyId: req.companyId, productId: req.params.id, batchId: batch.id, type: 'ADJ',
+      date: receiptDate, particular: 'Stock Adjustment', narration: reason || 'Stock adjustment',
+      batchNo: batch_no || 'ADJ', expiry: expiry || null, expiryDate: expiry ? parseExpiryToDate(expiry) : null,
+      qtyIn: Math.abs(qtyNum), rate: costNum, sourceKey: `ADJ:${mv.id || mv}`,
     })
 
     await trx.commit()

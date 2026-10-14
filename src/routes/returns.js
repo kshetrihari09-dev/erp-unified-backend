@@ -12,6 +12,8 @@
  *   - GET /returns now includes voucher and journal_entry data in response
  *   - Added GET /returns/:id to fetch a single return with full accounting detail
  */
+const { recordEntry } = require('../services/stockRegisterService')
+const crypto = require('crypto')
 const router = require('express').Router()
 const db     = require('../db/knex')
 const { authenticate }  = require('../middleware/index')
@@ -131,6 +133,7 @@ router.post('/sales', async (req, res, next) => {
     }
 
     const returnItems = []
+    const stockRef = String(req.body.client_txn_id || crypto.randomUUID())
     for (const item of items) {
       const qty  = Number(item.qty)  || 0
       const rate = Number(item.rate) || 0
@@ -151,6 +154,14 @@ router.post('/sales', async (req, res, next) => {
           qty_remaining: qty,
           unit_cost:     rate,
           total_cost:    Math.round(qty * rate * 100) / 100,
+        })
+        // Stock Register line (sales return → stock in)
+        await recordEntry(trx, {
+          companyId: req.companyId, productId: item.product_id, type: 'SRN', date,
+          refNo: originalSale?.invoice_no || null, particular: 'Sales Return',
+          narration: narration || null, batchNo: item.batch_no || 'RETURN',
+          expiry: item.expiry || null, expiryDate: parseExpiryToDate(item.expiry),
+          qtyIn: qty, rate, sourceKey: `SRN:${stockRef}:${returnItems.length - 1}`,
         })
       }
     }
@@ -264,6 +275,7 @@ router.post('/purchase', async (req, res, next) => {
     }
 
     const returnItems = []
+    const stockRef = String(req.body.client_txn_id || crypto.randomUUID())
     for (const item of items) {
       const qty  = Number(item.qty)  || 0
       const rate = Number(item.rate) || 0
@@ -296,6 +308,14 @@ router.post('/purchase', async (req, res, next) => {
           movement_date: date,
           description:   `Purchase Return — ${originalPurchase?.bill_no || 'manual'}`,
         }).catch(() => { /* inventory_movements insert is best-effort */ })
+        // Stock Register line (purchase return → stock out)
+        await recordEntry(trx, {
+          companyId: req.companyId, productId: item.product_id, batchId: batch?.id || null, type: 'PRN', date,
+          refNo: originalPurchase?.bill_no || null, particular: 'Purchase Return',
+          narration: narration || null, batchNo: batch?.batch_no || item.batch_no || null,
+          expiry: batch?.expiry || null, expiryDate: batch?.expiry_date || null,
+          qtyOut: qty, rate, sourceKey: `PRN:${stockRef}:${returnItems.length - 1}`,
+        })
       }
     }
 
