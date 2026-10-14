@@ -8,7 +8,7 @@
  *   Discount     = Σ round(qty × rate × discount_pct / 100)   what sale_items actually granted
  *   Sales Return = returns of goods that were NOT expired when returned
  *   SR Expiry    = returns of goods already expired on the return date
- *   Net          = Sales − Discount − Sales Return − SR Expiry     (Discount skipped if discountExcluded)
+ *   Net          = Sales − Discount − Sales Return − SR Expiry
  *
  * WHY "gross": sale_items.amount is stored NET of the item discount
  * (sales.js: amount = qty×rate×(1−disc%) + cc_amount). Adding the discount back
@@ -37,7 +37,7 @@ function validate({ from, to, customerType }) {
 }
 
 /** Pure: merge per-customer aggregates into report rows + grand totals. Exported for tests. */
-function buildRows({ sales, returns, parties, discountExcluded }) {
+function buildRows({ sales, returns, parties }) {
   const keys = new Set([...sales.keys(), ...returns.keys()])
   const rows = []
   for (const k of keys) {
@@ -46,7 +46,7 @@ function buildRows({ sales, returns, parties, discountExcluded }) {
     const p = parties.get(k)
     if (k !== '_walkin' && !p) continue                       // filtered out by customer type
     const sales_ = r2(s.sales), disc = r2(s.discount), sr = r2(r.sr), sre = r2(r.sre)
-    const net = r2(sales_ - (discountExcluded ? 0 : disc) - sr - sre)
+    const net = r2(sales_ - disc - sr - sre)
     if (!sales_ && !disc && !sr && !sre) continue
     rows.push({
       customer_id: k === '_walkin' ? null : k,
@@ -71,7 +71,7 @@ async function listCompanies(companyId) {
   return r.map(x => x.company_name)
 }
 
-async function getReport(companyId, { from, to, company, customerType = 'all', discountExcluded = false }) {
+async function getReport(companyId, { from, to, company, customerType = 'all' }) {
   validate({ from, to, customerType })
   const co  = company && company !== 'all' ? String(company) : null
   const bind = { cid: companyId, from, to, co }
@@ -141,10 +141,10 @@ async function getReport(companyId, { from, to, company, customerType = 'all', d
        GROUP BY v.party_id`, bind)))
   }
 
-  const { rows, totals } = buildRows({ sales, returns, parties, discountExcluded: !!discountExcluded })
+  const { rows, totals } = buildRows({ sales, returns, parties })
   return {
     title: 'Company vs Customer',
-    filters: { from, to, company: co || 'all', customer_type: customerType, discount_excluded: !!discountExcluded },
+    filters: { from, to, company: co || 'all', customer_type: customerType },
     rows, totals,
   }
 }
@@ -157,7 +157,7 @@ function toCSV(rep) {
   const L = [
     ['Company vs Customer'],
     ['From', f.from, 'To', f.to, 'Company', f.company === 'all' ? 'All Companies' : f.company,
-     'Customer Type', TYPE_LABEL[f.customer_type], 'Discount Excluded', f.discount_excluded ? 'Yes' : 'No'],
+     'Customer Type', TYPE_LABEL[f.customer_type]],
     [],
     ['Customer Code', 'Particular', 'Sales', 'Discount', 'Sales Return', 'Sales Return Expiry', 'Net'],
     ...rep.rows.map(r => [r.customer_code, r.customer_name, m(r.sales), m(r.discount), m(r.sales_return), m(r.sales_return_expiry), m(r.net)]),

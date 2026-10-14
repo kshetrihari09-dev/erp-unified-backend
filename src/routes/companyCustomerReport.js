@@ -15,7 +15,6 @@ const parse = (q) => ({
   from: q.from, to: q.to,
   company: q.company || 'all',
   customerType: q.customer_type || 'all',
-  discountExcluded: ['1', 'true', 'yes'].includes(String(q.discount_excluded || '').toLowerCase()),
 })
 
 router.get('/companies', async (req, res, next) => {
