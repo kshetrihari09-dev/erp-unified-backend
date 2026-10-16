@@ -23,6 +23,7 @@ const { authenticate } = require('../middleware/index')
 const { parsePagination, paginatedResponse, successResponse } = require('../middleware/helpers')
 const { nextPartyCode, adToBS, auditLog } = require('../utils/helpers')
 const AuditLogger = require('../utils/auditLogger')
+const PartyBalance = require('../services/partyBalanceService')
 
 router.use(authenticate)
 
@@ -164,6 +165,17 @@ router.get('/:id/ledger', async (req, res, next) => {
 
     const { date_from, date_to } = req.query
     const isCustomer = party.type === 'customer'
+
+    // Opening balance for the selected period = the party's ORIGINAL opening balance
+    // (parties.opening_balance, never modified) + every ledger movement dated BEFORE
+    // date_from. Movements ON date_from belong to the period itself. Computed by the
+    // shared PartyBalance service so reports and this ledger always agree.
+    const initialOpening = Number(party.opening_balance) || 0
+    let openingBalance = initialOpening
+    if (date_from) {
+      const b = (await PartyBalance.getBalances(req.companyId, { from: date_from, partyId: req.params.id })).get(req.params.id)
+      if (b) openingBalance = b.opening_balance
+    }
 
     // ── Helper: apply date filter to a query builder ─────────────────────────
     const applyDates = (q) => {
@@ -375,7 +387,14 @@ router.get('/:id/ledger', async (req, res, next) => {
     // A RECEIPT voucher whose reference matches an invoice number means
     // postingEngine created it for that specific sale — skip it because
     // salesPayments already shows the same payment.
+    // Built from ALL of the party's active invoices (not just those inside the date window) so that
+    // whether a receipt voucher is a duplicate never depends on the selected period.
+    const [allSaleRefs, allPurchaseRefs] = await Promise.all([
+      isCustomer  ? db('sales').where({ company_id: req.companyId, party_id: req.params.id, status: 'active' }).pluck('invoice_no') : [],
+      !isCustomer ? db('purchases').where({ company_id: req.companyId, party_id: req.params.id, status: 'active' }).pluck('bill_no') : [],
+    ])
     const invoiceRefs = new Set([
+      ...allSaleRefs, ...allPurchaseRefs,
       ...salesInvoices.map(r => r.reference),
       ...salesPayments.map(r => r.reference),   // cash sale INV refs
       ...purchaseInvoices.map(r => r.reference),
@@ -430,7 +449,7 @@ router.get('/:id/ledger', async (req, res, next) => {
     //   Credit (+) = we owe more         (purchase bill, credit note)
     //   Debit  (−) = we paid             (payment, debit note)
     //
-    let balance = Number(party.opening_balance) || 0
+    let balance = openingBalance
     const rows = [{
       date:            null,
       date_bs:         null,
@@ -481,7 +500,8 @@ router.get('/:id/ledger', async (req, res, next) => {
       party,
       rows,
       summary: {
-        opening_balance: Number(party.opening_balance) || 0,
+        opening_balance: openingBalance,           // balance immediately before date_from
+        initial_opening_balance: initialOpening,   // as entered on the party — never changed
         total_debit:     Math.round(totalDebit  * 100) / 100,
         total_credit:    Math.round(totalCredit * 100) / 100,
         closing_balance: balance,
@@ -489,7 +509,8 @@ router.get('/:id/ledger', async (req, res, next) => {
       },
       // Legacy fields kept for frontend compat
       closingBalance:  balance,
-      opening_balance: Number(party.opening_balance) || 0,
+      opening_balance: openingBalance,
+      initial_opening_balance: initialOpening,
     })
   } catch (err) { next(err) }
 })

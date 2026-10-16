@@ -20,10 +20,18 @@
  *   1. stock_register_entries type SRN (full detail: customer, product, expiry)
  *   2. legacy CREDIT_NOTE vouchers (metadata.items) that have NO linked entry
  *
+ * LEDGER COLUMNS (from partyBalanceService — the same numbers as the party Ledger):
+ *   Opening Balance = parties.opening_balance + ledger movements dated BEFORE From   (original never changed)
+ *   Receipts        = money received from the customer in From…To (inline payments + receipt vouchers)
+ *   Closing Balance = Opening Balance + ledger movement of From…To                    (= ledger balance at To)
+ * These are PARTY-LEVEL figures: the ledger has no manufacturer dimension, so they do not change
+ * with the Company filter, and they are kept apart from Sales/Discount/Returns (nothing is added twice).
+ *
  * Each source is aggregated per customer in its own query, then merged — joins
  * between invoices, items and returns can never multiply rows.
  */
 const db = require('../db/knex')
+const { getBalances } = require('./partyBalanceService')
 
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
@@ -37,8 +45,9 @@ function validate({ from, to, customerType }) {
 }
 
 /** Pure: merge per-customer aggregates into report rows + grand totals. Exported for tests. */
-function buildRows({ sales, returns, parties }) {
+function buildRows({ sales, returns, parties, balances = new Map(), includeBalanceOnly = false }) {
   const keys = new Set([...sales.keys(), ...returns.keys()])
+  if (includeBalanceOnly) for (const [id, b] of balances) if (parties.has(id) && (b.opening_balance || b.closing_balance || b.period_movement || b.receipts)) keys.add(id)
   const rows = []
   for (const k of keys) {
     const s = sales.get(k) || { sales: 0, discount: 0 }
@@ -47,20 +56,24 @@ function buildRows({ sales, returns, parties }) {
     if (k !== '_walkin' && !p) continue                       // filtered out by customer type
     const sales_ = r2(s.sales), disc = r2(s.discount), sr = r2(r.sr), sre = r2(r.sre)
     const net = r2(sales_ - disc - sr - sre)
-    if (!sales_ && !disc && !sr && !sre) continue
+    const b = balances.get(k) || { opening_balance: 0, receipts: 0, period_movement: 0, closing_balance: 0 }
+    if (!sales_ && !disc && !sr && !sre && !b.opening_balance && !b.closing_balance && !b.receipts && !b.period_movement) continue
     rows.push({
       customer_id: k === '_walkin' ? null : k,
       customer_code: p?.code || '',
       customer_name: p?.name || 'Cash / Walk-in Customer',
       customer_type: p ? (Number(p.credit_limit) > 0 ? 'credit' : 'customer') : 'customer',
-      sales: sales_, discount: disc, sales_return: sr, sales_return_expiry: sre, net,
+      opening_balance: r2(b.opening_balance), sales: sales_, discount: disc, sales_return: sr, sales_return_expiry: sre, net,
+      receipts: r2(b.receipts), ledger_movement: r2(b.period_movement), closing_balance: r2(b.closing_balance),
     })
   }
   rows.sort((a, b) => (a.customer_name || '').localeCompare(b.customer_name || ''))
   const t = rows.reduce((a, r) => ({
+    opening_balance: a.opening_balance + r.opening_balance,
     sales: a.sales + r.sales, discount: a.discount + r.discount, sales_return: a.sales_return + r.sales_return,
     sales_return_expiry: a.sales_return_expiry + r.sales_return_expiry, net: a.net + r.net,
-  }), { sales: 0, discount: 0, sales_return: 0, sales_return_expiry: 0, net: 0 })
+    receipts: a.receipts + r.receipts, ledger_movement: a.ledger_movement + r.ledger_movement, closing_balance: a.closing_balance + r.closing_balance,
+  }), { opening_balance: 0, sales: 0, discount: 0, sales_return: 0, sales_return_expiry: 0, net: 0, receipts: 0, ledger_movement: 0, closing_balance: 0 })
   for (const k of Object.keys(t)) t[k] = r2(t[k])
   return { rows, totals: t }
 }
@@ -141,7 +154,11 @@ async function getReport(companyId, { from, to, company, customerType = 'all' })
        GROUP BY v.party_id`, bind)))
   }
 
-  const { rows, totals } = buildRows({ sales, returns, parties })
+  // ledger columns (opening / receipts / closing) for the same customers — one SQL pass, no history in memory
+  const balances = await getBalances(companyId, { from, to, partyType: 'customer' })
+  // customers with a balance but no sales/returns are listed too — except when a single company is
+  // selected, where the ledger figures (party-level) would otherwise flood a company-specific list
+  const { rows, totals } = buildRows({ sales, returns, parties, balances, includeBalanceOnly: !co })
   return {
     title: 'Company vs Customer',
     filters: { from, to, company: co || 'all', customer_type: customerType },
@@ -159,9 +176,9 @@ function toCSV(rep) {
     ['From', f.from, 'To', f.to, 'Company', f.company === 'all' ? 'All Companies' : f.company,
      'Customer Type', TYPE_LABEL[f.customer_type]],
     [],
-    ['Customer Code', 'Particular', 'Sales', 'Discount', 'Sales Return', 'Sales Return Expiry', 'Net'],
-    ...rep.rows.map(r => [r.customer_code, r.customer_name, m(r.sales), m(r.discount), m(r.sales_return), m(r.sales_return_expiry), m(r.net)]),
-    ['', 'Total', m(rep.totals.sales), m(rep.totals.discount), m(rep.totals.sales_return), m(rep.totals.sales_return_expiry), m(rep.totals.net)],
+    ['Customer Code', 'Particular', 'Opening Balance', 'Sales', 'Discount', 'Sales Return', 'Sales Return Expiry', 'Net', 'Receipts', 'Closing Balance'],
+    ...rep.rows.map(r => [r.customer_code, r.customer_name, m(r.opening_balance), m(r.sales), m(r.discount), m(r.sales_return), m(r.sales_return_expiry), m(r.net), m(r.receipts), m(r.closing_balance)]),
+    ['', 'Total', m(rep.totals.opening_balance), m(rep.totals.sales), m(rep.totals.discount), m(rep.totals.sales_return), m(rep.totals.sales_return_expiry), m(rep.totals.net), m(rep.totals.receipts), m(rep.totals.closing_balance)],
   ]
   return '\uFEFF' + L.map(r => r.map(q).join(',')).join('\r\n') + '\r\n'
 }
