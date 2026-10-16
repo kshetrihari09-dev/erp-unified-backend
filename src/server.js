@@ -170,7 +170,9 @@ app.use((req, res, next) => {
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-Step-Up-Token', 'X-Device-Id', 'X-Device-Secret', 'X-Store-Company'],
-    exposedHeaders: ['X-Request-Id', 'RateLimit-Limit', 'RateLimit-Remaining'],
+    // Retry-After / RateLimit-Reset must be exposed or browsers hide them from cross-origin
+    // (Vercel → Render) fetch/XHR, and the frontend cannot honour the server's back-off hint.
+    exposedHeaders: ['X-Request-Id', 'RateLimit-Limit', 'RateLimit-Remaining', 'RateLimit-Reset', 'Retry-After'],
   })(req, res, next)
 })
 
