@@ -29,7 +29,7 @@
 /**
  * One purchase line.
  *
- * @param {{ qty: number, rate: number, bonus?: number, cc_pct?: number }} row
+ * @param {{ qty: number, rate: number, bonus?: number, cc_pct?: number, discount_pct?: number }} row
  * @returns {{ amount: number, cc_amount: number }}
  */
 function calcRowAmount(row) {
@@ -37,14 +37,16 @@ function calcRowAmount(row) {
   const rate   = Number(row.rate   || 0)
   const bonus  = Number(row.bonus  || 0)  // bonus qty drives cc_amount
   const cc_pct = Number(row.cc_pct || 0)  // whole number, e.g. 10 = 10%
+  const discount_pct = Number(row.discount_pct || 0)
 
-  // purchase_items has no discount_pct column — purchase entry has never
-  // supported a per-line discount (see the existing F7 shortcut message
-  // in PurchasePage.tsx: "Purchase invoices don't have a discount %").
-  // So base is qty × rate, with no discount term — matching what
-  // calcRowAmount on the frontend also reduces to whenever
-  // discount_pct is 0, which is every purchase line today.
-  const base = qty * rate
+  // Per-line discount (migration 043 added purchase_items.discount_pct).
+  // Same formula as routes/sales.js and the frontend's calcRowAmount:
+  //   base = qty × rate × (1 − discount_pct/100)
+  // The discount applies to the goods value only — CC is charged on the
+  // bonus qty and is never itself discounted. With discount_pct = 0
+  // (every purchase saved before migration 043) this reduces to the old
+  // qty × rate.
+  const base = qty * rate * (1 - discount_pct / 100)
 
   // cc_amount = bonus_qty × rate × (cc_pct / 100) — CC on the BONUS
   // (free) quantity, not the purchased quantity. This is the frontend's

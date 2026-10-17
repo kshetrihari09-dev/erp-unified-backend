@@ -119,3 +119,11 @@ this environment. Everything here was checked by isolated TypeScript
 compiles (where node_modules-independent) and manual review, but you
 should run `npm install && npx tsc --noEmit` and a Gradle sync before
 relying on this in production.
+
+
+## Purchase discounts (migration 043)
+
+- `purchase_items.discount_pct` added (default 0). Run `npm run migrate`.
+- `utils/purchaseCalc.js` now applies `qty × rate × (1 − discount_pct/100) + CC` — identical to `routes/sales.js`.
+- `POST /purchases` accepts per-line `discount_pct` (clamped 0–100), stores it, and now also populates `purchases.subtotal` and `purchases.cc_amount`.
+- Test: `test/purchase-calc.test.js`.

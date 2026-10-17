@@ -127,7 +127,7 @@ router.post('/', async (req, res, next) => {
     const date    = date_ad || new Date().toISOString().split('T')[0]
     const date_bs = adToBS(date) || todayBS()
 
-    let net_total = 0
+    let net_total = 0, cc_total = 0
     const purchaseItems = items.map(item => {
       const qty   = Number(item.qty)   || 0
       const rate  = Number(item.rate)  || 0
@@ -137,8 +137,12 @@ router.post('/', async (req, res, next) => {
       // that both disagreed with the Purchase screen's live preview and
       // was fed cc_pct=0 anyway, since the old save payload never sent
       // it. See utils/purchaseCalc.js for the full history.
-      const { amount, cc_amount } = calcRowAmount({ qty, rate, bonus, cc_pct })
+      // Clamped to 0-100 so a bad client value can't produce a negative
+      // or inflated line amount.
+      const discount_pct = Math.min(100, Math.max(0, Number(item.discount_pct) || 0))
+      const { amount, cc_amount } = calcRowAmount({ qty, rate, bonus, cc_pct, discount_pct })
       net_total += amount
+      cc_total  += cc_amount
       // Only spread columns that exist in purchase_items (migration 002):
       // id, purchase_id, product_id, product_name, batch_no, expiry_date, expiry,
       // qty, bonus, rate, cc_pct, cc_amount, amount
@@ -150,6 +154,7 @@ router.post('/', async (req, res, next) => {
         qty,
         bonus,
         rate,
+        discount_pct, // migration 043 — same per-line discount Sales stores
         cc_pct,      // real column — was vat_pct (does not exist)
         cc_amount,   // real column — calculated above
         amount,
@@ -172,7 +177,12 @@ router.post('/', async (req, res, next) => {
     const [purchase] = await trx('purchases').insert({
       company_id: req.companyId, party_id: party_id || null, created_by: req.user.id,
       bill_no, supplier_bill_no: supplier_bill_no || null, date_ad: date, date_bs,
-      payment_mode: payment_mode || 'credit', net_total, round_off, paid_amount, due_amount,
+      payment_mode: payment_mode || 'credit',
+      // subtotal = sum of already-discounted line amounts (same meaning as
+      // sales.subtotal); cc_amount = total CC charge. Both columns have
+      // existed since migration 002 but were never populated for purchases.
+      subtotal: unrounded_total, cc_amount: Math.round(cc_total * 100) / 100,
+      net_total, round_off, paid_amount, due_amount,
       notes: notes || null, status: 'active',
       client_txn_id: client_txn_id || null, device_id: req.deviceId || null,
       purchase_order_id: linkedOrder?.id || null,
