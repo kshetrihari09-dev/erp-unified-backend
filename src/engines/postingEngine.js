@@ -76,7 +76,7 @@ class PostingEngine {
       const numericLockId = lockId.rows[0].lock_id
       const lockResult = await trx.raw(`SELECT pg_try_advisory_xact_lock(?) AS acquired`, [numericLockId])
       if (!lockResult.rows[0].acquired) {
-        throw new AppError('Another process is posting this voucher. Please retry.', 429)
+        throw new AppError('Another process is posting this voucher. Please retry.', 409, 'POSTING_IN_PROGRESS')
       }
 
       // ── Step 5: Mark as PROCESSING (prevents duplicate concurrent posts) ─

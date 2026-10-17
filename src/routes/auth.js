@@ -169,7 +169,7 @@ router.post('/send-otp', async (req, res, next) => {
       const resetStr = rateCheck.resetAt
         ? ` Try again after ${new Date(rateCheck.resetAt).toLocaleTimeString()}.`
         : ''
-      throw new AppError(`Too many OTP requests (max 3/hour).${resetStr}`, 429)
+      throw new AppError(`Too many OTP requests (max 3/hour).${resetStr}`, 429, 'OTP_QUOTA_EXCEEDED')
     }
 
     /* ── generate & send ─────────────────────────────────────────────────── */
@@ -669,7 +669,7 @@ router.post('/verify-password', authenticate, async (req, res, next) => {
       userId: req.user.id, companyId: req.companyId, pin, password, ip: req.ip,
     })
     if (!result.ok) {
-      return res.status(result.status).json({ success: false, message: result.message, needsPinSetup: result.needsPinSetup })
+      return res.status(result.status).json({ success: false, code: result.code, message: result.message, needsPinSetup: result.needsPinSetup })
     }
 
     // `action`, when the caller knows which specific mandatory

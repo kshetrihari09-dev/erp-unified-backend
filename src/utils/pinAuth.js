@@ -30,7 +30,7 @@ async function verifyStepUpCredential({ userId, companyId, pin, password, ip }) 
       companyId, userId, action: 'STEP_UP_LOCKED', entityType: 'auth', entityId: userId, ipAddress: ip,
     })
     return {
-      ok: false, status: 429,
+      ok: false, status: 429, code: 'PIN_LOCKED',
       message: `Too many failed attempts. Try again in ${minsLeft} minute${minsLeft === 1 ? '' : 's'}.`,
     }
   }

@@ -17,6 +17,7 @@
 'use strict'
 
 const os = require('os')
+const { loadRateLimitConfig, RateLimitConfigError } = require('./rateLimitConfig')
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -74,6 +75,20 @@ function detectLanIp() {
   return { ip: '127.0.0.1', lanDetected: false }
 }
 
+// ── Rate limiting / proxy trust (validated; see config/rateLimitConfig.js) ────
+// Fails the boot on an invalid value - a typo must never silently become
+// "limit of 1" or "unlimited".
+let rateLimit
+try {
+  rateLimit = loadRateLimitConfig(process.env, { isProd, isDev })
+} catch (err) {
+  if (err instanceof RateLimitConfigError) {
+    console.error(`[Config] FATAL: ${err.message}`)
+    process.exit(1)
+  }
+  throw err
+}
+
 // ── Config object ─────────────────────────────────────────────────────────────
 
 const config = {
@@ -129,26 +144,10 @@ const config = {
 
   security: {
     bcryptRounds:          optionalInt('BCRYPT_ROUNDS',         isDev ? 10 : 14),
-    rateLimitWindowMs:     optionalInt('RATE_LIMIT_WINDOW_MS',  15 * 60 * 1000),
-    rateLimitMax:          optionalInt('RATE_LIMIT_MAX',         isDev ? 500 : 100),
-    authRateLimitMax:      optionalInt('AUTH_RATE_LIMIT_MAX',    isDev ?  50 :  10),
-    scannerRateLimitMax:   optionalInt('SCANNER_RATE_LIMIT_MAX', isDev ? 300 : 100),
-    // Reports run heavier aggregate SQL (profit/loss, stock valuation,
-    // dashboard) than a typical GET — generous enough for a dashboard
-    // that auto-refreshes plus a person clicking between report tabs,
-    // but tighter than the general limit so a runaway frontend loop or
-    // a scripted export can't hammer the reporting queries.
-    reportsRateLimitMax:   optionalInt('REPORTS_RATE_LIMIT_MAX', isDev ? 300 :  60),
-    // Purchase-scan (invoice OCR) covers both the upload itself (Sharp +
-    // Tesseract — CPU/memory heavy) and the short-lived 2s poll a client
-    // runs while OCR is processing (see useQuery.ts's usePurchaseScan).
-    // The poll is naturally self-limiting (it only runs per in-progress
-    // scan and stops itself once status leaves uploaded/processing), but
-    // this still caps how many *uploads* can be kicked off per window,
-    // independent of how many ordinary GETs the rest of the app makes.
-    ocrRateLimitMax:       optionalInt('OCR_RATE_LIMIT_MAX',     isDev ? 200 :  30),
     sessionTtlMinutes:     optionalInt('SESSION_TTL_MINUTES', 10),
   },
+
+  rateLimit,
 
   logging: {
     level:        optional('LOG_LEVEL', isDev ? 'debug' : 'warn'),

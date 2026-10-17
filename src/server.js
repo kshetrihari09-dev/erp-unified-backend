@@ -42,6 +42,8 @@ const {
   scannerLimiter,
   reportsLimiter,
   ocrLimiter,
+  heavyOpsLimiter,
+  rateLimiters,
   httpsRedirect,
   helmetConfig,
   extraSecurityHeaders,
@@ -84,18 +86,24 @@ const devicesPairingRouter = require('./routes/devices').publicRouter
 const { startLanDiscoveryResponder } = require('./services/lanDiscovery')
 
 
-const { errorHandler } = require('./middleware/index')
+const { errorHandler, authenticate, requireRole } = require('./middleware/index')
+const { snapshotCounters } = require('./middleware/rateLimit/diagnostics')
 const db = require('./db/knex')
 
 // ── App setup ─────────────────────────────────────────────────────────────────
 const app = express()
 
-// Trust the first reverse proxy (Nginx, Render, Railway).
-// Required for:
-//   - req.ip to return the real client IP (not the proxy IP)
-//   - x-forwarded-proto to work for HTTPS detection
-//   - express-rate-limit to rate-limit by real client IP
-app.set('trust proxy', 1)
+// Trust proxy - TRUST_PROXY env (validated in config/rateLimitConfig.js), default 1.
+//   - It is the number of reverse-proxy HOPS in front of Node (Nginx = 1; CDN + Nginx = 2).
+//     Express then takes req.ip from the Nth entry counted from the RIGHT of
+//     X-Forwarded-For, so entries a client prepends itself are ignored.
+//   - `true` ("trust everything") is rejected in production: it would let any client pick
+//     its own IP -> its own rate-limit bucket.
+//   - Too SMALL a number makes req.ip the proxy's address, so ALL users share one IP
+//     bucket (the classic cause of "everyone gets 429 at once").
+//   - Too LARGE a number makes req.ip a client-controlled value.
+//   Verify on the live deployment with GET /api/v1/diagnostics/rate-limits (see docs/RATE_LIMITING.md).
+app.set('trust proxy', config.rateLimit.trustProxy)
 
 // Disable ETag globally — prevents 304 Not Modified on scanner poll
 app.set('etag', false)
@@ -172,7 +180,7 @@ app.use((req, res, next) => {
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-Step-Up-Token', 'X-Device-Id', 'X-Device-Secret', 'X-Store-Company'],
     // Retry-After / RateLimit-Reset must be exposed or browsers hide them from cross-origin
     // (Vercel → Render) fetch/XHR, and the frontend cannot honour the server's back-off hint.
-    exposedHeaders: ['X-Request-Id', 'RateLimit-Limit', 'RateLimit-Remaining', 'RateLimit-Reset', 'Retry-After'],
+    exposedHeaders: ['X-Request-Id', 'RateLimit-Limit', 'RateLimit-Remaining', 'RateLimit-Reset', 'Retry-After', 'X-RateLimit-Limiter', 'X-RateLimit-Source'],
   })(req, res, next)
 })
 
@@ -255,10 +263,40 @@ app.get(`${'/api/v1'}/diagnostics`, require('./middleware/index').authenticate, 
 // ── 10. API routes ────────────────────────────────────────────────────────────
 const API = '/api/v1'
 
-// Apply general rate limit to all API routes
+// ── Rate limiting (see middleware/rateLimit/index.js for the full responsibility table) ──
+// TIER 1 - baseline for EVERY API request: per verified user, per verified company,
+// per IP for unauthenticated traffic. Counted exactly once here.
 app.use(API, generalLimiter)
 
-// Auth — tighter limit on login/register/OTP
+// TIER 2 - specialised, one per route family, added on top of the baseline.
+// Reports tier is mounted ONCE for both prefixes so a request is never counted twice.
+app.use([`${API}/reports`, `${API}/stock-register`], reportsLimiter)
+app.post(`${API}/settings/backup/run`,            heavyOpsLimiter)   // full DB backup - manual, admin only
+app.get(`${API}/settings/backup/:id/download`,    heavyOpsLimiter)   // backup download - manual, admin only
+
+// Rate-limit diagnostics (authenticated, owner/admin): live limits, store, proxy resolution, rejection counters.
+app.get(`${API}/diagnostics/rate-limits`, authenticate, requireRole(...config.rateLimit.diagnosticsRoles), (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      ...rateLimiters.describe(),
+      rejectionsSinceBoot: snapshotCounters(),
+      // How THIS request was resolved - the exact check for "is trust proxy right?".
+      // If `ip` is your proxy/CDN address (same for every user) trust proxy is too low;
+      // if it differs from your real public IP it is too high.
+      thisRequest: {
+        ip: req.ip,
+        forwardedFor: req.headers['x-forwarded-for'] || null,
+        forwardedHops: req.ips.length,
+        socketAddress: req.socket.remoteAddress,
+        protocol: req.protocol,
+      },
+    },
+  })
+})
+
+// Auth - ONE credential/sensitive limiter chosen by method + path (login failures,
+// OTP sends, refresh, password/PIN checks). /auth/me and /auth/logout are baseline-only.
 app.use(`${API}/auth`,       authLimiter, authRouter)
 
 // Multi-company management (create/list/edit companies, switch active one)
@@ -278,9 +316,9 @@ app.use(`${API}/reminders`,      remindersRouter)
 // Scan Purchase Bill / Invoice OCR (migration 039). Purchases themselves
 // still go exclusively through app.use(`${API}/purchases`, ...) below —
 // this router only turns an uploaded bill into a reviewable draft.
-app.use(`${API}/purchase-scans`,      ocrLimiter, purchaseScansRouter)
+app.use(`${API}/purchase-scans`,      ocrLimiter, purchaseScansRouter)   // ocrLimiter limits uploads (POST) only; status polls are baseline-only
 app.use(`${API}/stock`,      stockRouter)
-app.use(`${API}/stock-register`, reportsLimiter, stockRegisterRouter)
+app.use(`${API}/stock-register`, stockRegisterRouter)
 app.use(`${API}/returns`,    returnsRouter)
 app.use(`${API}/settings`,   settingsRouter)
 
@@ -288,11 +326,11 @@ app.use(`${API}/settings`,   settingsRouter)
 app.use(`${API}/accounting`, accountingRouter)
 
 // Company vs Customer report (mounted before the generic /reports router)
-app.use(`${API}/reports/company-vs-customer`, reportsLimiter, companyCustomerRouter)
-app.use(`${API}/reports/customer-vs-company`, reportsLimiter, customerCompanyRouter)
+app.use(`${API}/reports/company-vs-customer`, companyCustomerRouter)
+app.use(`${API}/reports/customer-vs-company`, customerCompanyRouter)
 
-// Reports — dedicated (tighter) rate limit for heavy aggregate queries
-app.use(`${API}/reports`,    reportsLimiter, reportsRouter)
+// Reports — dedicated (tighter) rate limit (reportsLimiter, mounted above) for heavy aggregate queries
+app.use(`${API}/reports`,    reportsRouter)
 
 // Scanner — dedicated rate limit for polling
 app.use(`${API}/scanner`,    scannerLimiter, scannerRouter)
@@ -403,6 +441,17 @@ async function start() {
       console.log(`   HTTPS:  ${config.server.https ? '✓ enabled' : '✗ disabled (HTTP)'}`)
       console.log(`   Env:    ${config.env}\n`)
 
+      // Rate-limit boot diagnostics: ignored legacy vars + single-instance warning.
+      const rl = config.rateLimit
+      if (rl.legacyVarsIgnored.length) {
+        console.warn(JSON.stringify({ level: 'warn', event: 'rate_limit_legacy_env_ignored', vars: rl.legacyVarsIgnored,
+          note: 'These variables are no longer read. Remove them and use RATE_LIMIT_USER_MAX / RATE_LIMIT_COMPANY_MAX / RATE_LIMIT_IP_MAX etc.' }))
+      }
+      if (config.isProd && rl.store === 'memory') {
+        console.warn(JSON.stringify({ level: 'warn', event: 'rate_limit_memory_store',
+          note: 'Counters are per-process. Correct for ONE instance; with N instances set RATE_LIMIT_STORE=redis and REDIS_URL.' }))
+      }
+
       // Best-effort — see services/lanDiscovery.js for why this can't be
       // the only discovery mechanism (browsers can't send raw UDP), and
       // why a failure here must never affect the HTTP server above.
@@ -458,6 +507,7 @@ async function start() {
       server.close(async () => {
         try {
           await db.destroy()
+          await rateLimiters.close()
           console.log('[Shutdown] DB pool closed. Bye.')
         } catch {
           // ignore

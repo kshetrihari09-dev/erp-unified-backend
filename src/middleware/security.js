@@ -5,12 +5,11 @@
  * Imported and applied in server.js BEFORE route registration.
  *
  * Covers:
- *  1. express-rate-limit   — per-IP throttling with env-tunable limits
+ *  1. Rate limiting       — per-user / per-company / per-IP, env-tunable (see ./rateLimit)
  *  2. HTTPS redirect       — 301 redirect for HTTP→HTTPS in production
  *  3. Security headers     — helmet + manual additions (CSP, HSTS, etc.)
  *  4. Request ID           — trace-id on every request for log correlation
  *
- * install once:  npm install express-rate-limit
  */
 
 'use strict'
@@ -19,99 +18,26 @@ const { v4: uuid } = require('uuid')
 const config       = require('../config')
 
 // ── 1. Rate limiters ──────────────────────────────────────────────────────────
+// All limiter definitions, keys, budgets and their documented responsibilities
+// live in ./rateLimit/index.js (see the table at the top of that file) and are
+// configured by validated env vars in config/rateLimitConfig.js.
+//
+//   generalLimiter  - TIER 1 baseline for every /api/v1 request: per verified user,
+//                     per verified company, per IP for unauthenticated traffic.
+//   authLimiter     - picks ONE credential/sensitive limiter by method + path.
+//   reportsLimiter  - heavy aggregate SQL (/reports, /stock-register).
+//   scannerLimiter  - barcode / fuzzy product lookups.
+//   ocrLimiter      - Scan-Purchase-Bill UPLOADS only (not the status poll).
+const { createRateLimiters } = require('./rateLimit')
 
-let rateLimit
-try {
-  rateLimit = require('express-rate-limit')
-} catch {
-  console.warn('[Security] express-rate-limit not installed. Run: npm install express-rate-limit')
-  // Provide a no-op middleware so the app still starts without the package
-  rateLimit = () => (_req, _res, next) => next()
-}
+const rateLimiters = createRateLimiters(config.rateLimit)
 
-/**
- * generalLimiter — applied to all /api/v1/* routes.
- * Generous limit; protects against hammering but won't block normal usage.
- */
-const generalLimiter = rateLimit({
-  windowMs:         config.security.rateLimitWindowMs,
-  max:              config.security.rateLimitMax,
-  standardHeaders:  true,   // Return rate-limit info in RateLimit-* headers
-  legacyHeaders:    false,   // Disable deprecated X-RateLimit-* headers
-  keyGenerator:     (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
-  handler: (_req, res) => res.status(429).json({
-    success: false,
-    message: 'Too many requests. Please wait and try again.',
-  }),
-})
-
-/**
- * authLimiter — tighter limit on login/register/OTP routes.
- * Prevents credential stuffing and OTP brute-force.
- */
-const authLimiter = rateLimit({
-  windowMs:        config.security.rateLimitWindowMs,
-  max:             config.security.authRateLimitMax,
-  standardHeaders: true,
-  legacyHeaders:   false,
-  keyGenerator:    (req) => req.ip || 'unknown',
-  handler: (_req, res) => res.status(429).json({
-    success: false,
-    message: 'Too many authentication attempts. Please wait 15 minutes.',
-  }),
-})
-
-/**
- * scannerLimiter — for mobile scanner poll endpoints.
- * Phones poll every 2s; allow headroom for multiple simultaneous sessions.
- */
-const scannerLimiter = rateLimit({
-  windowMs:        config.security.rateLimitWindowMs,
-  max:             config.security.scannerRateLimitMax,
-  standardHeaders: true,
-  legacyHeaders:   false,
-  keyGenerator:    (req) => req.ip || 'unknown',
-  handler: (_req, res) => res.status(429).json({
-    success: false,
-    message: 'Scanner poll rate limit exceeded.',
-  }),
-})
-
-/**
- * reportsLimiter — profit/loss, stock valuation, dashboard, etc.
- * These run heavier aggregate SQL than a typical GET, so they get their
- * own (tighter than general) ceiling instead of sharing the generous
- * general limit with every other route.
- */
-const reportsLimiter = rateLimit({
-  windowMs:        config.security.rateLimitWindowMs,
-  max:             config.security.reportsRateLimitMax,
-  standardHeaders: true,
-  legacyHeaders:   false,
-  keyGenerator:    (req) => req.ip || 'unknown',
-  handler: (_req, res) => res.status(429).json({
-    success: false,
-    message: 'Too many report requests. Please wait and try again.',
-  }),
-})
-
-/**
- * ocrLimiter — Scan Purchase Bill uploads + their status poll.
- * Upload is CPU/memory expensive (Sharp rasterization + Tesseract OCR);
- * capped independently so it can't be used to exhaust server resources
- * or the DB connection pool via a burst of uploads.
- */
-const ocrLimiter = rateLimit({
-  windowMs:        config.security.rateLimitWindowMs,
-  max:             config.security.ocrRateLimitMax,
-  standardHeaders: true,
-  legacyHeaders:   false,
-  keyGenerator:    (req) => req.ip || 'unknown',
-  handler: (_req, res) => res.status(429).json({
-    success: false,
-    message: 'Too many bill-scan requests. Please wait and try again.',
-  }),
-})
+const generalLimiter = rateLimiters.baseline
+const authLimiter    = rateLimiters.authRoutes
+const scannerLimiter = rateLimiters.scanner
+const reportsLimiter = rateLimiters.reports
+const ocrLimiter     = rateLimiters.ocrUpload
+const heavyOpsLimiter = rateLimiters.heavyOps
 
 // ── 2. HTTPS redirect ─────────────────────────────────────────────────────────
 
@@ -240,11 +166,13 @@ function requestId(req, res, next) {
 // ── Exports ───────────────────────────────────────────────────────────────────
 
 module.exports = {
+  rateLimiters,
   generalLimiter,
   authLimiter,
   scannerLimiter,
   reportsLimiter,
   ocrLimiter,
+  heavyOpsLimiter,
   httpsRedirect,
   helmetConfig,
   extraSecurityHeaders,

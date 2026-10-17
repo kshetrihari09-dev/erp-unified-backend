@@ -1,3 +1,13 @@
+# 429 "Too Many Requests" fix — rate limiting rebuilt
+
+Root causes and the full change list: see `../RATE_LIMIT_FIX_REPORT.md`; operations guide: `docs/RATE_LIMITING.md`.
+Summary: per-user / per-company / per-IP limiters keyed on a *verified* JWT (was: one shared per-IP bucket of
+100 requests / 15 min for everyone), 60 s windows, one documented responsibility per limiter, validated env
+(`RATE_LIMIT_USER_MAX` … — legacy `RATE_LIMIT_MAX` etc. are ignored), optional Redis store, structured 429 diagnostics,
+`TRUST_PROXY` configurable, nginx edge limits relaxed and made distinguishable.
+
+---
+
 # Delete (= reverse) a POSTED Receipt / Payment
 
 * `DELETE /accounting/receipts/:id` and `DELETE /accounting/payments/:id` with `{ reason }`.
