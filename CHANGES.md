@@ -127,3 +127,10 @@ relying on this in production.
 - `utils/purchaseCalc.js` now applies `qty × rate × (1 − discount_pct/100) + CC` — identical to `routes/sales.js`.
 - `POST /purchases` accepts per-line `discount_pct` (clamped 0–100), stores it, and now also populates `purchases.subtotal` and `purchases.cc_amount`.
 - Test: `test/purchase-calc.test.js`.
+
+
+## Stock & Sales Summary
+
+- New report: `GET /stock-register/summary` (+ `/summary/export`, `/summary/filters`, `/summary/batches`). Service: `services/stockSummaryService.js`.
+- `stockRegisterService.movementsSQL` now serves both the per-product register and the summary (adds `product_id`, line value columns; `allProducts` option). The register also accepts optional `batch` / `expiry_from` / `expiry_to`, and its rows expose `free_effect`.
+- No schema change. Tests: `test/stock-summary.integration.test.js`, `test/stock-summary.routes.test.js` (need `TEST_DATABASE_URL` pointing at a migrated Postgres; skipped otherwise).

@@ -42,51 +42,73 @@ function validate({ productId, from, to }) {
   if (from && to && from > to)     throw err('From date cannot be after To date')
 }
 
-async function movementsSQL(includeAdj) {
+/**
+ * The single definition of "what moved stock". Used by the per-product
+ * register (one product, :pid) AND the Stock & Sales Summary
+ * (stockSummaryService.js, every product of the company).
+ *
+ * Extra columns beyond the register's own (product_id, line_value,
+ * line_gross, line_disc, party_id) exist for the summary's value figures:
+ *   line_value  money value of the line as the document recorded it
+ *               (purchase_items.amount / sale_items.amount; for receipts and
+ *               register entries qty × rate)
+ *   line_gross  qty × rate before any discount
+ *   line_disc   discount given on the line (sales only)
+ *
+ * @param {boolean} includeAdj  include ADJ (opening stock / adjustment) lines
+ * @param {{allProducts?: boolean}} [opts]  allProducts → no `:pid` predicate
+ */
+async function movementsSQL(includeAdj, opts = {}) {
+  const pf = (alias) => (opts.allProducts ? '' : `AND ${alias}.product_id = :pid`)
   const rvBonus = (await receiveHasBonus()) ? 'COALESCE(ri.bonus,0)' : '0'
   return `
-    SELECT 'PU'::text AS ty, p.date_ad AS dt, p.bill_no::text AS inv_no, pi.batch_no::text AS batch,
+    SELECT 'PU'::text AS ty, pi.product_id AS product_id, p.date_ad AS dt, p.bill_no::text AS inv_no, pi.batch_no::text AS batch,
            COALESCE(pt.name, 'Purchase')::text AS particular, p.notes::text AS narration,
            pi.qty::numeric AS qty_in, 0::numeric AS qty_out, COALESCE(pi.bonus,0)::numeric AS qty_free, 1 AS free_effect,
            pi.rate::numeric AS rate, COALESCE(pr.mrp,0)::numeric AS mrp,
            pi.expiry::text AS expiry, pi.expiry_date AS expiry_date, 'Main Store'::text AS store,
-           p.created_at AS ts, pi.id::text AS rid
+           p.created_at AS ts, pi.id::text AS rid,
+           COALESCE(pi.amount,0)::numeric AS line_value, (pi.qty * pi.rate)::numeric AS line_gross, 0::numeric AS line_disc
       FROM purchase_items pi
       JOIN purchases p        ON p.id = pi.purchase_id
       LEFT JOIN parties pt    ON pt.id = p.party_id
       LEFT JOIN products pr   ON pr.id = pi.product_id
-     WHERE p.company_id = :cid AND pi.product_id = :pid AND p.status <> 'cancelled'
+     WHERE p.company_id = :cid ${pf('pi')} AND p.status <> 'cancelled'
     UNION ALL
-    SELECT 'SL', s.date_ad, s.invoice_no::text, si.batch_no::text,
+    SELECT 'SL', si.product_id, s.date_ad, s.invoice_no::text, si.batch_no::text,
            COALESCE(pt.name, 'Cash Sale')::text, s.notes::text,
            0::numeric, si.qty::numeric, COALESCE(si.bonus,0)::numeric, 0,
            si.rate::numeric, COALESCE(pr.mrp,0)::numeric,
            si.expiry::text, si.expiry_date, 'Main Store'::text,
-           s.created_at, si.id::text
+           s.created_at, si.id::text,
+           COALESCE(si.amount,0)::numeric, (si.qty * si.rate)::numeric,
+           (si.qty * si.rate * COALESCE(si.discount_pct,0) / 100)::numeric
       FROM sale_items si
       JOIN sales s            ON s.id = si.sale_id
       LEFT JOIN parties pt    ON pt.id = s.party_id
       LEFT JOIN products pr   ON pr.id = si.product_id
-     WHERE s.company_id = :cid AND si.product_id = :pid AND s.status <> 'cancelled'
+     WHERE s.company_id = :cid ${pf('si')} AND s.status <> 'cancelled'
     UNION ALL
-    SELECT 'RV', r.date_ad, r.receive_no::text, ri.batch_no::text,
+    SELECT 'RV', ri.product_id, r.date_ad, r.receive_no::text, ri.batch_no::text,
            'Stock Receipt'::text, r.notes::text,
            ri.qty::numeric, 0::numeric, ${rvBonus}::numeric, 1,
            COALESCE(ri.rate,0)::numeric, COALESCE(pr.mrp,0)::numeric,
            ri.expiry::text, ri.expiry_date, 'Main Store'::text,
-           r.created_at, ri.id::text
+           r.created_at, ri.id::text,
+           (ri.qty * COALESCE(ri.rate,0))::numeric, (ri.qty * COALESCE(ri.rate,0))::numeric, 0::numeric
       FROM receive_items ri
       JOIN receives r         ON r.id = ri.receive_id
       LEFT JOIN products pr   ON pr.id = ri.product_id
-     WHERE r.company_id = :cid AND ri.product_id = :pid
+     WHERE r.company_id = :cid ${pf('ri')}
     UNION ALL
-    SELECT e.entry_type, e.entry_date, e.ref_no::text, e.batch_no::text,
+    SELECT e.entry_type, e.product_id, e.entry_date, e.ref_no::text, e.batch_no::text,
            COALESCE(e.particular, e.entry_type)::text, e.narration::text,
            e.qty_in, e.qty_out, e.qty_free, 1,
            e.rate, e.mrp, e.expiry::text, e.expiry_date, e.store_name::text,
-           e.created_at, e.id::text
+           e.created_at, e.id::text,
+           ((e.qty_in + e.qty_out) * e.rate)::numeric, ((e.qty_in + e.qty_out) * e.rate)::numeric, 0::numeric
       FROM stock_register_entries e
-     WHERE e.company_id = :cid AND e.product_id = :pid
+     WHERE e.company_id = :cid ${pf('e')}
        ${includeAdj ? '' : "AND e.entry_type <> 'ADJ'"}`
 }
 
@@ -119,8 +141,25 @@ function fmtExpiry(r) {
 }
 const isoDate = (d) => (d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10))
 
-async function getRegister(companyId, { productId, from, to, store, includeAdj = true }) {
+/**
+ * Optional batch / expiry restriction shared by the register and the summary.
+ * Returns an SQL fragment (starting with AND) over the movement CTE columns
+ * plus its bind values. Lines with no expiry never match an expiry filter.
+ */
+function batchExpiryFilter({ batch, expiryFrom, expiryTo } = {}) {
+  let sql = ''
+  const bind = {}
+  if (batch)      { sql += ` AND batch ILIKE :f_batch`; bind.f_batch = `%${String(batch).replace(/[%_\\]/g, m => '\\' + m)}%` }
+  if (expiryFrom) { sql += ` AND expiry_date >= CAST(:f_exp_from AS date)`; bind.f_exp_from = expiryFrom }
+  if (expiryTo)   { sql += ` AND expiry_date <= CAST(:f_exp_to AS date)`;   bind.f_exp_to   = expiryTo }
+  return { sql, bind }
+}
+
+async function getRegister(companyId, { productId, from, to, store, includeAdj = true, batch, expiryFrom, expiryTo }) {
   validate({ productId, from, to })
+  for (const [k, v] of [['expiry_from', expiryFrom], ['expiry_to', expiryTo]]) {
+    if (v && !DATE_RE.test(v)) throw Object.assign(new Error(`${k} must be YYYY-MM-DD`), { status: 400 })
+  }
   if (store && String(store).toLowerCase() !== 'all' && !STORES.some(s => s.id === String(store).toLowerCase() || s.name === store)) {
     // Unknown store → nothing can match (only one store exists).
     store = '__none__'
@@ -131,8 +170,9 @@ async function getRegister(companyId, { productId, from, to, store, includeAdj =
   if (!product) throw Object.assign(new Error('Product not found'), { status: 404 })
 
   const mv   = await movementsSQL(includeAdj)
-  const bind = { cid: companyId, pid: productId, from: from || null, to: to || null }
-  const storeFilter = store === '__none__' ? 'AND false' : ''
+  const be   = batchExpiryFilter({ batch, expiryFrom, expiryTo })
+  const bind = { cid: companyId, pid: productId, from: from || null, to: to || null, ...be.bind }
+  const storeFilter = (store === '__none__' ? 'AND false' : '') + be.sql
 
   const openingRes = from ? await db.raw(`
       WITH mv AS (${mv})
@@ -152,7 +192,7 @@ async function getRegister(companyId, { productId, from, to, store, includeAdj =
   const rows = built.rows.map(r => ({
     date: isoDate(r.dt), inv_no: r.inv_no || '', batch: r.batch || '', particular: r.particular || '',
     narration: r.narration || '', ty: r.ty, qty_in: r.qty_in, qty_out: r.qty_out, balance: r.balance,
-    qty_free: r.qty_free, rate: Number(r.rate) || 0, store: r.store || 'Main Store',
+    qty_free: r.qty_free, free_effect: Number(r.free_effect) || 0, rate: Number(r.rate) || 0, store: r.store || 'Main Store',
     mrp: Number(r.mrp) || 0, expiry: fmtExpiry(r), key: `${r.ty}:${r.rid}`,
   }))
 
@@ -230,4 +270,4 @@ async function linkEntriesToVoucher(trx, companyId, keyPrefix, voucherId) {
     .where('source_key', 'like', `${keyPrefix}%`).update({ voucher_id: voucherId })
 }
 
-module.exports = { getRegister, buildRegister, toCSV, recordEntry, linkEntriesToVoucher, STORES }
+module.exports = { getRegister, buildRegister, toCSV, recordEntry, linkEntriesToVoucher, STORES, movementsSQL, batchExpiryFilter }
